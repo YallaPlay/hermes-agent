@@ -1,0 +1,24 @@
+# Hermes runtime state and secrets
+.hermes/
+.env
+*.env
+config/*.local.*
+config/secrets.*
+
+# Python/cache/log outputs
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.cache/
+logs/
+outputs/
+cache/
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Local runtime/tunnel secrets
+.local/
