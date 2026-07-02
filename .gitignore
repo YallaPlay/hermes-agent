@@ -1,10 +1,8 @@
-<<<<<<< HEAD
 .DS_Store
 /venv/
 /venv.old/
 /_pycache/
 *.pyc*
-=======
 # Hermes runtime state and secrets
 .hermes/
 .env
@@ -14,7 +12,6 @@ config/*.local.*
 config/secrets.*
 
 # Python/cache/log outputs
->>>>>>> cdaa0c32b (chore: ignore local vars config)
 __pycache__/
 .venv/
 .venv
@@ -160,4 +157,19 @@ infographic/
 outputs/
 cache/
 .local/
-vars.toml
+
+# Legacy job scheduler runtime state
+bot/jobs_state.json
+bot/jobs_scheduler.lock
+jobs/slack/**
+jobs/_deleted/**
+jobs/**/state.txt
+jobs/**/pin.txt
+jobs/**/nextrun.txt
+jobs/**/runs.log
+jobs/**/runs/
+jobs/**/data/
+jobs/**/.lock
+
+# Local Python environments
+venv/
