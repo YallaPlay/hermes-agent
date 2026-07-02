@@ -23,3 +23,20 @@ cache/
 
 # Local runtime/tunnel secrets
 .local/
+
+# Legacy job scheduler runtime state
+bot/jobs_state.json
+bot/jobs_scheduler.lock
+jobs/slack/**
+jobs/_deleted/**
+jobs/**/state.txt
+jobs/**/pin.txt
+jobs/**/nextrun.txt
+jobs/**/runs.log
+jobs/**/runs/
+jobs/**/data/
+jobs/**/.lock
+
+# Local Python environments
+.venv/
+venv/
