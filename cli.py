@@ -15997,6 +15997,13 @@ def main(
                         # status lines).  The response is printed once below.
                         cli.agent.stream_delta_callback = None
                         cli.agent.tool_gen_callback = None
+                        # Also drop the inline-diff edit callbacks: they print
+                        # "┊ review diff" + unified diffs to stdout via _cprint,
+                        # which corrupts the machine-readable reply consumed by
+                        # automation wrappers (e.g. the Slack bot posts stdout
+                        # verbatim).
+                        cli.agent.tool_start_callback = None
+                        cli.agent.tool_complete_callback = None
                         try:
                             result = cli.agent.run_conversation(
                                 user_message=effective_query,
