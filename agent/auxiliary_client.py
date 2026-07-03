@@ -5600,6 +5600,64 @@ def _get_task_extra_body(task: str) -> Dict[str, Any]:
     return {}
 
 
+# Valid values for auxiliary.<task>.reasoning_effort. "none" disables
+# reasoning for the task; the rest map to provider effort levels.
+_VALID_TASK_REASONING_EFFORTS = frozenset(
+    {"none", "minimal", "low", "medium", "high", "xhigh"}
+)
+
+
+def _get_task_reasoning_effort(task: str) -> Optional[str]:
+    """Read auxiliary.<task>.reasoning_effort from config, or None when unset.
+
+    Per-task override for reasoning effort on auxiliary LLM calls (#32813).
+    Lets high-frequency cheap tasks (compression, session_search, ...) run
+    with low/no reasoning while the main conversation keeps a higher global
+    ``agent.reasoning_effort``. Invalid values are ignored with a warning.
+    """
+    if not task:
+        return None
+    task_config = _get_auxiliary_task_config(task)
+    raw = task_config.get("reasoning_effort")
+    if raw is None:
+        return None
+    effort = str(raw).strip().lower()
+    if not effort:
+        return None
+    if effort not in _VALID_TASK_REASONING_EFFORTS:
+        logger.warning(
+            "auxiliary.%s.reasoning_effort: invalid value %r ignored "
+            "(expected one of %s)",
+            task, raw, ", ".join(sorted(_VALID_TASK_REASONING_EFFORTS)),
+        )
+        return None
+    return effort
+
+
+def _apply_task_reasoning_effort(task: str, extra_body: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge auxiliary.<task>.reasoning_effort into *extra_body* in place.
+
+    Produces the chat.completions ``extra_body.reasoning`` shape that the
+    downstream transports already understand: the chat.completions path
+    forwards it verbatim (OpenRouter/OpenAI-compatible), and the Codex
+    Responses auxiliary adapter translates it into top-level ``reasoning``.
+
+    Precedence: an explicit ``reasoning`` key already present in extra_body
+    (from auxiliary.<task>.extra_body config or a caller argument) wins —
+    the per-task effort only fills the gap when nothing else set reasoning.
+    """
+    if "reasoning" in extra_body:
+        return extra_body
+    effort = _get_task_reasoning_effort(task)
+    if effort is None:
+        return extra_body
+    if effort == "none":
+        extra_body["reasoning"] = {"enabled": False}
+    else:
+        extra_body["reasoning"] = {"enabled": True, "effort": effort}
+    return extra_body
+
+
 # ---------------------------------------------------------------------------
 # Anthropic-compatible endpoint detection + image block conversion
 # ---------------------------------------------------------------------------
@@ -5957,6 +6015,7 @@ def call_llm(
         resolved_api_mode = api_mode
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
+    _apply_task_reasoning_effort(task, effective_extra_body)
 
     if task == "vision":
         effective_provider, client, final_model = resolve_vision_provider_client(
@@ -6554,6 +6613,7 @@ async def async_call_llm(
         task, provider, model, base_url, api_key)
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
+    _apply_task_reasoning_effort(task, effective_extra_body)
 
     if task == "vision":
         effective_provider, client, final_model = resolve_vision_provider_client(

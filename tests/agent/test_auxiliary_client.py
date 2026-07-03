@@ -3006,6 +3006,134 @@ class TestAuxiliaryTaskExtraBody:
         kwargs = client.chat.completions.create.call_args.kwargs
         assert kwargs["extra_body"]["enable_thinking"] is True
 
+    def test_sync_call_applies_task_reasoning_effort(self):
+        """auxiliary.<task>.reasoning_effort maps to extra_body.reasoning (#32813)."""
+        client = MagicMock()
+        client.base_url = "https://api.example.com/v1"
+        response = MagicMock()
+        client.chat.completions.create.return_value = response
+
+        config = {
+            "auxiliary": {
+                "session_search": {"reasoning_effort": "low"}
+            }
+        }
+
+        with patch("hermes_cli.config.load_config", return_value=config), patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(client, "glm-4.5-air"),
+        ):
+            result = call_llm(
+                task="session_search",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert result is response
+        kwargs = client.chat.completions.create.call_args.kwargs
+        assert kwargs["extra_body"]["reasoning"] == {"enabled": True, "effort": "low"}
+
+    def test_sync_call_reasoning_effort_none_disables_reasoning(self):
+        client = MagicMock()
+        client.base_url = "https://api.example.com/v1"
+        response = MagicMock()
+        client.chat.completions.create.return_value = response
+
+        config = {
+            "auxiliary": {
+                "compression": {"reasoning_effort": "none"}
+            }
+        }
+
+        with patch("hermes_cli.config.load_config", return_value=config), patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(client, "deepseek-v4-flash"),
+        ):
+            call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        kwargs = client.chat.completions.create.call_args.kwargs
+        assert kwargs["extra_body"]["reasoning"] == {"enabled": False}
+
+    def test_explicit_extra_body_reasoning_wins_over_task_effort(self):
+        """extra_body.reasoning (config or caller) takes precedence."""
+        client = MagicMock()
+        client.base_url = "https://api.example.com/v1"
+        response = MagicMock()
+        client.chat.completions.create.return_value = response
+
+        config = {
+            "auxiliary": {
+                "session_search": {
+                    "reasoning_effort": "high",
+                    "extra_body": {"reasoning": {"effort": "none"}},
+                }
+            }
+        }
+
+        with patch("hermes_cli.config.load_config", return_value=config), patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(client, "glm-4.5-air"),
+        ):
+            call_llm(
+                task="session_search",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        kwargs = client.chat.completions.create.call_args.kwargs
+        assert kwargs["extra_body"]["reasoning"] == {"effort": "none"}
+
+    def test_invalid_reasoning_effort_ignored(self, caplog):
+        client = MagicMock()
+        client.base_url = "https://api.example.com/v1"
+        response = MagicMock()
+        client.chat.completions.create.return_value = response
+
+        config = {
+            "auxiliary": {
+                "session_search": {"reasoning_effort": "turbo"}
+            }
+        }
+
+        with patch("hermes_cli.config.load_config", return_value=config), patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(client, "glm-4.5-air"),
+        ), caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            call_llm(
+                task="session_search",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        kwargs = client.chat.completions.create.call_args.kwargs
+        assert "reasoning" not in kwargs.get("extra_body", {})
+        assert any("invalid value" in rec.message for rec in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_async_call_applies_task_reasoning_effort(self):
+        client = MagicMock()
+        client.base_url = "https://api.example.com/v1"
+        response = MagicMock()
+        client.chat.completions.create = AsyncMock(return_value=response)
+
+        config = {
+            "auxiliary": {
+                "web_extract": {"reasoning_effort": "minimal"}
+            }
+        }
+
+        with patch("hermes_cli.config.load_config", return_value=config), patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(client, "glm-4.5-air"),
+        ):
+            await async_call_llm(
+                task="web_extract",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        kwargs = client.chat.completions.create.call_args.kwargs
+        assert kwargs["extra_body"]["reasoning"] == {"enabled": True, "effort": "minimal"}
+
     def test_no_warning_when_provider_is_custom(self, monkeypatch, caplog):
         """No warning when the provider is 'custom' — OPENAI_BASE_URL is expected."""
         import agent.auxiliary_client as mod
