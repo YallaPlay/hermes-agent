@@ -1169,6 +1169,15 @@ class TestBedrockContextLength:
         from agent.bedrock_adapter import get_bedrock_context_length
         assert get_bedrock_context_length("anthropic.claude-opus-4-6-20250514-v1:0") == 200_000
 
+    def test_claude_opus_4_8_is_1m(self):
+        from agent.bedrock_adapter import get_bedrock_context_length
+        # Opus 4.8 serves 1M context on Bedrock (context-1m beta sent by default).
+        assert get_bedrock_context_length("anthropic.claude-opus-4-8-20260101-v1:0") == 1_000_000
+        assert get_bedrock_context_length("global.anthropic.claude-opus-4-8") == 1_000_000
+        # Must not collide down into the generic opus-4 / opus-4-6 (200K) entries.
+        assert get_bedrock_context_length("global.anthropic.claude-opus-4-6") == 200_000
+        assert get_bedrock_context_length("global.anthropic.claude-opus-4") == 200_000
+
     def test_claude_sonnet_versioned(self):
         from agent.bedrock_adapter import get_bedrock_context_length
         assert get_bedrock_context_length("anthropic.claude-sonnet-4-6-20250514-v1:0") == 200_000

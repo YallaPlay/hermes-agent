@@ -1300,6 +1300,10 @@ BEDROCK_CONTEXT_LENGTHS: Dict[str, int] = {
     # Fable/Mythos-class models support 1M context on Bedrock (128K max output)
     "anthropic.claude-fable-5":      1_000_000,
     "anthropic.claude-mythos-5":     1_000_000,
+    # Opus 4.8 serves 1M context on Bedrock with the context-1m beta header
+    # (attached by default in the Bedrock client builder). Without this entry
+    # it fell through to the generic claude-opus-4 (200K) match.
+    "anthropic.claude-opus-4-8":     1_000_000,
     "anthropic.claude-opus-4-6":     200_000,
     "anthropic.claude-sonnet-4-6":   200_000,
     "anthropic.claude-sonnet-4-5":   200_000,
