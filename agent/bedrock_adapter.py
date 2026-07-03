@@ -1297,6 +1297,9 @@ def classify_bedrock_error(error_message: str) -> str:
 
 BEDROCK_CONTEXT_LENGTHS: Dict[str, int] = {
     # Anthropic Claude models on Bedrock
+    # Fable/Mythos-class models support 1M context on Bedrock (128K max output)
+    "anthropic.claude-fable-5":      1_000_000,
+    "anthropic.claude-mythos-5":     1_000_000,
     "anthropic.claude-opus-4-6":     200_000,
     "anthropic.claude-sonnet-4-6":   200_000,
     "anthropic.claude-sonnet-4-5":   200_000,
