@@ -808,6 +808,78 @@ class TestListAndFork:
         assert fork_resp.session_id != new_resp.session_id
 
     @pytest.mark.asyncio
+    async def test_fork_session_keep_history_meta_slices_prefix(self, agent):
+        new_resp = await agent.new_session(cwd="/original")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        state.history.extend(
+            [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "reply"},
+                {"role": "user", "content": "second"},
+                {"role": "assistant", "content": "reply 2"},
+            ]
+        )
+
+        # The JSON-RPC router flattens _meta into handler kwargs, so
+        # {"_meta": {"hermes": {"keepHistory": 2}}} arrives as hermes={...}.
+        fork_resp = await agent.fork_session(
+            cwd="/forked",
+            session_id=new_resp.session_id,
+            hermes={"keepHistory": 2},
+        )
+
+        forked = agent.session_manager.get_session(fork_resp.session_id)
+        assert len(forked.history) == 2
+        assert forked.history[1]["content"] == "reply"
+        assert len(state.history) == 4
+
+    @pytest.mark.asyncio
+    async def test_fork_session_keep_history_meta_invalid_raises(self, agent):
+        new_resp = await agent.new_session(cwd="/original")
+
+        for bad in ("2", -1, True, 1.5):
+            with pytest.raises(acp.RequestError):
+                await agent.fork_session(
+                    cwd="/forked",
+                    session_id=new_resp.session_id,
+                    hermes={"keepHistory": bad},
+                )
+
+    @pytest.mark.asyncio
+    async def test_fork_session_router_delivers_keep_history_meta(self, agent):
+        """End-to-end through the JSON-RPC router: _meta survives the wire shape."""
+        new_resp = await agent.new_session(cwd="/original")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        state.history.extend(
+            [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "reply"},
+                {"role": "user", "content": "second"},
+            ]
+        )
+        router = build_agent_router(agent, use_unstable_protocol=True)
+
+        result = await router(
+            "session/fork",
+            {
+                "cwd": "/forked",
+                "sessionId": new_resp.session_id,
+                "_meta": {"hermes": {"keepHistory": 1}},
+            },
+            False,
+        )
+
+        forked = agent.session_manager.get_session(result.session_id)
+        assert len(forked.history) == 1
+        assert forked.history[0]["content"] == "first"
+
+    @pytest.mark.asyncio
+    async def test_initialize_advertises_fork_keep_history_extension(self, agent):
+        resp = await agent.initialize(protocol_version=1)
+        fork_caps = resp.agent_capabilities.session_capabilities.fork
+        assert fork_caps.field_meta == {"hermes": {"keepHistory": True}}
+
+    @pytest.mark.asyncio
     async def test_list_sessions_includes_title_and_updated_at(self, agent):
         with patch.object(
             agent.session_manager,
