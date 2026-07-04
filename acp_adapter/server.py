@@ -888,7 +888,10 @@ class HermesACPAgent(acp.Agent):
                 load_session=True,
                 prompt_capabilities=PromptCapabilities(image=True),
                 session_capabilities=SessionCapabilities(
-                    fork=SessionForkCapabilities(),
+                    # _meta.hermes.keepHistory: this agent honors the
+                    # ``_meta.hermes.keepHistory`` fork-rewind extension on
+                    # ``session/fork`` (fork the first N history entries).
+                    fork=SessionForkCapabilities(_meta={"hermes": {"keepHistory": True}}),
                     list=SessionListCapabilities(),
                     resume=SessionResumeCapabilities(),
                 ),
@@ -1226,6 +1229,31 @@ class HermesACPAgent(acp.Agent):
                 logger.debug("Failed to interrupt ACP session %s", session_id, exc_info=True)
             logger.info("Cancelled session %s", session_id)
 
+    @staticmethod
+    def _fork_keep_history(kwargs: dict[str, Any]) -> int | None:
+        """Extract the optional ``_meta.hermes.keepHistory`` fork rewind point.
+
+        ``session/fork`` has no spec-level rewind parameter, so clients pass it
+        through ACP's extensibility escape hatch: ``_meta.hermes.keepHistory``
+        is the number of leading history entries to copy into the fork (in the
+        same OpenAI-message coordinate space that ``session/load`` replays).
+        The JSON-RPC router flattens ``_meta`` keys into handler kwargs, so the
+        payload arrives here as a ``hermes`` dict. Absent → ``None`` → full
+        copy (the pre-existing behavior). Invalid types/values raise
+        ``invalid_params`` rather than silently forking the whole session —
+        a client asking for a rewind must not quietly get a full copy.
+        """
+        hermes_meta = kwargs.get("hermes")
+        if not isinstance(hermes_meta, dict) or "keepHistory" not in hermes_meta:
+            return None
+        keep = hermes_meta["keepHistory"]
+        # bool is an int subclass; reject it explicitly.
+        if isinstance(keep, bool) or not isinstance(keep, int) or keep < 0:
+            raise acp.RequestError.invalid_params(
+                {"reason": "_meta.hermes.keepHistory must be a non-negative integer"}
+            )
+        return keep
+
     async def fork_session(
         self,
         cwd: str,
@@ -1233,7 +1261,10 @@ class HermesACPAgent(acp.Agent):
         mcp_servers: list | None = None,
         **kwargs: Any,
     ) -> ForkSessionResponse:
-        state = self.session_manager.fork_session(session_id, cwd=cwd)
+        keep_history = self._fork_keep_history(kwargs)
+        state = self.session_manager.fork_session(
+            session_id, cwd=cwd, keep_history=keep_history
+        )
         new_id = state.session_id if state else ""
         if state is not None:
             await self._register_session_mcp_servers(state, mcp_servers)
