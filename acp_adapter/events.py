@@ -132,6 +132,18 @@ def make_tool_progress_cb(
     """
 
     def _tool_progress(event_type: str, name: str = None, preview: str = None, args: Any = None, **kwargs) -> None:
+        # A completed ``todo`` carries the authoritative task list in its result.
+        # Emit the native ACP plan update here, on the live completion event, so
+        # the turn's FINAL todo is reflected too. The step callback only observes
+        # a tool's result on the *next* step (via ``prev_tools``), which never
+        # arrives for the last tool of a turn — leaving the plan panel one todo
+        # behind whenever the turn ends on a todo update.
+        if event_type == "tool.completed":
+            if name == "todo":
+                plan_update = _build_plan_update_from_todo_result(kwargs.get("result"))
+                if plan_update is not None:
+                    _send_update(conn, session_id, loop, plan_update)
+            return
         # Only emit ACP ToolCallStart for tool.started; ignore other event types
         if event_type != "tool.started":
             return
@@ -249,10 +261,11 @@ def make_step_cb(
                         snapshot=meta.get("snapshot"),
                     )
                     _send_update(conn, session_id, loop, update)
-                    if tool_name == "todo":
-                        plan_update = _build_plan_update_from_todo_result(result)
-                        if plan_update is not None:
-                            _send_update(conn, session_id, loop, plan_update)
+                    # NOTE: the native ``plan`` update for ``todo`` results is now
+                    # emitted live from the ``tool.completed`` progress event (see
+                    # ``make_tool_progress_cb``), which also covers a turn's final
+                    # todo. Emitting it here too would double-send and still miss
+                    # the last todo, so it is intentionally not done here.
                     if not queue:
                         tool_call_ids.pop(tool_name, None)
 

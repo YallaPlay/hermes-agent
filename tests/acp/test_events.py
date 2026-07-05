@@ -297,12 +297,36 @@ class TestStepCallback:
         }
         mock_send.assert_called_once()
 
-    def test_todo_completion_emits_native_plan_update_after_tool_completion(self, mock_conn, event_loop_fixture):
+    def test_step_callback_completes_todo_without_emitting_plan(self, mock_conn, event_loop_fixture):
+        """The deferred step callback finalizes the tool call but no longer emits
+        the plan update — that now happens live on ``tool.completed`` so the
+        turn's final todo is not stranded one step behind."""
         from collections import deque
 
         tool_call_ids = {"todo": deque(["tc-todo"])}
         loop = event_loop_fixture
         cb = make_step_cb(mock_conn, "session-1", loop, tool_call_ids, {})
+        todo_result = (
+            '{"todos":['
+            '{"id":"inspect","content":"Inspect ACP","status":"completed"}'
+            '],"summary":{"total":1}}'
+        )
+
+        with patch("acp_adapter.events._send_update") as mock_send:
+            cb(1, [{"name": "todo", "result": todo_result}])
+
+        updates = [call.args[3] for call in mock_send.call_args_list]
+        assert [getattr(update, "session_update", None) for update in updates] == [
+            "tool_call_update",
+        ]
+
+    def test_todo_completion_emits_native_plan_update_live(self, mock_conn, event_loop_fixture):
+        """A live ``tool.completed`` event for ``todo`` emits the native ACP plan
+        update immediately, covering the final todo of a turn."""
+        tool_call_ids = {}
+        tool_call_meta = {}
+        loop = event_loop_fixture
+        cb = make_tool_progress_cb(mock_conn, "session-1", loop, tool_call_ids, tool_call_meta)
         todo_result = (
             '{"todos":['
             '{"id":"inspect","content":"Inspect ACP","status":"completed"},'
@@ -312,14 +336,11 @@ class TestStepCallback:
         )
 
         with patch("acp_adapter.events._send_update") as mock_send:
-            cb(1, [{"name": "todo", "result": todo_result}])
+            cb("tool.completed", "todo", None, None, result=todo_result)
 
         updates = [call.args[3] for call in mock_send.call_args_list]
-        assert [getattr(update, "session_update", None) for update in updates] == [
-            "tool_call_update",
-            "plan",
-        ]
-        plan = updates[1]
+        assert [getattr(update, "session_update", None) for update in updates] == ["plan"]
+        plan = updates[0]
         assert isinstance(plan, AgentPlanUpdate)
         assert [entry.content for entry in plan.entries] == [
             "Inspect ACP",
@@ -328,6 +349,18 @@ class TestStepCallback:
         ]
         assert [entry.status for entry in plan.entries] == ["completed", "in_progress", "completed"]
         assert [entry.priority for entry in plan.entries] == ["medium", "medium", "medium"]
+
+    def test_non_todo_completion_emits_nothing(self, mock_conn, event_loop_fixture):
+        """A ``tool.completed`` for a non-todo tool must not emit a plan update."""
+        tool_call_ids = {}
+        tool_call_meta = {}
+        loop = event_loop_fixture
+        cb = make_tool_progress_cb(mock_conn, "session-1", loop, tool_call_ids, tool_call_meta)
+
+        with patch("acp_adapter.events._send_update") as mock_send:
+            cb("tool.completed", "terminal", None, None, result="done")
+
+        mock_send.assert_not_called()
 
     def test_todo_plan_update_parses_json_with_trailing_hint(self):
         result = '{"todos":[{"id":"ship","content":"Ship ACP plan","status":"pending"}]}\n\n[Hint: persisted]'
