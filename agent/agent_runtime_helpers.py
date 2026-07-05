@@ -2171,6 +2171,19 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     elif function_name == "delegate_task":
         def _execute(next_args: dict) -> Any:
             return _finish_agent_tool(agent._dispatch_delegate_task(next_args), next_args)
+    elif function_name == "set_reasoning_effort":
+        def _execute(next_args: dict) -> Any:
+            # Mutates the live agent.reasoning_config, which is re-read on the
+            # next API call (same-turn escalation). Session-scoped; never persists.
+            from tools.reasoning_effort_tool import set_reasoning_effort as _set_effort
+            return _finish_agent_tool(
+                _set_effort(
+                    agent,
+                    level=next_args.get("level", ""),
+                    reason=next_args.get("reason", ""),
+                ),
+                next_args,
+            )
     else:
         def _execute(next_args: dict) -> Any:
             return _ra().handle_function_call(
