@@ -114,3 +114,29 @@ def test_registered_in_tool_registry():
     entry = registry.get_entry("set_reasoning_effort")
     assert entry is not None
     assert entry.toolset == "reasoning"
+
+
+def test_effort_reaches_bedrock_request_wire():
+    """End-to-end wire proof: mutating reasoning_config changes the effort sent
+    to the Anthropic/Bedrock request. This is what makes same-turn escalation real
+    (agent.reasoning_config is re-read per API call, then mapped here)."""
+    from agent.anthropic_adapter import build_anthropic_kwargs, _supports_adaptive_thinking
+
+    model = "global.anthropic.claude-opus-4-8"
+    if not _supports_adaptive_thinking(model):
+        import pytest as _pytest
+        _pytest.skip("model does not use adaptive thinking")
+
+    def effort_on_wire(reasoning_config):
+        kw = build_anthropic_kwargs(
+            model, [{"role": "user", "content": "hi"}], [], 1024, reasoning_config
+        )
+        oc = kw.get("output_config") or {}
+        return oc.get("effort")
+
+    # The tool sets these exact shapes via parse_reasoning_effort.
+    assert effort_on_wire({"enabled": True, "effort": "medium"}) == "medium"
+    assert effort_on_wire({"enabled": True, "effort": "high"}) == "high"
+    assert effort_on_wire({"enabled": True, "effort": "xhigh"}) == "xhigh"
+    # 'none' disables thinking entirely (no output_config effort).
+    assert effort_on_wire({"enabled": False}) is None

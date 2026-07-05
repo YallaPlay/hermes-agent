@@ -52,6 +52,8 @@ _HERMES_CORE_TOOLS = [
     "text_to_speech",
     # Planning & memory
     "todo", "memory",
+    # Reasoning effort self-tuning (model raises/lowers its own effort per task)
+    "set_reasoning_effort",
     # NOTE: the desktop Project tools (project_list/create/switch) are
     # deliberately NOT here. They only make sense where a GUI can follow the
     # move, so they live in the `project` toolset and are enabled solely by the
@@ -203,6 +205,12 @@ TOOLSETS = {
     "todo": {
         "description": "Task planning and tracking for multi-step work",
         "tools": ["todo"],
+        "includes": []
+    },
+
+    "reasoning": {
+        "description": "Let the model tune its own reasoning effort per task (set_reasoning_effort)",
+        "tools": ["set_reasoning_effort"],
         "includes": []
     },
     

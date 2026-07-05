@@ -1268,6 +1268,27 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
+        elif function_name == "set_reasoning_effort":
+            def _execute(next_args: dict) -> Any:
+                # Mutates live agent.reasoning_config (re-read per API call →
+                # same-turn escalation). Session-scoped; never persists.
+                from tools.reasoning_effort_tool import set_reasoning_effort as _set_effort
+                return _set_effort(
+                    agent,
+                    level=next_args.get("level", ""),
+                    reason=next_args.get("reason", ""),
+                )
+            function_result, function_args = _run_agent_tool_execution_middleware(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                execute=_execute,
+            )
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(f"  {_get_cute_tool_message_impl('set_reasoning_effort', function_args, tool_duration, result=function_result)}")
         elif function_name == "read_terminal":
             def _execute(next_args: dict) -> Any:
                 from tools.read_terminal_tool import read_terminal_tool as _read_terminal_tool
