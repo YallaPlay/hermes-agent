@@ -763,3 +763,37 @@ class TestPersistence:
 
         assert stdout_buf.getvalue() == ""
         assert stderr_buf.getvalue() == "ACP noise\n"
+
+
+# ---------------------------------------------------------------------------
+# archived support
+# ---------------------------------------------------------------------------
+
+
+def _mgr_with_db(rows, archived_ok=True):
+    mgr = SessionManager(agent_factory=lambda: MagicMock(name="MockAIAgent"))
+    db = MagicMock(name="db")
+    db.list_sessions_rich.return_value = rows
+    db.set_session_archived.return_value = archived_ok
+    mgr._get_db = lambda: db  # type: ignore[method-assign]
+    return mgr, db
+
+
+def test_list_sessions_forwards_archived_flags_and_maps_archived_field():
+    rows = [{
+        "id": "s1", "cwd": ".", "model": "m", "message_count": 3,
+        "title": "T", "last_active": 1.0, "started_at": 0.0, "archived": 1,
+    }]
+    mgr, db = _mgr_with_db(rows)
+    out = mgr.list_sessions(archived_only=True)
+    # forwarded to the DB layer
+    _, kwargs = db.list_sessions_rich.call_args
+    assert kwargs.get("archived_only") is True
+    # archived surfaced as a bool on the result dict
+    assert out and out[0]["archived"] is True
+
+
+def test_set_session_archived_delegates_to_db():
+    mgr, db = _mgr_with_db([], archived_ok=True)
+    assert mgr.set_session_archived("s1", True) is True
+    db.set_session_archived.assert_called_once_with("s1", True)

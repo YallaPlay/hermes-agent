@@ -280,7 +280,12 @@ class SessionManager:
         logger.info("Forked ACP session %s -> %s", session_id, new_id)
         return state
 
-    def list_sessions(self, cwd: str | None = None) -> List[Dict[str, Any]]:
+    def list_sessions(
+        self,
+        cwd: str | None = None,
+        include_archived: bool = False,
+        archived_only: bool = False,
+    ) -> List[Dict[str, Any]]:
         """Return lightweight info dicts for all sessions (memory + database)."""
         normalized_cwd = _normalize_cwd_for_compare(cwd) if cwd else None
         db = self._get_db()
@@ -288,7 +293,12 @@ class SessionManager:
 
         if db is not None:
             try:
-                for row in db.list_sessions_rich(source="acp", limit=1000):
+                for row in db.list_sessions_rich(
+                    source="acp",
+                    limit=1000,
+                    include_archived=include_archived,
+                    archived_only=archived_only,
+                ):
                     persisted_rows[str(row["id"])] = dict(row)
             except Exception:
                 logger.debug("Failed to load ACP sessions from DB", exc_info=True)
@@ -300,6 +310,8 @@ class SessionManager:
             for s in self._sessions.values():
                 history_len = len(s.history)
                 if history_len <= 0:
+                    continue
+                if archived_only:
                     continue
                 if normalized_cwd and _normalize_cwd_for_compare(s.cwd) != normalized_cwd:
                     continue
@@ -322,6 +334,7 @@ class SessionManager:
                         "updated_at": _format_updated_at(
                             persisted.get("last_active") or persisted.get("started_at") or time.time()
                         ),
+                        "archived": False,
                     }
                 )
 
@@ -349,6 +362,7 @@ class SessionManager:
                 "history_len": message_count,
                 "title": _build_session_title(row.get("title"), row.get("preview"), session_cwd),
                 "updated_at": _format_updated_at(row.get("last_active") or row.get("started_at")),
+                "archived": bool(row.get("archived")),
             })
 
         results.sort(key=lambda item: _updated_at_sort_key(item.get("updated_at")), reverse=True)
@@ -588,6 +602,17 @@ class SessionManager:
             return db.delete_session(session_id)
         except Exception:
             logger.debug("Failed to delete ACP session %s from DB", session_id, exc_info=True)
+            return False
+
+    def set_session_archived(self, session_id: str, archived: bool) -> bool:
+        """Soft-archive (hide) or restore a session. Reversible; not a delete."""
+        db = self._get_db()
+        if db is None:
+            return False
+        try:
+            return bool(db.set_session_archived(session_id, archived))
+        except Exception:
+            logger.debug("Failed to set archived on %s", session_id, exc_info=True)
             return False
 
     # ---- internal -----------------------------------------------------------
