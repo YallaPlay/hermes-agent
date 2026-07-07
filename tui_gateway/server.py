@@ -275,7 +275,7 @@ _detached_ws_transport = _DropTransport()
 class _SlashWorker:
     """Persistent HermesCLI subprocess for slash commands."""
 
-    def __init__(self, session_key: str, model: str):
+    def __init__(self, session_key: str, model: str, profile_home: str | None = None):
         self._lock = threading.Lock()
         self._seq = 0
         self.stderr_tail: list[str] = []
@@ -294,6 +294,15 @@ class _SlashWorker:
         self._closed = False
         from hermes_cli._subprocess_compat import windows_hide_flags
 
+        # slash_worker runs the Hermes agent → needs provider credentials.
+        # Tier-1 secrets (gateway/GitHub/infra) are still stripped (#29157).
+        env = hermes_subprocess_env(inherit_credentials=True)
+        if profile_home:
+            # Global-remote / multi-profile sessions: the worker must resolve
+            # config/skills/state against the session's profile home, not the
+            # gateway's launch HERMES_HOME (#40677).
+            env["HERMES_HOME"] = str(profile_home)
+
         # start_new_session=True detaches the slash worker into its own
         # process group / session. Without this, the worker inherits the
         # gateway's pgid (= TUI parent PID). When mcp_tool's
@@ -310,9 +319,7 @@ class _SlashWorker:
             text=True,
             bufsize=1,
             cwd=os.getcwd(),
-            # slash_worker runs the Hermes agent → needs provider credentials.
-            # Tier-1 secrets (gateway/GitHub/infra) are still stripped (#29157).
-            env=hermes_subprocess_env(inherit_credentials=True),
+            env=env,
             creationflags=windows_hide_flags(),
             start_new_session=True,
         )
@@ -1299,7 +1306,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
             current["config_model_seen"] = _config_model_target()
 
             try:
-                worker = _SlashWorker(key, getattr(agent, "model", _resolve_model()))
+                worker = _SlashWorker(
+                    key,
+                    getattr(agent, "model", _resolve_model()),
+                    profile_home=current.get("profile_home"),
+                )
                 _attach_worker(sid, current, worker)
             except Exception:
                 pass
@@ -1994,14 +2005,14 @@ def _resolve_model() -> str:
 
 
 def _config_model_target() -> tuple[str, str]:
-    """(model, provider) currently selected by config (env as fallback).
+    """(model, provider) currently selected by config.yaml — and ONLY config.
 
-    config.yaml wins over HERMES_MODEL / HERMES_INFERENCE_MODEL here, the
-    reverse of `_resolve_model()`'s startup order. Those env vars are a
-    provision-time seed (hosted instances set HERMES_INFERENCE_MODEL in the
-    container env); if they outranked config.yaml, the per-turn sync would
-    stay pinned to the seed forever and dashboard/CLI model changes would
-    never reach an open chat — the exact bug this sync exists to fix.
+    Unlike `_resolve_model()`, this never reads HERMES_MODEL /
+    HERMES_INFERENCE_MODEL. Those env vars are a launch-scoped seed
+    (`hermes --tui -m <model>`, hosted-instance provisioning); if they
+    fed the per-turn sync, the seed would be replayed as a /model switch
+    and persisted globally, or would pin the session so dashboard/CLI
+    model changes never reach an open chat.
     """
     cfg_model = _load_cfg().get("model")
     model = ""
@@ -2013,8 +2024,15 @@ def _config_model_target() -> tuple[str, str]:
             provider = ""
     elif isinstance(cfg_model, str):
         model = cfg_model.strip()
-    if not model:
-        model = _resolve_model()
+    # No fallback to _resolve_model() here: that reads HERMES_MODEL /
+    # HERMES_INFERENCE_MODEL, which `hermes --tui -m <model>` sets as a
+    # session-scoped seed for THIS launch. When config.yaml has no
+    # model.default (custom-provider-only setups), falling back to the env
+    # seed made the per-turn sync treat the -m flag as "the configured
+    # model" and replay it as a /model switch — which then persisted the
+    # one-shot flag into config.yaml globally (#-m leak). An empty model
+    # simply means "config expresses no preference": the sync is a no-op
+    # and the agent keeps whatever it was built with.
     return model, provider
 
 
@@ -2621,6 +2639,7 @@ def _restart_slash_worker(sid: str, session: dict):
         new_worker = _SlashWorker(
             session["session_key"],
             getattr(session.get("agent"), "model", _resolve_model()),
+            profile_home=session.get("profile_home"),
         )
     except Exception:
         session["slash_worker"] = None
@@ -2660,6 +2679,7 @@ def _apply_model_switch(
     confirm_expensive_model: bool = False,
     pin_session_override: bool = True,
     parsed_flags: tuple[str, str, bool, bool, bool] | None = None,
+    persist_override: bool | None = None,
 ) -> dict:
     from hermes_cli.model_switch import (
         parse_model_flags,
@@ -2677,7 +2697,11 @@ def _apply_model_switch(
         _force_refresh,
         is_session,
     ) = parsed_flags
-    persist_global = resolve_persist_behavior(is_global_flag, is_session)
+    persist_global = (
+        persist_override
+        if persist_override is not None
+        else resolve_persist_behavior(is_global_flag, is_session)
+    )
     if not model_input:
         raise ValueError("model value required")
 
@@ -2869,6 +2893,12 @@ def _sync_agent_model_with_config(sid: str, session: dict) -> None:
             raw,
             confirm_expensive_model=True,
             pin_session_override=False,
+            # This sync ADOPTS a config.yaml change into the live session; it
+            # must never write config back. Without this, the flag/config
+            # default (persist_switch_by_default=True) re-persisted whatever
+            # target the sync computed — the path that leaked `hermes --tui -m`
+            # into config.yaml as the permanent global model.
+            persist_override=False,
         )
     except Exception as e:
         _emit(
@@ -4505,7 +4535,11 @@ def _init_session(
         _attach_worker(
             sid,
             _sessions[sid],
-            _SlashWorker(key, getattr(agent, "model", _resolve_model())),
+            _SlashWorker(
+                key,
+                getattr(agent, "model", _resolve_model()),
+                profile_home=_sessions[sid].get("profile_home"),
+            ),
         )
     except Exception:
         # Defer hard-failure to slash.exec; chat still works without slash worker.
@@ -8709,6 +8743,9 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                                 _raw,
                                 confirm_expensive_model=False,
                                 pin_session_override=bool(_prev_override),
+                                # Session-internal restore after the /moa
+                                # one-shot — never persist to config.yaml.
+                                persist_override=False,
                             )
                         except Exception as _moa_restore_exc:
                             logger.warning(
@@ -11568,6 +11605,9 @@ def _(rid, params: dict) -> dict:
                         f"{preset} --provider moa",
                         confirm_expensive_model=False,
                         pin_session_override=True,
+                        # One-shot turn-scoped swap — never persist the MoA
+                        # virtual provider to config.yaml.
+                        persist_override=False,
                     )
                 except Exception as exc:
                     session.pop("moa_one_shot_restore", None)
@@ -12384,6 +12424,7 @@ def _(rid, params: dict) -> dict:
             capabilities=True,
             refresh=bool(params.get("refresh")),
             probe_custom_providers=bool(params.get("refresh")),
+            probe_current_custom_provider=not bool(params.get("refresh")),
         )
         return _ok(rid, payload)
     except Exception as e:
@@ -12694,6 +12735,7 @@ def _(rid, params: dict) -> dict:
             worker = _SlashWorker(
                 session["session_key"],
                 getattr(session.get("agent"), "model", _resolve_model()),
+                profile_home=session.get("profile_home"),
             )
             _attach_worker(params.get("session_id", ""), session, worker)
         except Exception as e:
