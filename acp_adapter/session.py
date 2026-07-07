@@ -633,6 +633,84 @@ class SessionManager:
             logger.debug("Failed to set archived on %s", session_id, exc_info=True)
             return False
 
+    def set_session_title(self, session_id: str, title: str) -> bool:
+        """Set (or clear, when *title* is empty/whitespace) a session's canonical
+        title in state.db. Returns True when a row was updated.
+
+        Raises ValueError on validation failure or a title-uniqueness conflict —
+        callers (the ACP ext-method) surface that to the client so an inline
+        rename collision is a visible error, not a silent no-op.
+        """
+        db = self._get_db()
+        if db is None:
+            return False
+        return bool(db.set_session_title(session_id, title))
+
+    def get_session_title(self, session_id: str) -> Optional[str]:
+        """Return the session's canonical title, or None."""
+        db = self._get_db()
+        if db is None:
+            return None
+        try:
+            return db.get_session_title(session_id)
+        except Exception:
+            logger.debug("Failed to read title for %s", session_id, exc_info=True)
+            return None
+
+    def derive_session_title(self, session_id: str) -> Optional[str]:
+        """Derive and persist a title from the session's FIRST user→assistant
+        exchange, reusing the same auxiliary-model pass as auto-titling.
+
+        Unlike ``maybe_auto_title`` this is NOT gated to the first turn — it is
+        the on-demand backfill for sessions that opened into a long/interrupted
+        first turn and never got auto-titled (the classic ``source='acp'``
+        untitled case). Runs synchronously (the caller invokes it off-thread) and
+        is a no-op when the session already has a title. Returns the new title,
+        or None when nothing was set (no exchange yet / already titled / aux
+        failure)."""
+        db = self._get_db()
+        if db is None:
+            return None
+        try:
+            if db.get_session_title(session_id):
+                return None  # already titled — never overwrite
+            messages = db.get_messages(session_id)
+        except Exception:
+            logger.debug("derive_session_title: could not read %s", session_id, exc_info=True)
+            return None
+
+        def _text(m):
+            c = m.get("content")
+            if isinstance(c, str):
+                return c
+            if isinstance(c, list):
+                return " ".join(
+                    p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text"
+                )
+            return ""
+
+        first_user = next((_text(m) for m in messages if m.get("role") == "user"), "")
+        first_assistant = next((_text(m) for m in messages if m.get("role") == "assistant"), "")
+        if not first_user or not first_assistant:
+            return None  # no completed exchange yet — nothing to title from
+
+        try:
+            from agent.title_generator import generate_title
+            title = generate_title(first_user, first_assistant)
+        except Exception:
+            logger.debug("derive_session_title: generation failed for %s", session_id, exc_info=True)
+            return None
+        if not title:
+            return None
+        try:
+            if db.set_session_title(session_id, title):
+                return title
+        except ValueError:
+            # Extremely unlikely (a derived title colliding with another
+            # session); leave untitled rather than error a background derive.
+            logger.debug("derive_session_title: title collision for %s", session_id, exc_info=True)
+        return None
+
     # ---- internal -----------------------------------------------------------
 
     def _make_agent(

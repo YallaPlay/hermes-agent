@@ -1287,6 +1287,40 @@ class HermesACPAgent(acp.Agent):
             archived = bool(params.get("archived"))
             ok = self.session_manager.set_session_archived(session_id, archived) if session_id else False
             return {"ok": bool(ok)}
+        if method == "setTitle":
+            # Set (or clear, with an empty string) a session's CANONICAL title in
+            # state.db — the thing session/list, the web UI, sessions-list CLI,
+            # and search all read. This is the write path ACP core lacks; the
+            # extension's inline rename routes here instead of a VS-Code-local
+            # override, so the name is global. Surface a uniqueness conflict as a
+            # visible error rather than a silent no-op.
+            session_id = params.get("sessionId")
+            title = str(params.get("title") or "")
+            if not session_id:
+                return {"ok": False, "error": "sessionId required"}
+            try:
+                ok = self.session_manager.set_session_title(session_id, title)
+            except ValueError as exc:
+                return {"ok": False, "error": str(exc)}
+            if ok:
+                await self._send_session_info_update(session_id)
+            return {"ok": bool(ok), "title": self.session_manager.get_session_title(session_id)}
+        if method == "deriveTitle":
+            # On-demand backfill for an untitled session (e.g. one that opened
+            # into a long first turn and missed the first-exchange auto-title).
+            # Reuses the auxiliary-model pass; no-op if already titled or no
+            # completed exchange. The aux call is blocking, so run it off the
+            # event loop, then push the new title to the client.
+            session_id = params.get("sessionId")
+            if not session_id:
+                return {"ok": False, "error": "sessionId required"}
+            loop = asyncio.get_running_loop()
+            title = await loop.run_in_executor(
+                None, self.session_manager.derive_session_title, session_id
+            )
+            if title:
+                await self._send_session_info_update(session_id)
+            return {"ok": bool(title), "title": title}
         raise RequestError.method_not_found(f"_{method}")
 
     async def list_sessions(

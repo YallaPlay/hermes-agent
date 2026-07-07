@@ -971,6 +971,55 @@ class TestListAndFork:
         mock_set.assert_called_once_with("s1", True)
 
     @pytest.mark.asyncio
+    async def test_ext_method_set_title_delegates_persists_and_emits(self, agent):
+        with patch.object(
+            agent.session_manager, "set_session_title", return_value=True
+        ) as mock_set, patch.object(
+            agent.session_manager, "get_session_title", return_value="My Title"
+        ), patch.object(agent, "_send_session_info_update") as mock_emit:
+            result = await agent.ext_method("setTitle", {"sessionId": "s1", "title": "My Title"})
+        assert result == {"ok": True, "title": "My Title"}
+        mock_set.assert_called_once_with("s1", "My Title")
+        mock_emit.assert_awaited_once_with("s1")
+
+    @pytest.mark.asyncio
+    async def test_ext_method_set_title_conflict_returns_error_no_emit(self, agent):
+        with patch.object(
+            agent.session_manager,
+            "set_session_title",
+            side_effect=ValueError("Title 'X' is already in use by session s2"),
+        ), patch.object(agent, "_send_session_info_update") as mock_emit:
+            result = await agent.ext_method("setTitle", {"sessionId": "s1", "title": "X"})
+        assert result["ok"] is False
+        assert "already in use" in result["error"]
+        mock_emit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ext_method_set_title_requires_session_id(self, agent):
+        result = await agent.ext_method("setTitle", {"title": "X"})
+        assert result["ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_ext_method_derive_title_success_persists_and_emits(self, agent):
+        with patch.object(
+            agent.session_manager, "derive_session_title", return_value="Derived Title"
+        ) as mock_derive, patch.object(agent, "_send_session_info_update") as mock_emit:
+            result = await agent.ext_method("deriveTitle", {"sessionId": "s1"})
+        assert result == {"ok": True, "title": "Derived Title"}
+        mock_derive.assert_called_once_with("s1")
+        mock_emit.assert_awaited_once_with("s1")
+
+    @pytest.mark.asyncio
+    async def test_ext_method_derive_title_noop_returns_false_no_emit(self, agent):
+        # Already titled / no exchange yet / aux failure → derive returns None.
+        with patch.object(
+            agent.session_manager, "derive_session_title", return_value=None
+        ), patch.object(agent, "_send_session_info_update") as mock_emit:
+            result = await agent.ext_method("deriveTitle", {"sessionId": "s1"})
+        assert result == {"ok": False, "title": None}
+        mock_emit.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_ext_method_unknown_raises_method_not_found(self, agent):
         from acp import RequestError
         with pytest.raises(RequestError):
