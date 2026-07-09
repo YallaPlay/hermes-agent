@@ -40,7 +40,7 @@ def test_set_session_owner_unknown_returns_false(db):
     assert db.set_session_owner("nope", "x@y.com") is False
 
 
-def test_owner_filter_shows_own_and_untagged_hides_others(db):
+def test_owner_filter_shows_only_own_hides_untagged_and_others(db):
     _mk(db, "mine", user_id="alice@yallaplay.com")
     _mk(db, "theirs", user_id="bob@yallaplay.com")
     _mk(db, "legacy", user_id=None)  # untagged
@@ -49,8 +49,9 @@ def test_owner_filter_shows_own_and_untagged_hides_others(db):
         s["id"]
         for s in db.list_sessions_rich(source="acp", owner="alice@yallaplay.com")
     }
-    # Own + untagged visible; someone else's hidden.
-    assert ids == {"mine", "legacy"}
+    # STRICT ownership: only the caller's own sessions. Untagged (legacy /
+    # non-interactive) rows AND other owners' rows are hidden under "My".
+    assert ids == {"mine"}
 
 
 def test_no_owner_filter_shows_all(db):

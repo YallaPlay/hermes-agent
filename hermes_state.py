@@ -3118,11 +3118,13 @@ class SessionDB:
         elif not include_archived:
             where_clauses.append("s.archived = 0")
         if owner:
-            # Per-user session list: show the caller's own sessions PLUS any
-            # untagged (legacy / pre-ownership) rows so history is never
-            # orphaned. Only sessions KNOWN to belong to someone else are
-            # hidden. Soft display filter, not an access boundary.
-            where_clauses.append("(s.user_id = ? OR COALESCE(s.user_id, '') = '')")
+            # Per-user session list: STRICT ownership — show only the caller's
+            # own sessions. Untagged (legacy / pre-ownership / non-interactive
+            # e.g. slack-bot, jobs-cron) rows are HIDDEN under "My Sessions" so
+            # the view is truly the caller's own. Soft display filter toggled by
+            # the client's ownerOnly flag, not an access boundary; "All" (ownerOnly
+            # off) still shows everything.
+            where_clauses.append("s.user_id = ?")
             params.append(owner)
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""

@@ -355,13 +355,14 @@ class SessionManager:
                     continue
                 persisted = persisted_rows.get(s.session_id, {})
                 if owner_filter:
-                    # Mirror the DB filter for in-memory rows: show own + untagged,
-                    # hide sessions known to belong to someone else. Prefer the
-                    # in-memory owner, fall back to the persisted user_id.
+                    # Mirror the DB filter for in-memory rows: STRICT ownership —
+                    # show only the caller's own sessions, hide untagged and
+                    # other-owner rows. Prefer the in-memory owner, fall back to
+                    # the persisted user_id.
                     row_owner = (
                         (s.owner or persisted.get("user_id") or "").strip()
                     )
-                    if row_owner and row_owner != owner_filter:
+                    if row_owner != owner_filter:
                         continue
                 preview = next(
                     (
