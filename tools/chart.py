@@ -40,7 +40,7 @@ PALETTE = [
 
 
 def read_csv(path):
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         reader = csv.reader(f)
         headers = next(reader)
         rows = list(reader)
