@@ -5758,17 +5758,43 @@ class AIAgent:
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.conversation_loop import run_conversation
-        return run_conversation(
-            self,
-            user_message,
-            system_message,
-            conversation_history,
-            task_id,
-            stream_callback,
-            persist_user_message,
-            persist_user_timestamp=persist_user_timestamp,
-            moa_config=moa_config,
-        )
+        try:
+            return run_conversation(
+                self,
+                user_message,
+                system_message,
+                conversation_history,
+                task_id,
+                stream_callback,
+                persist_user_message,
+                persist_user_timestamp=persist_user_timestamp,
+                moa_config=moa_config,
+            )
+        finally:
+            # Clear the process-global runtime-main override recorded by
+            # ``set_runtime_main`` in ``build_turn_context`` at the top of every
+            # turn.  On a long-lived, multi-session process (the ``hermes acp``
+            # gateway, messaging gateways, background workers) the override is a
+            # sticky module global that would otherwise only ever be overwritten
+            # by the NEXT turn's ``set_runtime_main`` and never reset.  Any
+            # auxiliary resolve that fires AFTER this run completes but BEFORE
+            # the next turn sets it (vision auto-detect client build, title/
+            # completion passes, background aux tasks) would otherwise read a
+            # STALE main model from a PREVIOUS session and route to the wrong
+            # provider/model.  Clearing here — at the ``run_conversation``
+            # forwarder boundary, the single chokepoint every entry path (CLI,
+            # gateway, ACP) funnels through and the boundary that MATCHES the
+            # ``set`` (session/agent-run scoped, covering the whole turn loop) —
+            # guarantees the override does not leak past the run that set it.
+            # Multi-turn sessions are unaffected: each turn re-sets the override
+            # at the top of ``build_turn_context`` before any aux resolve reads
+            # it.  Cleared per-run rather than per-turn so an in-flight aux task
+            # for the SAME run never observes an empty override mid-flight.
+            try:
+                from agent.auxiliary_client import clear_runtime_main
+                clear_runtime_main()
+            except Exception:
+                pass
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """
