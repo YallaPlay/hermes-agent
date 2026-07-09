@@ -143,6 +143,33 @@ def make_tool_progress_cb(
                 plan_update = _build_plan_update_from_todo_result(kwargs.get("result"))
                 if plan_update is not None:
                     _send_update(conn, session_id, loop, plan_update)
+            # Emit the ACP tool-call completion live, the instant the tool
+            # finishes. The step callback only reports a tool's result on the
+            # *next* API step (via ``prev_tools``), so the last tool(s) of a turn
+            # — or any turn that ends without a further step — never received a
+            # "completed" update and the client spun their spinner forever
+            # (until the turn-end sweep marked them failed, which is also wrong:
+            # they succeeded). Completing here, correlated by the same FIFO
+            # queue, clears the spinner immediately; the step callback's pop is
+            # now a redundant no-op for these ids (guarded there).
+            queue = tool_call_ids.get(name or "")
+            if isinstance(queue, str):
+                queue = deque([queue])
+                tool_call_ids[name] = queue
+            if name and queue:
+                tc_id = queue.popleft()
+                meta = tool_call_meta.pop(tc_id, {})
+                result = kwargs.get("result")
+                update = build_tool_complete(
+                    tc_id,
+                    name,
+                    result=str(result) if result is not None else None,
+                    function_args=meta.get("args"),
+                    snapshot=meta.get("snapshot"),
+                )
+                _send_update(conn, session_id, loop, update)
+                if not queue:
+                    tool_call_ids.pop(name, None)
             return
         # Only emit ACP ToolCallStart for tool.started; ignore other event types
         if event_type != "tool.started":

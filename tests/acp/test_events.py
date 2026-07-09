@@ -126,6 +126,63 @@ class TestToolProgressCallback:
             step_cb(2, [{"name": "terminal", "result": "ok-2"}])
             assert "terminal" not in tool_call_ids
 
+    def test_completes_tool_live_on_tool_completed(self, mock_conn, event_loop_fixture):
+        """A tool.completed event emits the ACP completion immediately.
+
+        The step callback only reports a tool's result on the *next* step, so
+        the last tool of a turn never got a "completed" update and the client
+        spun forever. tool.completed must clear it live, correlated by the FIFO
+        queue and carrying the result.
+        """
+        from collections import deque
+
+        tool_call_ids = {}
+        tool_call_meta = {}
+        loop = event_loop_fixture
+
+        cb = make_tool_progress_cb(mock_conn, "session-1", loop, tool_call_ids, tool_call_meta)
+
+        with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts, \
+             patch("acp_adapter.events.build_tool_complete") as mock_btc:
+            future = MagicMock(spec=Future)
+            future.result.return_value = None
+            mock_rcts.return_value = future
+
+            cb("tool.started", "read_file", "Reading /etc/hosts", {"path": "/etc/hosts"})
+            assert len(tool_call_ids["read_file"]) == 1
+            tc_id = tool_call_ids["read_file"][0]
+
+            cb("tool.completed", "read_file", None, None, result="file contents")
+
+        # Completion built with the started id, args, and the live result.
+        mock_btc.assert_called_once_with(
+            tc_id, "read_file", result="file contents", function_args={"path": "/etc/hosts"}, snapshot=None
+        )
+        # The id is consumed so the step callback won't double-complete it.
+        assert "read_file" not in tool_call_ids
+
+    def test_tool_completed_is_noop_in_step_after_live_completion(self, mock_conn, event_loop_fixture):
+        """After a live completion, the step callback has nothing left to pop."""
+        tool_call_ids = {}
+        tool_call_meta = {}
+        loop = event_loop_fixture
+
+        progress_cb = make_tool_progress_cb(mock_conn, "session-1", loop, tool_call_ids, tool_call_meta)
+        step_cb = make_step_cb(mock_conn, "session-1", loop, tool_call_ids, tool_call_meta)
+
+        with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts, \
+             patch("acp_adapter.events.build_tool_complete") as mock_btc:
+            future = MagicMock(spec=Future)
+            future.result.return_value = None
+            mock_rcts.return_value = future
+
+            progress_cb("tool.started", "terminal", "$ ls", {"command": "ls"})
+            progress_cb("tool.completed", "terminal", None, None, result="ok")
+            assert mock_btc.call_count == 1
+            # The next step sees the id already consumed → no second completion.
+            step_cb(1, [{"name": "terminal", "result": "ok"}])
+            assert mock_btc.call_count == 1
+
 
 # ---------------------------------------------------------------------------
 # Thinking callback
