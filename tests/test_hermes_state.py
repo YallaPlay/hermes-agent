@@ -3466,6 +3466,43 @@ class TestListSessionsRich:
         sessions = db.list_sessions_rich()
         assert sessions[0]["preview"] == ""
 
+    def test_preview_flattens_multimodal_content(self, db):
+        # A user message with an image attachment persists as a content list
+        # (\x00json:-prefixed). The preview must show the text, not the repr.
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", [
+            {"type": "text", "text": "let's change this title"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ])
+        sessions = db.list_sessions_rich()
+        assert sessions[0]["preview"] == "let's change this title"
+        assert "'type'" not in sessions[0]["preview"]
+
+    def test_preview_image_only_multimodal(self, db):
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ])
+        sessions = db.list_sessions_rich()
+        assert sessions[0]["preview"] == "[multimodal content]"
+
+    def test_preview_recovers_legacy_repr_content(self, db):
+        # Legacy/fallback rows stored the content list as a raw str(list) repr
+        # (single-quoted, no \x00json: prefix). The preview must still recover
+        # the text rather than leaking the repr.
+        db.create_session("s1", "cli")
+        db._conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?,?,?,?)",
+            ("s1", "user",
+             "[{'type': 'text', 'text': \"hello from a repr\"}, "
+             "{'type': 'image_url', 'image_url': {'url': 'x'}}]",
+             1.0),
+        )
+        db._conn.commit()
+        sessions = db.list_sessions_rich()
+        assert sessions[0]["preview"] == "hello from a repr"
+        assert "'type'" not in sessions[0]["preview"]
+
     def test_last_active_from_latest_message(self, db):
         import time
         db.create_session("s1", "cli")
