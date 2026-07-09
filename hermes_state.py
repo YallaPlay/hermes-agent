@@ -2811,6 +2811,32 @@ class SessionDB:
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
+    def set_session_owner(self, session_id: str, user_id: str) -> bool:
+        """Stamp a session's owner (``user_id``). Reversible; pass an empty
+        string to clear ownership. Returns True when a row was updated.
+
+        Ownership is a soft, per-user display key (used by the ACP sessions
+        list to show a user only their own sessions), not a security boundary —
+        it does not gate ``session/load``. Unlike archiving there is no
+        compression-lineage walk: ownership is a property of the individual
+        session row a client created, and continuations inherit their own
+        ``user_id`` at creation time.
+        """
+        owner = (user_id or "").strip() or None
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE sessions SET user_id = ? WHERE id = ?",
+                (owner, session_id),
+            )
+            rowcount = cursor.rowcount
+            if rowcount is None or rowcount < 0:
+                rowcount = conn.execute("SELECT changes()").fetchone()[0]
+            return rowcount
+
+        rowcount = self._execute_write(_do)
+        return rowcount > 0
+
     def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
         """Look up a session by exact title. Returns session dict or None."""
         with self._lock:
@@ -3011,6 +3037,7 @@ class SessionDB:
         id_query: str = None,
         search_query: str = None,
         compact_rows: bool = False,
+        owner: str = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -3090,6 +3117,13 @@ class SessionDB:
             where_clauses.append("s.archived = 1")
         elif not include_archived:
             where_clauses.append("s.archived = 0")
+        if owner:
+            # Per-user session list: show the caller's own sessions PLUS any
+            # untagged (legacy / pre-ownership) rows so history is never
+            # orphaned. Only sessions KNOWN to belong to someone else are
+            # hidden. Soft display filter, not an access boundary.
+            where_clauses.append("(s.user_id = ? OR COALESCE(s.user_id, '') = '')")
+            params.append(owner)
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 

@@ -1135,7 +1135,13 @@ class HermesACPAgent(acp.Agent):
         mcp_servers: list | None = None,
         **kwargs: Any,
     ) -> NewSessionResponse:
-        state = self.session_manager.create_session(cwd=cwd)
+        # The authenticated owner rides the ACP extension channel as
+        # _meta.hermes.owner (the JSON-RPC router flattens _meta.<ns> into a
+        # kwarg named after the namespace). Persisted to sessions.user_id so the
+        # sessions list can filter to a user's own sessions. Soft display key.
+        hermes = kwargs.get("hermes") or {}
+        owner = str(hermes.get("owner") or "").strip() or None
+        state = self.session_manager.create_session(cwd=cwd, owner=owner)
         await self._register_session_mcp_servers(state, mcp_servers)
         logger.info("New session %s (cwd=%s)", state.session_id, cwd)
         self._schedule_available_commands_update(state.session_id)
@@ -1300,6 +1306,20 @@ class HermesACPAgent(acp.Agent):
             archived = bool(params.get("archived"))
             ok = self.session_manager.set_session_archived(session_id, archived) if session_id else False
             return {"ok": bool(ok)}
+        if method == "setOwner":
+            # Stamp (or clear, with an empty string) a session's owner
+            # (sessions.user_id) — the key the sessions list filters on so a
+            # user sees only their own sessions. Soft per-user display key, not
+            # an access boundary. Mirrors setArchived; emit an info update so the
+            # client sidebar refreshes.
+            session_id = params.get("sessionId")
+            owner = str(params.get("owner") or "")
+            if not session_id:
+                return {"ok": False, "error": "sessionId required"}
+            ok = self.session_manager.set_session_owner(session_id, owner)
+            if ok:
+                await self._send_session_info_update(session_id)
+            return {"ok": bool(ok)}
         if method == "setTitle":
             # Set (or clear, with an empty string) a session's CANONICAL title in
             # state.db — the thing session/list, the web UI, sessions-list CLI,
@@ -1353,10 +1373,20 @@ class HermesACPAgent(acp.Agent):
         hermes = kwargs.get("hermes") or {}
         archived_only = bool(hermes.get("archivedOnly"))
         include_archived = bool(hermes.get("includeArchived"))
+        # Per-user filter: when ownerOnly is set, restrict to the caller's own
+        # sessions (plus untagged legacy rows). owner carries the authenticated
+        # identity (Cloudflare Access email) the client resolved. Soft display
+        # filter, not an access boundary.
+        owner = (
+            str(hermes.get("owner") or "").strip()
+            if hermes.get("ownerOnly")
+            else None
+        ) or None
         infos = self.session_manager.list_sessions(
             cwd=cwd,
             include_archived=include_archived,
             archived_only=archived_only,
+            owner=owner,
         )
 
         if cursor:

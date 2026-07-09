@@ -949,6 +949,7 @@ class TestListAndFork:
             cwd="/mnt/e/Projects/AI/browser-link-3",
             include_archived=False,
             archived_only=False,
+            owner=None,
         )
 
     @pytest.mark.asyncio
@@ -1081,6 +1082,59 @@ class TestListAndFork:
         assert kwargs.get("include_archived") is False
         s = resp.sessions[0]
         assert (s.field_meta or {}).get("hermes", {}).get("archived") is True
+
+    @pytest.mark.asyncio
+    async def test_ext_method_set_owner_delegates_persists_and_emits(self, agent):
+        with patch.object(
+            agent.session_manager, "set_session_owner", return_value=True
+        ) as mock_set, patch.object(agent, "_send_session_info_update") as mock_emit:
+            result = await agent.ext_method(
+                "setOwner", {"sessionId": "s1", "owner": "user@yallaplay.com"}
+            )
+        assert result == {"ok": True}
+        mock_set.assert_called_once_with("s1", "user@yallaplay.com")
+        mock_emit.assert_awaited_once_with("s1")
+
+    @pytest.mark.asyncio
+    async def test_ext_method_set_owner_noop_returns_false_no_emit(self, agent):
+        # Unknown session id → set returns False → no info update emitted.
+        with patch.object(
+            agent.session_manager, "set_session_owner", return_value=False
+        ), patch.object(agent, "_send_session_info_update") as mock_emit:
+            result = await agent.ext_method("setOwner", {"sessionId": "s1", "owner": ""})
+        assert result == {"ok": False}
+        mock_emit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ext_method_set_owner_requires_session_id(self, agent):
+        result = await agent.ext_method("setOwner", {"owner": "x@y.com"})
+        assert result["ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_list_sessions_owner_only_forwards_owner(self, agent):
+        with patch.object(
+            agent.session_manager, "list_sessions",
+            return_value=[{
+                "session_id": "s1", "cwd": "/tmp", "title": "T",
+                "updated_at": 1.0, "user_id": "me@yallaplay.com",
+            }],
+        ) as mock_list:
+            resp = await agent.list_sessions(
+                cwd="/tmp", hermes={"ownerOnly": True, "owner": "me@yallaplay.com"}
+            )
+        _, kwargs = mock_list.call_args
+        assert kwargs.get("owner") == "me@yallaplay.com"
+        assert len(resp.sessions) == 1
+
+    @pytest.mark.asyncio
+    async def test_list_sessions_owner_ignored_without_owner_only(self, agent):
+        # owner without ownerOnly must NOT filter (owner passed through as None).
+        with patch.object(
+            agent.session_manager, "list_sessions", return_value=[],
+        ) as mock_list:
+            await agent.list_sessions(cwd="/tmp", hermes={"owner": "me@yallaplay.com"})
+        _, kwargs = mock_list.call_args
+        assert kwargs.get("owner") is None
 
 # ---------------------------------------------------------------------------
 # session configuration / model routing
