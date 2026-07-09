@@ -174,6 +174,11 @@ class SessionState:
     agent: Any  # AIAgent instance
     cwd: str = "."
     model: str = ""
+    # ACP session mode (edit-approval policy: default / acceptEdits / dontAsk).
+    # Set by set_session_mode; persisted in the model_config JSON blob so it
+    # survives an agent restart (e.g. a VS Code window reload respawns the ACP
+    # child) instead of reverting to the server default.
+    mode: str = ""
     history: List[Dict[str, Any]] = field(default_factory=list)
     cancel_event: Any = None  # threading.Event
     is_running: bool = False
@@ -474,6 +479,11 @@ class SessionManager:
             session_meta["base_url"] = base_url.strip()
         if isinstance(api_mode, str) and api_mode.strip():
             session_meta["api_mode"] = api_mode.strip()
+        # Persist the ACP session mode so it survives an agent restart; omit the
+        # default so existing rows stay byte-identical when nothing changed it.
+        session_mode = str(getattr(state, "mode", "") or "").strip()
+        if session_mode:
+            session_meta["mode"] = session_mode
         cwd_json = json.dumps(session_meta)
 
         try:
@@ -563,6 +573,7 @@ class SessionManager:
         requested_provider = row.get("billing_provider")
         restored_base_url = row.get("billing_base_url")
         restored_api_mode = None
+        restored_mode = ""
         mc = row.get("model_config")
         if mc:
             try:
@@ -572,6 +583,7 @@ class SessionManager:
                     requested_provider = meta.get("provider") or requested_provider
                     restored_base_url = meta.get("base_url") or restored_base_url
                     restored_api_mode = meta.get("api_mode") or restored_api_mode
+                    restored_mode = str(meta.get("mode") or "").strip()
             except (json.JSONDecodeError, TypeError):
                 pass
 
@@ -602,6 +614,7 @@ class SessionManager:
             agent=agent,
             cwd=cwd,
             model=model or getattr(agent, "model", "") or "",
+            mode=restored_mode,
             history=history,
             cancel_event=threading.Event(),
         )

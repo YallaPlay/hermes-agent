@@ -528,6 +528,35 @@ class TestPersistence:
         # Agent should have been recreated.
         assert restored.agent is not None
 
+    def test_mode_survives_restore_from_db(self, manager):
+        """A non-default session mode must survive a process restart.
+
+        set_session_mode stores the mode on SessionState and persists it into
+        the model_config JSON blob; _restore must read it back so a VS Code
+        window reload (which respawns the ACP agent) doesn't revert the mode
+        to the server default.
+        """
+        state = manager.create_session(cwd="/work")
+        state.mode = "acceptEdits"
+        manager.save_session(state.session_id)
+        sid = state.session_id
+
+        # Drop from in-memory store (simulates process restart).
+        with manager._lock:
+            del manager._sessions[sid]
+
+        restored = manager.get_session(sid)
+        assert restored is not None
+        assert restored.mode == "acceptEdits"
+
+    def test_default_mode_not_written_to_model_config(self, manager):
+        """An unset/default mode leaves no `mode` key in the meta blob."""
+        state = manager.create_session(cwd="/work")
+        manager.save_session(state.session_id)
+        row = manager._get_db().get_session(state.session_id)
+        meta = json.loads(row["model_config"])
+        assert "mode" not in meta
+
     def test_save_session_updates_db(self, manager):
         state = manager.create_session()
         state.history.append({"role": "user", "content": "test"})
