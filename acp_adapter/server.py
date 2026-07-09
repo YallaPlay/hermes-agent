@@ -1607,7 +1607,22 @@ class HermesACPAgent(acp.Agent):
                     clear_session_vars,
                     set_session_vars,
                 )
-                session_tokens = set_session_vars(session_key=session_id)
+                # ACP is a stateless request/response channel: it tears down its
+                # outbound channel when the turn ends and runs no persistent
+                # watcher/drain loop, so a background completion that finishes
+                # AFTER the turn (delegate_task background=True, terminal
+                # notify_on_complete / watch_patterns) has nowhere to route and
+                # is silently dropped until the next inbound request. Bind
+                # async_delivery=False — mirroring the stateless API server
+                # (gateway/platforms/api_server.py) — so async_delivery_supported()
+                # reports False and those tools refuse the promise (running the
+                # work inline) instead of stranding it. Without this, ACP inherits
+                # the optimistic set_session_vars default (True) because
+                # HermesACPAgent subclasses acp.Agent directly and never goes
+                # through the platform-adapter supports_async_delivery convention.
+                session_tokens = set_session_vars(
+                    session_key=session_id, async_delivery=False
+                )
             except Exception:
                 session_tokens = None
                 clear_session_vars = None  # type: ignore[assignment]
