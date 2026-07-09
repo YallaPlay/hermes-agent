@@ -179,6 +179,10 @@ class SessionState:
     # survives an agent restart (e.g. a VS Code window reload respawns the ACP
     # child) instead of reverting to the server default.
     mode: str = ""
+    # Authenticated owner (e.g. Cloudflare Access email) supplied by the client
+    # on session/new. Persisted to sessions.user_id so the ACP sessions list can
+    # filter to a user's own sessions. Soft display key, not an access boundary.
+    owner: Optional[str] = None
     history: List[Dict[str, Any]] = field(default_factory=list)
     cancel_event: Any = None  # threading.Event
     is_running: bool = False
@@ -212,8 +216,15 @@ class SessionManager:
 
     # ---- public API ---------------------------------------------------------
 
-    def create_session(self, cwd: str = ".") -> SessionState:
-        """Create a new session with a unique ID and a fresh AIAgent."""
+    def create_session(self, cwd: str = ".", owner: str | None = None) -> SessionState:
+        """Create a new session with a unique ID and a fresh AIAgent.
+
+        ``owner`` (an authenticated user identifier, e.g. the Cloudflare Access
+        email supplied by the client on ``session/new``) is persisted to
+        ``sessions.user_id`` so the ACP sessions list can show a user only
+        their own sessions. It is a soft per-user display key, not an access
+        boundary.
+        """
         import threading
 
         cwd = _translate_acp_cwd(cwd)
@@ -226,6 +237,7 @@ class SessionManager:
             model=getattr(agent, "model", "") or "",
             cancel_event=threading.Event(),
         )
+        state.owner = (owner or "").strip() or None
         with self._lock:
             self._sessions[session_id] = state
         _register_task_cwd(session_id, cwd)
@@ -308,9 +320,11 @@ class SessionManager:
         cwd: str | None = None,
         include_archived: bool = False,
         archived_only: bool = False,
+        owner: str | None = None,
     ) -> List[Dict[str, Any]]:
         """Return lightweight info dicts for all sessions (memory + database)."""
         normalized_cwd = _normalize_cwd_for_compare(cwd) if cwd else None
+        owner_filter = (owner or "").strip() or None
         db = self._get_db()
         persisted_rows: dict[str, dict[str, Any]] = {}
 
@@ -321,6 +335,7 @@ class SessionManager:
                     limit=1000,
                     include_archived=include_archived,
                     archived_only=archived_only,
+                    owner=owner_filter,
                 ):
                     persisted_rows[str(row["id"])] = dict(row)
             except Exception:
@@ -339,6 +354,15 @@ class SessionManager:
                 if normalized_cwd and _normalize_cwd_for_compare(s.cwd) != normalized_cwd:
                     continue
                 persisted = persisted_rows.get(s.session_id, {})
+                if owner_filter:
+                    # Mirror the DB filter for in-memory rows: show own + untagged,
+                    # hide sessions known to belong to someone else. Prefer the
+                    # in-memory owner, fall back to the persisted user_id.
+                    row_owner = (
+                        (s.owner or persisted.get("user_id") or "").strip()
+                    )
+                    if row_owner and row_owner != owner_filter:
+                        continue
                 preview = next(
                     (
                         str(msg.get("content") or "").strip()
@@ -353,6 +377,7 @@ class SessionManager:
                         "cwd": s.cwd,
                         "model": s.model,
                         "history_len": history_len,
+                        "user_id": s.owner or persisted.get("user_id") or "",
                         "title": _build_session_title(persisted.get("title"), preview, s.cwd),
                         "updated_at": _format_updated_at(
                             persisted.get("last_active") or persisted.get("started_at") or time.time()
@@ -383,6 +408,7 @@ class SessionManager:
                 "cwd": session_cwd,
                 "model": row.get("model") or "",
                 "history_len": message_count,
+                "user_id": row.get("user_id") or "",
                 "title": _build_session_title(row.get("title"), row.get("preview"), session_cwd),
                 "updated_at": _format_updated_at(row.get("last_active") or row.get("started_at")),
                 "archived": bool(row.get("archived")),
@@ -495,6 +521,7 @@ class SessionManager:
                     source="acp",
                     model=model_str,
                     model_config={"cwd": state.cwd},
+                    user_id=getattr(state, "owner", None),
                 )
             else:
                 # Update model_config (contains cwd) if changed.
@@ -644,6 +671,27 @@ class SessionManager:
             return bool(db.set_session_archived(session_id, archived))
         except Exception:
             logger.debug("Failed to set archived on %s", session_id, exc_info=True)
+            return False
+
+    def set_session_owner(self, session_id: str, user_id: str) -> bool:
+        """Stamp (or clear, when *user_id* is empty) a session's owner in
+        state.db. The owner is the authenticated user identifier the ACP
+        sessions list filters on. Soft per-user display key, not a boundary.
+        Also mirrors the value onto the in-memory session so a subsequent
+        ``_persist`` doesn't drop it. Returns True when a row was updated.
+        """
+        db = self._get_db()
+        if db is None:
+            return False
+        owner = (user_id or "").strip() or None
+        with self._lock:
+            state = self._sessions.get(session_id)
+            if state is not None:
+                state.owner = owner
+        try:
+            return bool(db.set_session_owner(session_id, owner or ""))
+        except Exception:
+            logger.debug("Failed to set owner on %s", session_id, exc_info=True)
             return False
 
     def set_session_title(self, session_id: str, title: str) -> bool:
