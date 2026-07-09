@@ -27,6 +27,7 @@ from typing import Any, Dict, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
+from hermes_logging import run_with_session_context
 from agent.error_classifier import FailoverReason
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
@@ -459,7 +460,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
     _call_start = time.time()
     agent._touch_activity("waiting for non-streaming API response")
 
-    t = threading.Thread(target=_call, daemon=True)
+    # Propagate the session context into the worker thread so its log records
+    # carry the [session_id] tag (threading.local does not inherit — see
+    # hermes_logging.run_with_session_context).
+    _sid = getattr(agent, "session_id", None)
+    t = threading.Thread(
+        target=lambda: run_with_session_context(_sid, _call), daemon=True
+    )
     t.start()
     _poll_count = 0
     while t.is_alive():
@@ -1940,7 +1947,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             except Exception as e:
                 result["error"] = e
 
-        t = threading.Thread(target=_bedrock_call, daemon=True)
+        # Propagate session context into the Bedrock worker thread (see
+        # hermes_logging.run_with_session_context) so its log records are tagged.
+        _sid = getattr(agent, "session_id", None)
+        t = threading.Thread(
+            target=lambda: run_with_session_context(_sid, _bedrock_call),
+            daemon=True,
+        )
         t.start()
         while t.is_alive():
             t.join(timeout=0.3)
@@ -2899,7 +2912,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         if _reasoning_floor is not None:
             _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
 
-    t = threading.Thread(target=_call, daemon=True)
+    # Propagate session context into the streaming worker thread (see
+    # hermes_logging.run_with_session_context) so its log records are tagged.
+    _sid = getattr(agent, "session_id", None)
+    t = threading.Thread(
+        target=lambda: run_with_session_context(_sid, _call), daemon=True
+    )
     t.start()
     _last_heartbeat = time.time()
     _HEARTBEAT_INTERVAL = 30.0  # seconds between gateway activity touches

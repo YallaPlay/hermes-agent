@@ -176,6 +176,45 @@ def clear_session_context() -> None:
     _session_context.session_id = None
 
 
+def get_session_context() -> Optional[str]:
+    """Return the session ID bound to the current thread, or ``None``.
+
+    Reads the same threading.local the LogRecord factory consults, so callers
+    can capture the active session id BEFORE spawning a worker thread and
+    re-apply it inside that worker (worker threads do NOT inherit
+    threading.local state).  Returns ``None`` when no context is set.
+    """
+    return getattr(_session_context, "session_id", None)
+
+
+def run_with_session_context(session_id: Optional[str], fn, *args, **kwargs):
+    """Run ``fn(*args, **kwargs)`` with the thread-local session context set.
+
+    Hermes spawns daemon worker threads for model API calls and auxiliary
+    work (title generation, curator review, …).  Those threads do NOT inherit
+    the main turn thread's ``threading.local`` session context, so log records
+    they emit come out with an empty ``session_tag``.  Wrap the worker's target
+    with this helper — capturing ``get_session_context()`` (or the in-scope
+    ``agent.session_id``) on the spawning thread BEFORE ``Thread(...)`` — to
+    tag those records with ``[session_id]``.
+
+    The prior context on the worker thread (normally none, since it is fresh)
+    is restored in a ``finally`` so the helper is safe on reused/pooled
+    threads too.  When *session_id* is falsy this is a transparent pass-through:
+    no context is set and the tag stays ``""`` (no crash, no KeyError).
+    """
+    if not session_id:
+        return fn(*args, **kwargs)
+    _prev = getattr(_session_context, "session_id", None)
+    set_session_context(session_id)
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        # Restore rather than blindly clear so a genuinely nested/reused thread
+        # keeps whatever context it had before we borrowed it.
+        _session_context.session_id = _prev
+
+
 # ---------------------------------------------------------------------------
 # Record factory — injects session_tag into every LogRecord at creation
 # ---------------------------------------------------------------------------
