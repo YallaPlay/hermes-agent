@@ -1513,6 +1513,22 @@ class HermesACPAgent(acp.Agent):
             state.is_running = True
             state.current_prompt_text = user_text or "[Image attachment]"
 
+        # First-turn identity: when the session carries an authenticated owner
+        # (e.g. the Cloudflare Access email stamped via _meta.hermes.owner at
+        # session/new), surface it to the agent ONCE — on the first turn, when
+        # history is still empty — as a neutral context line prepended to the
+        # user message. Later turns already have it in history, so re-injecting
+        # would waste tokens. Text-only prompts only (a plain string user_content);
+        # multimodal turns keep their structured content untouched.
+        if state.owner and not state.history and isinstance(user_content, str):
+            owner_note = (
+                f"[authenticated user: {state.owner}]\n"
+                "(This is the signed-in user you are talking to, from the "
+                "surface's SSO/identity provider. Use it to address and identify "
+                "them; do not ask who they are.)\n\n"
+            )
+            user_content = owner_note + user_content
+
         logger.info("Prompt on session %s: %s", session_id, user_text[:100])
 
         conn = self._conn

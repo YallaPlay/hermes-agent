@@ -1302,6 +1302,94 @@ class TestPrompt:
         assert state.agent.thinking_callback is None
 
     @pytest.mark.asyncio
+    async def test_prompt_injects_authenticated_owner_on_first_turn(self, agent):
+        """A session with an authenticated owner surfaces the identity to the
+        agent ONCE, on the first turn (empty history), prepended to the user
+        message. The persisted user message stays clean (original text)."""
+        new_resp = await agent.new_session(cwd=".", hermes={"owner": "kareem@yallaplay.com"})
+        state = agent.session_manager.get_session(new_resp.session_id)
+        assert state.owner == "kareem@yallaplay.com"
+        assert not state.history  # first turn
+
+        captured = {}
+
+        def _run(**kwargs):
+            captured.update(kwargs)
+            return {"final_response": "hi", "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+            ]}
+
+        state.agent.run_conversation = MagicMock(side_effect=_run)
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        await agent.prompt(prompt=[TextContentBlock(type="text", text="hello")],
+                           session_id=new_resp.session_id)
+
+        # The owner note is prepended to what the model sees this turn...
+        assert "kareem@yallaplay.com" in captured["user_message"]
+        assert "authenticated user" in captured["user_message"]
+        assert captured["user_message"].endswith("hello")
+        # ...but the persisted message is the clean original.
+        assert captured["persist_user_message"] == "hello"
+
+    @pytest.mark.asyncio
+    async def test_prompt_omits_owner_note_on_later_turns(self, agent):
+        """Once history exists, the owner note is NOT re-injected (already in
+        history — re-sending wastes tokens)."""
+        new_resp = await agent.new_session(cwd=".", hermes={"owner": "kareem@yallaplay.com"})
+        state = agent.session_manager.get_session(new_resp.session_id)
+        state.history = [
+            {"role": "user", "content": "prior"},
+            {"role": "assistant", "content": "ok"},
+        ]
+
+        captured = {}
+
+        def _run(**kwargs):
+            captured.update(kwargs)
+            return {"final_response": "hi", "messages": state.history}
+
+        state.agent.run_conversation = MagicMock(side_effect=_run)
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        await agent.prompt(prompt=[TextContentBlock(type="text", text="second")],
+                           session_id=new_resp.session_id)
+
+        assert captured["user_message"] == "second"
+        assert "authenticated user" not in captured["user_message"]
+
+    @pytest.mark.asyncio
+    async def test_prompt_no_owner_note_when_unowned(self, agent):
+        """A session without an owner injects nothing."""
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        assert state.owner is None
+
+        captured = {}
+
+        def _run(**kwargs):
+            captured.update(kwargs)
+            return {"final_response": "hi", "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+            ]}
+
+        state.agent.run_conversation = MagicMock(side_effect=_run)
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        await agent.prompt(prompt=[TextContentBlock(type="text", text="hello")],
+                           session_id=new_resp.session_id)
+
+        assert captured["user_message"] == "hello"
+
+    @pytest.mark.asyncio
     async def test_prompt_updates_history(self, agent):
         """After a prompt, session history should be updated."""
         new_resp = await agent.new_session(cwd=".")
