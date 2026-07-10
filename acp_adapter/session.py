@@ -305,6 +305,10 @@ class SessionManager:
             agent=agent,
             cwd=cwd,
             model=getattr(agent, "model", original.model) or original.model,
+            # Carry the edit-approval mode into the fork: a fork continues the
+            # same working context, so silently reverting to the server default
+            # (ask-before-edits) would surprise the user mid-flow.
+            mode=original.mode,
             history=copy.deepcopy(forked_history),
             cancel_event=threading.Event(),
         )

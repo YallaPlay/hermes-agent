@@ -204,6 +204,19 @@ class TestForkSession:
         assert forked is not None
         assert forked.session_id != original.session_id
 
+    def test_fork_session_preserves_mode(self, manager):
+        original = manager.create_session()
+        original.mode = "acceptEdits"
+        forked = manager.fork_session(original.session_id, cwd="/new")
+        assert forked is not None
+        assert forked.mode == "acceptEdits"
+
+    def test_fork_session_default_mode_stays_empty(self, manager):
+        original = manager.create_session()
+        forked = manager.fork_session(original.session_id, cwd="/new")
+        assert forked is not None
+        assert forked.mode == ""
+
     def test_fork_nonexistent_returns_none(self, manager):
         assert manager.fork_session("bogus-id") is None
 
