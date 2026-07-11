@@ -298,6 +298,41 @@ class TestListAndCleanup:
         manager.create_session(cwd="/empty")
         assert manager.list_sessions() == []
 
+    def test_list_sessions_flattens_multimodal_first_message(self, manager):
+        """A multimodal first user message (text + image parts) must surface its
+        text in the title, not the raw list repr (leaking-code-in-title bug)."""
+        s = manager.create_session(cwd="/mm")
+        s.history.append(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "sometimes i send a screenshot"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                ],
+            }
+        )
+        listing = manager.list_sessions()
+        assert len(listing) == 1
+        title = listing[0]["title"]
+        assert "sometimes i send a screenshot" in title
+        assert "[{" not in title and "'type'" not in title
+
+    def test_list_sessions_image_only_first_message_placeholder(self, manager):
+        s = manager.create_session(cwd="/imgonly")
+        s.history.append(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+                ],
+            }
+        )
+        s.history.append({"role": "user", "content": "follow-up words"})
+        listing = manager.list_sessions()
+        assert len(listing) == 1
+        # First user message is image-only → placeholder wins (first match).
+        assert listing[0]["title"] == "[multimodal content]"
+
     def test_save_session_preserves_existing_messages_on_encode_failure(self, manager):
         """Regression for #13675: a bad message in state.history must not
         clobber the previously-persisted transcript.  replace_messages()

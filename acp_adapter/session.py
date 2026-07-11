@@ -70,6 +70,29 @@ def _normalize_cwd_for_compare(cwd: str | None) -> str:
     return os.path.normpath(expanded)
 
 
+def _preview_text(content: Any, limit: int = 60) -> str:
+    """Flatten an in-memory message ``content`` value into preview text.
+
+    Multimodal user messages (e.g. a prompt with a screenshot) hold ``content``
+    as a list of parts (``[{"type": "text", ...}, {"type": "image_url", ...}]``).
+    A naive ``str()`` leaks the list repr into the sessions-list title —
+    mirror SessionDB._preview_from_raw: flatten the text parts, fall back to a
+    ``[multimodal content]`` placeholder for image-only messages.
+    """
+    if isinstance(content, list):
+        parts = [
+            p.get("text", "")
+            for p in content
+            if isinstance(p, dict) and p.get("type") == "text"
+        ]
+        text = " ".join(t.strip() for t in parts if t and t.strip()).strip()
+        text = text or "[multimodal content]"
+    else:
+        text = str(content or "").strip()
+    text = " ".join(text.split())
+    return text[:limit] + ("..." if len(text) > limit else "")
+
+
 def _build_session_title(title: Any, preview: Any, cwd: str | None) -> str:
     explicit = str(title or "").strip()
     if explicit:
@@ -396,9 +419,9 @@ class SessionManager:
                         continue
                 preview = next(
                     (
-                        str(msg.get("content") or "").strip()
+                        _preview_text(msg.get("content"))
                         for msg in s.history
-                        if msg.get("role") == "user" and str(msg.get("content") or "").strip()
+                        if msg.get("role") == "user" and _preview_text(msg.get("content"))
                     ),
                     persisted.get("preview") or "",
                 )
