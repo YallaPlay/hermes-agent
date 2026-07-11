@@ -47,6 +47,8 @@ from acp.schema import (
     SetSessionModeResponse,
     ResourceContentBlock,
     SessionCapabilities,
+    SessionConfigOptionSelect,
+    SessionConfigSelectOption,
     SessionForkCapabilities,
     SessionInfoUpdate,
     SessionListCapabilities,
@@ -73,7 +75,12 @@ from acp_adapter.events import (
 )
 from acp_adapter.permissions import make_approval_callback
 from acp_adapter.provenance import session_provenance_meta
-from acp_adapter.session import SessionManager, SessionState, _expand_acp_enabled_toolsets
+from acp_adapter.session import (
+    SessionManager,
+    SessionState,
+    _apply_effort_to_agent,
+    _expand_acp_enabled_toolsets,
+)
 from acp_adapter.tools import build_tool_complete, build_tool_start
 from tools.approval import (
     reset_hermes_interactive_context,
@@ -108,6 +115,28 @@ _TEXT_RESOURCE_MIME_TYPES = {
     "application/toml",
     "application/sql",
 }
+
+
+def _apply_session_effort(agent: Any, level: str) -> None:
+    """Apply a reasoning-effort level to the LIVE agent.
+
+    ``agent.reasoning_config`` is read on every API call, so this takes effect
+    on the next call (same mechanism as the set_reasoning_effort tool).
+    "default" restores the provider default by clearing the override to None —
+    unlike the restore-time helper in acp_adapter.session, which can simply
+    skip touching a fresh agent.
+    """
+    try:
+        if str(level or "").strip().lower() == "default":
+            agent.reasoning_config = None
+            return
+        from hermes_constants import parse_reasoning_effort
+
+        parsed = parse_reasoning_effort(level)
+        if parsed is not None:
+            agent.reasoning_config = parsed
+    except Exception:
+        logger.debug("Could not apply reasoning effort %r", level, exc_info=True)
 
 
 def _resource_display_name(uri: str, name: str | None = None, title: str | None = None) -> str:
@@ -521,6 +550,21 @@ class HermesACPAgent(acp.Agent):
         value: key for key, value in _MODE_TO_EDIT_APPROVAL_POLICY.items()
     }
 
+    # Session-scoped reasoning effort, exposed as an ACP select config option.
+    # "default" means no override (provider/profile default); the rest mirror
+    # tools/reasoning_effort_tool.VALID_LEVELS and the /reasoning command.
+    _REASONING_EFFORT_CONFIG_ID = "reasoning_effort"
+    _REASONING_EFFORT_DEFAULT = "default"
+    _REASONING_EFFORT_LEVELS = (
+        ("default", "Default", "Provider/profile default reasoning effort."),
+        ("none", "None", "Disable extended reasoning."),
+        ("minimal", "Minimal", "Bare-minimum reasoning."),
+        ("low", "Low", "Light reasoning for routine work."),
+        ("medium", "Medium", "Balanced reasoning."),
+        ("high", "High", "Deep reasoning for hard tasks."),
+        ("xhigh", "XHigh", "Maximum reasoning effort."),
+    )
+
     def __init__(self, session_manager: SessionManager | None = None):
         super().__init__()
         self.session_manager = session_manager or SessionManager()
@@ -571,6 +615,26 @@ class HermesACPAgent(acp.Agent):
         mode = str(getattr(state, "mode", "") or self._MODE_DEFAULT)
         policy = self._MODE_TO_EDIT_APPROVAL_POLICY.get(mode, self._EDIT_APPROVAL_POLICY_DEFAULT)
         return policy, state.cwd
+
+    def _session_config_options(self, state: SessionState) -> list[SessionConfigOptionSelect]:
+        """ACP config options for a session: currently the reasoning-effort select."""
+        current = str(getattr(state, "effort", "") or "").strip().lower()
+        valid = {value for value, _, _ in self._REASONING_EFFORT_LEVELS}
+        if current not in valid:
+            current = self._REASONING_EFFORT_DEFAULT
+        return [
+            SessionConfigOptionSelect(
+                id=self._REASONING_EFFORT_CONFIG_ID,
+                name="Effort",
+                description="Reasoning effort for this session.",
+                type="select",
+                current_value=current,
+                options=[
+                    SessionConfigSelectOption(value=value, name=name, description=desc)
+                    for value, name, desc in self._REASONING_EFFORT_LEVELS
+                ],
+            )
+        ]
 
     @staticmethod
     def _encode_model_choice(provider: str | None, model: str | None) -> str:
@@ -1150,6 +1214,7 @@ class HermesACPAgent(acp.Agent):
             session_id=state.session_id,
             models=self._build_model_state(state),
             modes=self._session_modes(state),
+            config_options=self._session_config_options(state),
             field_meta=self._provenance_meta(
                 state.session_id, getattr(state.agent, "session_id", state.session_id)
             ),
@@ -1197,6 +1262,7 @@ class HermesACPAgent(acp.Agent):
         return LoadSessionResponse(
             models=self._build_model_state(state),
             modes=self._session_modes(state),
+            config_options=self._session_config_options(state),
             field_meta=self._provenance_meta(
                 session_id, getattr(state.agent, "session_id", session_id)
             ),
@@ -1232,6 +1298,7 @@ class HermesACPAgent(acp.Agent):
         return ResumeSessionResponse(
             models=self._build_model_state(state),
             modes=self._session_modes(state),
+            config_options=self._session_config_options(state),
             field_meta=self._provenance_meta(
                 state.session_id, getattr(state.agent, "session_id", state.session_id)
             ),
@@ -1297,6 +1364,7 @@ class HermesACPAgent(acp.Agent):
             session_id=new_id,
             models=self._build_model_state(state) if state is not None else None,
             modes=self._session_modes(state) if state is not None else None,
+            config_options=self._session_config_options(state) if state is not None else None,
         )
 
     async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -1955,6 +2023,9 @@ class HermesACPAgent(acp.Agent):
             model=new_model,
             requested_provider=target_provider,
         )
+        # A fresh agent starts at the provider-default reasoning config; carry
+        # the session's effort override over so a model switch doesn't drop it.
+        _apply_effort_to_agent(state.agent, getattr(state, "effort", ""))
         self.session_manager.save_session(state.session_id)
         provider_label = getattr(state.agent, "provider", None) or target_provider or current_provider
         logger.info("Session %s: model switched to %s", state.session_id, new_model)
@@ -2191,6 +2262,8 @@ class HermesACPAgent(acp.Agent):
                 base_url=current_base_url,
                 api_mode=current_api_mode,
             )
+            # Carry the session's reasoning-effort override onto the fresh agent.
+            _apply_effort_to_agent(state.agent, getattr(state, "effort", ""))
             self.session_manager.save_session(session_id)
             logger.info(
                 "Session %s: model switched to %s via provider %s",
@@ -2230,6 +2303,17 @@ class HermesACPAgent(acp.Agent):
         if str(config_id) == self._EDIT_APPROVAL_POLICY_CONFIG_ID:
             mode = self._EDIT_APPROVAL_POLICY_TO_MODE.get(str(value), self._MODE_DEFAULT)
             setattr(state, "mode", mode)
+        elif str(config_id) == self._REASONING_EFFORT_CONFIG_ID:
+            level = str(value or "").strip().lower()
+            valid = {v for v, _, _ in self._REASONING_EFFORT_LEVELS}
+            if level not in valid:
+                level = self._REASONING_EFFORT_DEFAULT
+            # "default" clears the override; the fresh-agent path (restore/fork/
+            # model switch) then simply doesn't touch reasoning_config. On the
+            # LIVE agent, restore the provider default explicitly.
+            state.effort = "" if level == self._REASONING_EFFORT_DEFAULT else level
+            _apply_session_effort(state.agent, level)
+            logger.info("Session %s: reasoning effort set to %s", session_id, level)
         else:
             options = getattr(state, "config_options", None)
             if not isinstance(options, dict):
@@ -2238,4 +2322,6 @@ class HermesACPAgent(acp.Agent):
             setattr(state, "config_options", options)
         self.session_manager.save_session(session_id)
         logger.info("Session %s: config option %s updated", session_id, config_id)
-        return SetSessionConfigOptionResponse(config_options=[])
+        return SetSessionConfigOptionResponse(
+            config_options=self._session_config_options(state)
+        )

@@ -54,10 +54,11 @@ def agent(mock_manager):
 
 
 @pytest.mark.asyncio
-async def test_new_session_exposes_edit_approvals_as_modes_not_config_options(agent):
+async def test_new_session_exposes_edit_approvals_as_modes(agent):
+    """Edit approval stays on the modes channel (Zed keeps its model picker);
+    config_options carries only the reasoning-effort select."""
     resp = await agent.new_session(cwd="/tmp")
 
-    assert resp.config_options is None
     assert isinstance(resp.modes, SessionModeState)
     assert resp.modes.current_mode_id == "default"
     assert [(mode.id, mode.name) for mode in resp.modes.available_modes] == [
@@ -65,10 +66,22 @@ async def test_new_session_exposes_edit_approvals_as_modes_not_config_options(ag
         ("accept_edits", "Accept Edits"),
         ("dont_ask", "Don't Ask"),
     ]
+    assert [opt.id for opt in resp.config_options] == ["reasoning_effort"]
 
 
 @pytest.mark.asyncio
-async def test_set_config_option_persists_edit_approval_policy_without_advertising_config(agent):
+async def test_new_session_advertises_reasoning_effort_config_option(agent):
+    resp = await agent.new_session(cwd="/tmp")
+    (opt,) = resp.config_options
+    assert opt.type == "select"
+    assert opt.current_value == "default"
+    assert [o.value for o in opt.options] == [
+        "default", "none", "minimal", "low", "medium", "high", "xhigh",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_set_config_option_persists_edit_approval_policy(agent):
     resp = await agent.new_session(cwd="/tmp")
     update = await agent.set_config_option(
         "edit_approval_policy",
@@ -78,8 +91,46 @@ async def test_set_config_option_persists_edit_approval_policy_without_advertisi
     state = agent.session_manager.get_session(resp.session_id)
 
     assert isinstance(update, SetSessionConfigOptionResponse)
-    assert update.config_options == []
     assert getattr(state, "mode", None) == "accept_edits"
+
+
+@pytest.mark.asyncio
+async def test_set_config_option_reasoning_effort_applies_and_persists(agent):
+    resp = await agent.new_session(cwd="/tmp")
+    update = await agent.set_config_option(
+        "reasoning_effort",
+        resp.session_id,
+        "high",
+    )
+    state = agent.session_manager.get_session(resp.session_id)
+
+    assert state.effort == "high"
+    assert state.agent.reasoning_config == {"enabled": True, "effort": "high"}
+    (opt,) = update.config_options
+    assert opt.id == "reasoning_effort"
+    assert opt.current_value == "high"
+
+
+@pytest.mark.asyncio
+async def test_set_config_option_reasoning_effort_default_clears_override(agent):
+    resp = await agent.new_session(cwd="/tmp")
+    await agent.set_config_option("reasoning_effort", resp.session_id, "xhigh")
+    update = await agent.set_config_option("reasoning_effort", resp.session_id, "default")
+    state = agent.session_manager.get_session(resp.session_id)
+
+    assert state.effort == ""
+    assert state.agent.reasoning_config is None
+    assert update.config_options[0].current_value == "default"
+
+
+@pytest.mark.asyncio
+async def test_set_config_option_reasoning_effort_invalid_falls_back_to_default(agent):
+    resp = await agent.new_session(cwd="/tmp")
+    await agent.set_config_option("reasoning_effort", resp.session_id, "ludicrous")
+    state = agent.session_manager.get_session(resp.session_id)
+
+    assert state.effort == ""
+    assert state.agent.reasoning_config is None
 
 
 # ---------------------------------------------------------------------------
@@ -1172,7 +1223,9 @@ class TestSessionConfiguration:
         )
 
         assert mode_result == {}
-        assert config_result["configOptions"] == []
+        # The response advertises the full option set (currently the
+        # reasoning-effort select) so clients can re-render their pickers.
+        assert [opt["id"] for opt in config_result["configOptions"]] == ["reasoning_effort"]
 
     @pytest.mark.asyncio
     async def test_router_accepts_unstable_model_switch_when_enabled(self, agent):

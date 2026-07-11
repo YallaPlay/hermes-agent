@@ -570,6 +570,39 @@ class TestPersistence:
         meta = json.loads(row["model_config"])
         assert "mode" not in meta
 
+    def test_effort_survives_restore_from_db(self, manager):
+        """A session's reasoning-effort override must survive a restart,
+        and be re-applied to the freshly minted agent's reasoning_config."""
+        state = manager.create_session(cwd="/work")
+        state.effort = "high"
+        manager.save_session(state.session_id)
+        sid = state.session_id
+
+        with manager._lock:
+            del manager._sessions[sid]
+
+        restored = manager.get_session(sid)
+        assert restored is not None
+        assert restored.effort == "high"
+        assert restored.agent.reasoning_config == {"enabled": True, "effort": "high"}
+
+    def test_default_effort_not_written_to_model_config(self, manager):
+        """An unset effort leaves no `effort` key in the meta blob and does
+        not touch the restored agent's reasoning_config."""
+        state = manager.create_session(cwd="/work")
+        manager.save_session(state.session_id)
+        row = manager._get_db().get_session(state.session_id)
+        meta = json.loads(row["model_config"])
+        assert "effort" not in meta
+
+    def test_fork_session_preserves_effort(self, manager):
+        original = manager.create_session()
+        original.effort = "xhigh"
+        forked = manager.fork_session(original.session_id, cwd="/new")
+        assert forked is not None
+        assert forked.effort == "xhigh"
+        assert forked.agent.reasoning_config == {"enabled": True, "effort": "xhigh"}
+
     def test_save_session_updates_db(self, manager):
         state = manager.create_session()
         state.history.append({"role": "user", "content": "test"})

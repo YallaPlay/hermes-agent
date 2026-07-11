@@ -155,6 +155,26 @@ def _expand_acp_enabled_toolsets(
     return expanded
 
 
+def _apply_effort_to_agent(agent: Any, effort: str) -> None:
+    """Mirror a session's reasoning-effort override onto a (fresh) agent.
+
+    ``agent.reasoning_config`` is read on every API call, so mutating it here
+    takes effect on the next call (same mechanism as the set_reasoning_effort
+    tool). Empty/invalid levels are a no-op — the agent keeps its default.
+    """
+    effort = str(effort or "").strip().lower()
+    if not effort:
+        return
+    try:
+        from hermes_constants import parse_reasoning_effort
+
+        parsed = parse_reasoning_effort(effort)
+        if parsed is not None:
+            agent.reasoning_config = parsed
+    except Exception:
+        logger.debug("Could not apply reasoning effort %r to agent", effort, exc_info=True)
+
+
 def _clear_task_cwd(task_id: str) -> None:
     """Remove task-specific cwd overrides for an ACP session."""
     if not task_id:
@@ -179,6 +199,10 @@ class SessionState:
     # survives an agent restart (e.g. a VS Code window reload respawns the ACP
     # child) instead of reverting to the server default.
     mode: str = ""
+    # Session-scoped reasoning effort override (none/minimal/low/medium/high/
+    # xhigh), set via the reasoningEffort ACP config option. Empty = provider
+    # default. Persisted like `mode` and re-applied to the agent on restore.
+    effort: str = ""
     # Authenticated owner (e.g. Cloudflare Access email) supplied by the client
     # on session/new. Persisted to sessions.user_id so the ACP sessions list can
     # filter to a user's own sessions. Soft display key, not an access boundary.
@@ -305,13 +329,15 @@ class SessionManager:
             agent=agent,
             cwd=cwd,
             model=getattr(agent, "model", original.model) or original.model,
-            # Carry the edit-approval mode into the fork: a fork continues the
-            # same working context, so silently reverting to the server default
-            # (ask-before-edits) would surprise the user mid-flow.
+            # Carry the edit-approval mode and reasoning effort into the fork:
+            # a fork continues the same working context, so silently reverting
+            # to server defaults would surprise the user mid-flow.
             mode=original.mode,
+            effort=original.effort,
             history=copy.deepcopy(forked_history),
             cancel_event=threading.Event(),
         )
+        _apply_effort_to_agent(agent, original.effort)
         with self._lock:
             self._sessions[new_id] = state
         _register_task_cwd(new_id, cwd)
@@ -515,6 +541,10 @@ class SessionManager:
         session_mode = str(getattr(state, "mode", "") or "").strip()
         if session_mode:
             session_meta["mode"] = session_mode
+        # Same for the session's reasoning-effort override.
+        session_effort = str(getattr(state, "effort", "") or "").strip()
+        if session_effort:
+            session_meta["effort"] = session_effort
         cwd_json = json.dumps(session_meta)
 
         try:
@@ -606,6 +636,7 @@ class SessionManager:
         restored_base_url = row.get("billing_base_url")
         restored_api_mode = None
         restored_mode = ""
+        restored_effort = ""
         mc = row.get("model_config")
         if mc:
             try:
@@ -616,6 +647,7 @@ class SessionManager:
                     restored_base_url = meta.get("base_url") or restored_base_url
                     restored_api_mode = meta.get("api_mode") or restored_api_mode
                     restored_mode = str(meta.get("mode") or "").strip()
+                    restored_effort = str(meta.get("effort") or "").strip()
             except (json.JSONDecodeError, TypeError):
                 pass
 
@@ -647,9 +679,11 @@ class SessionManager:
             cwd=cwd,
             model=model or getattr(agent, "model", "") or "",
             mode=restored_mode,
+            effort=restored_effort,
             history=history,
             cancel_event=threading.Event(),
         )
+        _apply_effort_to_agent(agent, restored_effort)
         with self._lock:
             self._sessions[session_id] = state
         _register_task_cwd(session_id, cwd)
