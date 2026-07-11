@@ -221,6 +221,18 @@ source .venv/bin/activate   # or: source venv/bin/activate
 `$HOME/.hermes/hermes-agent/venv` (for worktrees that share a venv with the
 main checkout).
 
+### Worktree Policy (YallaPlay fork-local)
+
+Do not build features on the shared `main` checkout — it is the LIVE agent
+checkout and multiple sessions commit to it concurrently. For ANY feature work
+(even single-commit, since another session's WIP is often sitting dirty here),
+spin up a worktree: `bash /home/ubuntu/git/yallaplay-claudio-hermes/scripts/new_worktree.sh runtime <slug>`
+(branches off a freshly-fetched `origin/main`, dir `~/.hermes/hermes-agent-wt-<slug>`,
+shares this checkout's venv via the run_tests.sh probe above). Commit there,
+push the branch, merge back to `origin/main` by fast-forward or PR, then
+`--remove`. Never touch `tui_gateway`/other files carrying a sibling session's
+uncommitted WIP on the main checkout.
+
 ## Project Structure
 
 File counts shift constantly — don't treat the tree below as exhaustive.
