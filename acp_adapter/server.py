@@ -1422,6 +1422,24 @@ class HermesACPAgent(acp.Agent):
             if title:
                 await self._send_session_info_update(session_id)
             return {"ok": bool(title), "title": title}
+        if method == "contextBreakdown":
+            # Read-only per-category context-window composition for the client's
+            # usage popover. Wraps the same engine the desktop popover and the
+            # gateway /usage use; estimates align with usage_update numbers.
+            session_id = params.get("sessionId")
+            if not session_id:
+                return {"ok": False, "error": "sessionId required"}
+            state = self.session_manager.get_session(session_id)
+            if state is None:
+                return {"ok": False, "error": "session not loaded"}
+            from agent.context_breakdown import compute_session_context_breakdown
+
+            try:
+                breakdown = compute_session_context_breakdown(state.agent, state.history)
+            except Exception as exc:  # engine failure must not kill the RPC
+                logger.debug("contextBreakdown failed", exc_info=True)
+                return {"ok": False, "error": str(exc)}
+            return {"ok": True, "breakdown": breakdown}
         raise RequestError.method_not_found(f"_{method}")
 
     async def list_sessions(
