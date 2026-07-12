@@ -1267,6 +1267,65 @@ class TestBuildSystemPrompt:
         prompt = agent._build_system_prompt()
         assert MEMORY_GUIDANCE not in prompt
 
+    def test_reasoning_effort_guidance_when_tool_loaded(self):
+        from agent.prompt_builder import REASONING_EFFORT_GUIDANCE
+
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("web_search", "reasoning_effort"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        prompt = agent._build_system_prompt()
+        assert REASONING_EFFORT_GUIDANCE in prompt
+
+    def test_no_reasoning_effort_guidance_without_tool(self, agent):
+        from agent.prompt_builder import REASONING_EFFORT_GUIDANCE
+
+        prompt = agent._build_system_prompt()
+        assert REASONING_EFFORT_GUIDANCE not in prompt
+
+    def test_system_prompt_stays_stable_after_reasoning_effort_change(self):
+        """The cached system prompt must remain byte-identical across a
+        reasoning_effort tool call — invalidating it mid-session breaks
+        provider prefix caching (see agent/system_prompt.py)."""
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("web_search", "reasoning_effort"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        original_prompt = agent._build_system_prompt()
+        cached_before = agent._cached_system_prompt
+
+        result = json.loads(agent._apply_reasoning_effort({"level": "high"}))
+        assert result["success"] is True
+
+        assert agent._cached_system_prompt is cached_before
+        assert agent._build_system_prompt() == original_prompt
+        # The runtime config DID change — only the prompt is stable.
+        assert agent.reasoning_config == {"enabled": True, "effort": "high"}
+
     def test_includes_datetime(self, agent):
         prompt = agent._build_system_prompt()
         # Should contain current date info like "Conversation started:"
@@ -2033,6 +2092,116 @@ class TestBuildApiKwargs:
 
 
 
+class TestApplyReasoningEffort:
+    def test_updates_reasoning_config(self, agent):
+        agent.reasoning_config = {"enabled": True, "effort": "medium"}
+
+        result = json.loads(agent._apply_reasoning_effort({"level": "low"}))
+
+        assert result["success"] is True
+        assert result["level"] == "low"
+        assert result["reasoning_config"] == {"enabled": True, "effort": "low"}
+        assert agent.reasoning_config == {"enabled": True, "effort": "low"}
+
+    def test_new_level_reaches_next_api_request(self, agent):
+        """The changed level must flow into request construction — that is
+        the mechanism that replaces mutating the system prompt."""
+        agent.provider = "openrouter"
+        agent.model = "qwen/qwen3.5-plus-02-15"
+        agent.reasoning_config = {"enabled": True, "effort": "medium"}
+
+        json.loads(agent._apply_reasoning_effort({"level": "high"}))
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        assert kwargs.get("extra_body", {}).get("reasoning", {}).get("effort") == "high"
+
+    def test_can_disable_reasoning(self, agent):
+        agent.reasoning_config = {"enabled": True, "effort": "medium"}
+
+        result = json.loads(agent._apply_reasoning_effort({"level": "none"}))
+
+        assert result["success"] is True
+        assert result["enabled"] is False
+        assert agent.reasoning_config == {"enabled": False}
+
+    def test_rejects_invalid_level(self, agent):
+        agent.reasoning_config = {"enabled": True, "effort": "medium"}
+
+        result = json.loads(agent._apply_reasoning_effort({"level": "galaxy-brain"}))
+
+        assert "error" in result
+        assert agent.reasoning_config == {"enabled": True, "effort": "medium"}
+
+    def test_rejects_missing_level(self, agent):
+        result = json.loads(agent._apply_reasoning_effort({}))
+        assert "error" in result
+
+    def test_callback_receives_session_scope_by_default(self, agent):
+        calls = []
+
+        def _update(level, parsed_config, persist=False):
+            calls.append((level, parsed_config, persist))
+            return False
+
+        agent.reasoning_update_callback = _update
+
+        result = json.loads(agent._apply_reasoning_effort({"level": "high"}))
+
+        assert result["success"] is True
+        assert result["persisted"] is False
+        assert calls == [("high", {"enabled": True, "effort": "high"}, False)]
+
+    def test_persist_flag_reaches_callback(self, agent):
+        calls = []
+
+        def _update(level, parsed_config, persist=False):
+            calls.append((level, parsed_config, persist))
+            return True
+
+        agent.reasoning_update_callback = _update
+
+        result = json.loads(
+            agent._apply_reasoning_effort({"level": "high", "persist": True})
+        )
+
+        assert result["success"] is True
+        assert result["persisted"] is True
+        assert calls == [("high", {"enabled": True, "effort": "high"}, True)]
+
+    def test_reports_no_change_for_same_level(self, agent):
+        agent.reasoning_config = {"enabled": True, "effort": "medium"}
+
+        result = json.loads(agent._apply_reasoning_effort({"level": "medium"}))
+
+        assert result["success"] is True
+        assert result["no_change"] is True
+        assert agent.reasoning_config == {"enabled": True, "effort": "medium"}
+
+    def test_callback_failure_does_not_block_runtime_change(self, agent):
+        def _update(level, parsed_config, persist=False):
+            raise RuntimeError("disk full")
+
+        agent.reasoning_update_callback = _update
+
+        result = json.loads(agent._apply_reasoning_effort({"level": "low"}))
+
+        assert result["success"] is True
+        assert result["persisted"] is False
+        assert agent.reasoning_config == {"enabled": True, "effort": "low"}
+
+    def test_invoke_tool_routes_reasoning_effort(self, agent):
+        """The agent-loop interception must handle reasoning_effort — the
+        registry dispatcher only returns a stub error for loop tools."""
+        agent.reasoning_config = {"enabled": True, "effort": "medium"}
+
+        result = json.loads(
+            agent._invoke_tool("reasoning_effort", {"level": "xhigh"}, "task-1")
+        )
+
+        assert result["success"] is True
+        assert agent.reasoning_config == {"enabled": True, "effort": "xhigh"}
+
+
 class TestBuildAssistantMessage:
     def test_basic_message(self, agent):
         msg = _mock_assistant_msg(content="Hello!")
@@ -2333,7 +2502,7 @@ class TestExecuteToolCalls:
             or "interrupted" in messages[0]["content"].lower()
         )
 
-    def test_invalid_json_args_defaults_empty(self, agent):
+    def test_invalid_json_args_are_rejected_without_dispatch(self, agent):
         tc = _mock_tool_call(
             name="web_search", arguments="not valid json", call_id="c1"
         )
@@ -2341,13 +2510,12 @@ class TestExecuteToolCalls:
         messages = []
         with patch("run_agent.handle_function_call", return_value="ok") as mock_hfc:
             agent._execute_tool_calls(mock_msg, messages, "task-1")
-            # Invalid JSON args should fall back to empty dict
-            args, kwargs = mock_hfc.call_args
-            assert args[:3] == ("web_search", {}, "task-1")
-            assert set(kwargs.get("enabled_tools", [])) == agent.valid_tool_names
+            mock_hfc.assert_not_called()
         assert len(messages) == 1
         assert messages[0]["role"] == "tool"
         assert messages[0]["tool_call_id"] == "c1"
+        assert "valid json object" in messages[0]["content"].lower()
+        assert "tool was not executed" in messages[0]["content"].lower()
 
     def test_result_truncation_over_100k(self, agent, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
@@ -2776,6 +2944,7 @@ class TestConcurrentToolExecution:
         assert "fast-result" in messages[0]["content"]
         assert messages[1]["tool_call_id"] == "c2"
         assert "timed out after" in messages[1]["content"]
+        assert messages[1]["effect_disposition"] == "unknown"
         assert [batch[-1]["tool_call_id"] for batch in flushed] == ["c1", "c2"]
         assert "fast-result" in flushed[0][-1]["content"]
         assert "timed out after" in flushed[1][-1]["content"]
@@ -2966,7 +3135,7 @@ class TestConcurrentToolExecution:
         """Agent-owned tool paths should close observer tool spans."""
         hook_calls = []
         monkeypatch.setattr(
-            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            "hermes_cli.plugins.resolve_pre_tool_block",
             lambda *args, **kwargs: None,
         )
         monkeypatch.setattr(
@@ -2990,7 +3159,7 @@ class TestConcurrentToolExecution:
     def test_invoke_tool_blocked_returns_error_and_skips_execution(self, agent, monkeypatch):
         """_invoke_tool should return error JSON when a plugin blocks the tool."""
         monkeypatch.setattr(
-            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            "hermes_cli.plugins.resolve_pre_tool_block",
             lambda *args, **kwargs: "Blocked by test policy",
         )
         with patch("tools.todo_tool.todo_tool", side_effect=AssertionError("should not run")) as mock_todo:
@@ -3002,7 +3171,7 @@ class TestConcurrentToolExecution:
     def test_invoke_tool_blocked_skips_handle_function_call(self, agent, monkeypatch):
         """Blocked registry tools should not reach handle_function_call."""
         monkeypatch.setattr(
-            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            "hermes_cli.plugins.resolve_pre_tool_block",
             lambda *args, **kwargs: "Blocked",
         )
         with patch("run_agent.handle_function_call", side_effect=AssertionError("should not run")):
@@ -3019,7 +3188,7 @@ class TestConcurrentToolExecution:
         messages = []
 
         monkeypatch.setattr(
-            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            "hermes_cli.plugins.resolve_pre_tool_block",
             lambda *args, **kwargs: "Blocked by policy",
         )
         agent._checkpoint_mgr.enabled = True
@@ -3049,7 +3218,7 @@ class TestConcurrentToolExecution:
         hook_calls = []
 
         monkeypatch.setattr(
-            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            "hermes_cli.plugins.resolve_pre_tool_block",
             lambda *args, **kwargs: "Blocked by policy",
         )
         monkeypatch.setattr(
@@ -3076,7 +3245,7 @@ class TestConcurrentToolExecution:
         hook_calls = []
 
         monkeypatch.setattr(
-            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            "hermes_cli.plugins.resolve_pre_tool_block",
             lambda *args, **kwargs: None,
         )
         monkeypatch.setattr(
@@ -3123,7 +3292,7 @@ class TestConcurrentToolExecution:
             lambda kind, **kwargs: [request_middleware(**kwargs)] if kind == "tool_request" else [],
         )
         monkeypatch.setattr(
-            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            "hermes_cli.plugins.resolve_pre_tool_block",
             lambda *args, **kwargs: None,
         )
         monkeypatch.setattr(
@@ -3161,7 +3330,7 @@ class TestConcurrentToolExecution:
             lambda kind, **kwargs: [request_middleware(**kwargs)] if kind == "tool_request" else [],
         )
         monkeypatch.setattr(
-            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            "hermes_cli.plugins.resolve_pre_tool_block",
             lambda *args, **kwargs: None,
         )
         monkeypatch.setattr(
@@ -3196,7 +3365,7 @@ class TestConcurrentToolExecution:
         """Blocked memory tool should not reset the nudge counter."""
         agent._turns_since_memory = 5
         monkeypatch.setattr(
-            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            "hermes_cli.plugins.resolve_pre_tool_block",
             lambda *args, **kwargs: "Blocked",
         )
         with patch("tools.memory_tool.memory_tool", side_effect=AssertionError("should not run")):
@@ -3209,7 +3378,7 @@ class TestConcurrentToolExecution:
 
     def test_invoke_tool_memory_remove_notifies_provider_with_old_text(self, agent, monkeypatch):
         monkeypatch.setattr(
-            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            "hermes_cli.plugins.resolve_pre_tool_block",
             lambda *args, **kwargs: None,
         )
         calls = []
@@ -3241,7 +3410,7 @@ class TestConcurrentToolExecution:
 
     def test_invoke_tool_memory_failed_remove_skips_provider_notification(self, agent, monkeypatch):
         monkeypatch.setattr(
-            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            "hermes_cli.plugins.resolve_pre_tool_block",
             lambda *args, **kwargs: None,
         )
         notify = MagicMock(side_effect=AssertionError("should not notify"))
@@ -3281,7 +3450,7 @@ class TestConcurrentToolExecution:
         messages = []
 
         monkeypatch.setattr(
-            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            "hermes_cli.plugins.resolve_pre_tool_block",
             lambda *args, **kwargs: "Blocked" if args[0] == "write_file" else None,
         )
 
@@ -3308,7 +3477,7 @@ class TestConcurrentToolExecution:
         messages = []
 
         monkeypatch.setattr(
-            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            "hermes_cli.plugins.resolve_pre_tool_block",
             lambda *args, **kwargs: "Blocked" if args[0] == "patch" else None,
         )
 
@@ -3335,7 +3504,7 @@ class TestConcurrentToolExecution:
         messages = []
 
         monkeypatch.setattr(
-            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            "hermes_cli.plugins.resolve_pre_tool_block",
             lambda *args, **kwargs: "Blocked" if args[0] == "terminal" else None,
         )
 
@@ -3369,7 +3538,7 @@ class TestConcurrentToolExecution:
             return "Blocked" if call_count["n"] == 1 else None
 
         monkeypatch.setattr(
-            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            "hermes_cli.plugins.resolve_pre_tool_block",
             block_first_only,
         )
 
@@ -3586,8 +3755,8 @@ class TestMcpParallelToolBatch:
     def test_mcp_tools_default_sequential(self):
         """MCP tools without supports_parallel_tool_calls are sequential."""
         from run_agent import _should_parallelize_tool_batch
-        tc1 = _mock_tool_call(name="mcp_github_list_repos", arguments='{"org":"openai"}', call_id="c1")
-        tc2 = _mock_tool_call(name="mcp_github_search_code", arguments='{"q":"test"}', call_id="c2")
+        tc1 = _mock_tool_call(name="mcp__github__list_repos", arguments='{"org":"openai"}', call_id="c1")
+        tc2 = _mock_tool_call(name="mcp__github__search_code", arguments='{"q":"test"}', call_id="c2")
         assert not _should_parallelize_tool_batch([tc1, tc2])
 
     def test_mcp_tools_parallel_when_server_opted_in(self):
@@ -3596,17 +3765,17 @@ class TestMcpParallelToolBatch:
         from tools.mcp_tool import _mcp_tool_server_names, _parallel_safe_servers, _lock
         with _lock:
             _parallel_safe_servers.add("github")
-            _mcp_tool_server_names["mcp_github_list_repos"] = "github"
-            _mcp_tool_server_names["mcp_github_search_code"] = "github"
+            _mcp_tool_server_names["mcp__github__list_repos"] = "github"
+            _mcp_tool_server_names["mcp__github__search_code"] = "github"
         try:
-            tc1 = _mock_tool_call(name="mcp_github_list_repos", arguments='{"org":"openai"}', call_id="c1")
-            tc2 = _mock_tool_call(name="mcp_github_search_code", arguments='{"q":"test"}', call_id="c2")
+            tc1 = _mock_tool_call(name="mcp__github__list_repos", arguments='{"org":"openai"}', call_id="c1")
+            tc2 = _mock_tool_call(name="mcp__github__search_code", arguments='{"q":"test"}', call_id="c2")
             assert _should_parallelize_tool_batch([tc1, tc2])
         finally:
             with _lock:
                 _parallel_safe_servers.discard("github")
-                _mcp_tool_server_names.pop("mcp_github_list_repos", None)
-                _mcp_tool_server_names.pop("mcp_github_search_code", None)
+                _mcp_tool_server_names.pop("mcp__github__list_repos", None)
+                _mcp_tool_server_names.pop("mcp__github__search_code", None)
 
     def test_mixed_mcp_and_builtin_parallel(self):
         """MCP parallel tools mixed with built-in parallel-safe tools."""
@@ -3614,15 +3783,15 @@ class TestMcpParallelToolBatch:
         from tools.mcp_tool import _mcp_tool_server_names, _parallel_safe_servers, _lock
         with _lock:
             _parallel_safe_servers.add("docs")
-            _mcp_tool_server_names["mcp_docs_search"] = "docs"
+            _mcp_tool_server_names["mcp__docs__search"] = "docs"
         try:
-            tc1 = _mock_tool_call(name="mcp_docs_search", arguments='{"query":"api"}', call_id="c1")
+            tc1 = _mock_tool_call(name="mcp__docs__search", arguments='{"query":"api"}', call_id="c1")
             tc2 = _mock_tool_call(name="web_search", arguments='{"query":"test"}', call_id="c2")
             assert _should_parallelize_tool_batch([tc1, tc2])
         finally:
             with _lock:
                 _parallel_safe_servers.discard("docs")
-                _mcp_tool_server_names.pop("mcp_docs_search", None)
+                _mcp_tool_server_names.pop("mcp__docs__search", None)
 
     def test_mixed_parallel_and_serial_mcp_servers(self):
         """One parallel MCP server + one non-parallel MCP server = sequential."""
@@ -3631,17 +3800,17 @@ class TestMcpParallelToolBatch:
         with _lock:
             _parallel_safe_servers.add("docs")
             # "github" is NOT in _parallel_safe_servers
-            _mcp_tool_server_names["mcp_docs_search"] = "docs"
-            _mcp_tool_server_names["mcp_github_list_repos"] = "github"
+            _mcp_tool_server_names["mcp__docs__search"] = "docs"
+            _mcp_tool_server_names["mcp__github__list_repos"] = "github"
         try:
-            tc1 = _mock_tool_call(name="mcp_docs_search", arguments='{"query":"api"}', call_id="c1")
-            tc2 = _mock_tool_call(name="mcp_github_list_repos", arguments='{"org":"openai"}', call_id="c2")
+            tc1 = _mock_tool_call(name="mcp__docs__search", arguments='{"query":"api"}', call_id="c1")
+            tc2 = _mock_tool_call(name="mcp__github__list_repos", arguments='{"org":"openai"}', call_id="c2")
             assert not _should_parallelize_tool_batch([tc1, tc2])
         finally:
             with _lock:
                 _parallel_safe_servers.discard("docs")
-                _mcp_tool_server_names.pop("mcp_docs_search", None)
-                _mcp_tool_server_names.pop("mcp_github_list_repos", None)
+                _mcp_tool_server_names.pop("mcp__docs__search", None)
+                _mcp_tool_server_names.pop("mcp__github__list_repos", None)
 
 
 class TestHandleMaxIterations:
@@ -3788,6 +3957,48 @@ class TestHandleMaxIterations:
         assert result == "Summary"
         kwargs = agent.client.chat.completions.create.call_args.kwargs
         assert kwargs["extra_body"]["provider"]["only"] == ["Anthropic"]
+
+    def test_summary_keeps_provider_preferences_for_nous(self, agent):
+        agent.base_url = "https://proxy.example.com/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.provider = "nous"
+        agent.providers_allowed = ["deepseek"]
+        agent.providers_ignored = ["deepinfra"]
+        agent.provider_sort = "throughput"
+        agent.provider_require_parameters = True
+        agent.provider_data_collection = "deny"
+        agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
+        agent._cached_system_prompt = "You are helpful."
+
+        result = agent._handle_max_iterations([{"role": "user", "content": "do stuff"}], 60)
+
+        assert result == "Summary"
+        kwargs = agent.client.chat.completions.create.call_args.kwargs
+        from agent.portal_tags import nous_portal_tags
+
+        assert kwargs["extra_body"]["tags"] == nous_portal_tags()
+        assert kwargs["extra_body"]["provider"] == {
+            "only": ["deepseek"],
+            "ignore": ["deepinfra"],
+            "sort": "throughput",
+            "require_parameters": True,
+            "data_collection": "deny",
+        }
+
+    def test_summary_keeps_nous_profile_body_without_routing_preferences(self, agent):
+        agent.base_url = "https://proxy.example.com/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.provider = "nous"
+        agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
+        agent._cached_system_prompt = "You are helpful."
+
+        result = agent._handle_max_iterations([{"role": "user", "content": "do stuff"}], 60)
+
+        assert result == "Summary"
+        kwargs = agent.client.chat.completions.create.call_args.kwargs
+        from agent.portal_tags import nous_portal_tags
+
+        assert kwargs["extra_body"] == {"tags": nous_portal_tags()}
 
     def test_summary_drops_invalid_provider_sort(self, agent):
         agent.base_url = "https://openrouter.ai/api/v1"
@@ -6998,7 +7209,7 @@ class TestInterruptVprintForceTrue:
                 if "force=True" not in stripped:
                     violations.append(f"line {i}: {stripped}")
         assert not violations, (
-            f"Interrupt _vprint calls missing force=True:\n"
+            "Interrupt _vprint calls missing force=True:\n"
             + "\n".join(violations)
         )
 

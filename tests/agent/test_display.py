@@ -4,6 +4,7 @@ import json
 import pytest
 from unittest.mock import MagicMock
 
+import agent.display as display_module
 from agent.display import (
     build_tool_preview,
     capture_local_edit_snapshot,
@@ -22,6 +23,17 @@ def reset_tool_preview_max_len():
     set_tool_preview_max_len(0)
     yield
     set_tool_preview_max_len(0)
+
+
+def test_cute_tool_message_falls_back_when_renderer_raises(monkeypatch):
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("cosmetic failure")
+
+    monkeypatch.setattr(display_module, "_get_cute_tool_message", _boom)
+
+    assert get_cute_tool_message("web_extract", {"urls": []}, 0.25) == (
+        "┊ ⚡ web_extra completed  0.2s"
+    )
 
 
 class TestBuildToolPreview:
@@ -77,6 +89,21 @@ class TestBuildToolPreview:
         result = build_tool_preview("web_search", {"query": "hello world"})
         assert result is not None
         assert "hello world" in result
+
+    def test_reasoning_effort_preview_shows_target_level(self):
+        assert build_tool_preview("reasoning_effort", {"level": "high"}) == "high"
+
+    def test_reasoning_effort_preview_normalizes_case(self):
+        assert build_tool_preview("reasoning_effort", {"level": " HIGH "}) == "high"
+
+    def test_reasoning_effort_preview_marks_persist(self):
+        result = build_tool_preview(
+            "reasoning_effort", {"level": "low", "persist": True}
+        )
+        assert result == "low (persist)"
+
+    def test_reasoning_effort_preview_empty_level_returns_none(self):
+        assert build_tool_preview("reasoning_effort", {"level": ""}) is None
 
     def test_read_file_preview(self):
         result = build_tool_preview("read_file", {"path": "/tmp/test.py", "offset": 1})
