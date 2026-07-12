@@ -434,6 +434,32 @@ _ADVISORY_INSTRUCTION = (
 )
 
 
+def _flatten_content_parts(content: Any) -> str:
+    """Flatten a structured content-parts array into plain advisory text.
+
+    User messages built by the CLI's -q path (and multimodal turns) carry
+    ``[{"type": "text", "text": ...}, {"type": "image_url", ...}]`` arrays
+    instead of a plain string. The advisory view is text-only, so join the
+    text parts and mark non-text parts with a placeholder rather than
+    silently rendering the whole turn as empty (which blinds every reference
+    model to the actual question — they then respond "no task provided").
+    """
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type")
+        if ptype in ("text", "input_text"):
+            text = part.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text)
+        elif ptype:
+            parts.append(f"[{ptype} attachment]")
+    return "\n".join(parts)
+
+
 def _reference_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Build an advisory view of the conversation for reference models.
 
@@ -470,7 +496,7 @@ def _reference_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for msg in messages:
         role = msg.get("role")
         content = msg.get("content")
-        text = content if isinstance(content, str) else ""
+        text = content if isinstance(content, str) else _flatten_content_parts(content)
 
         if role == "system":
             continue

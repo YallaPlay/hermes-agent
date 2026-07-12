@@ -392,6 +392,28 @@ def test_reference_messages_fresh_user_turn_ends_on_that_user():
     assert view[-1] == {"role": "user", "content": "q2 current"}
 
 
+def test_reference_messages_flattens_content_parts_user_turn():
+    """Structured content-parts user turns (CLI -q path, multimodal) must not
+    render as empty — the references would then see no task at all."""
+    from agent.moa_loop import _reference_messages
+
+    messages = [
+        {"role": "system", "content": "sys"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What layout is better?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,xx"}},
+            ],
+        },
+    ]
+
+    view = _reference_messages(messages)
+    assert view[-1]["role"] == "user"
+    assert "What layout is better?" in view[-1]["content"]
+    assert "[image_url attachment]" in view[-1]["content"]
+
+
 def test_run_reference_prepends_advisory_system_prompt(monkeypatch):
     """Each reference call gets the advisory-role system prompt first.
 
