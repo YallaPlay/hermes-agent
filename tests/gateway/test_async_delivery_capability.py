@@ -209,3 +209,64 @@ class TestTerminalNotifyGate:
         assert not d.get("notify_unsupported")
         # No platform bound -> no gateway watcher, but completion_queue still fires.
         assert len(process_registry.pending_watchers) == 0
+
+
+# ---------------------------------------------------------------------------
+# ACP adapter: stateless request/response channel -> no async delivery
+# ---------------------------------------------------------------------------
+
+class TestACPAsyncDelivery:
+    """ACP (the VS Code / code-server surface, ``HermesACPAgent``) is a
+    stateless request/response channel: it tears down its outbound channel when
+    the turn ends and runs no persistent watcher/drain loop, so a background
+    completion that finishes AFTER the turn has nowhere to route. It therefore
+    must bind ``async_delivery=False`` — like the API server — so
+    ``async_delivery_supported()`` is False and ``delegate_task`` /
+    ``terminal`` run the work inline instead of stranding it (#10760).
+
+    Unlike the API server, ``HermesACPAgent`` subclasses the third-party
+    ``acp.Agent`` directly and never inherits the platform-adapter
+    ``supports_async_delivery`` convention, so the bind site itself must pass
+    the flag explicitly.
+    """
+
+    def test_acp_binds_no_async_delivery(self):
+        """The contract ACP now binds: session context with
+        async_delivery=False reports unsupported."""
+        tokens = set_session_vars(session_key="acp-sess-1", async_delivery=False)
+        try:
+            assert async_delivery_supported() is False
+        finally:
+            clear_session_vars(tokens)
+
+    def test_acp_server_source_passes_async_delivery_false(self):
+        """Guard against a future edit dropping the flag: the ACP server's
+        set_session_vars call must pass async_delivery=False, otherwise it
+        inherits the optimistic default (True) and re-introduces the silent
+        no-op. Assert the source keeps the wiring."""
+        import inspect
+
+        from acp_adapter import server as acp_server
+
+        src = inspect.getsource(acp_server)
+        assert "async_delivery=False" in src, (
+            "ACP server must bind async_delivery=False so background "
+            "delegations run inline instead of being silently dropped (#10760)"
+        )
+
+    def test_acp_binding_does_not_outlive_turn(self):
+        """The no-delivery decision is request-scoped. After clear, the same
+        session resumed on a delivering interface (CLI/gateway) re-binds fresh
+        and is NOT blocked."""
+        tokens = set_session_vars(session_key="acp-shared", async_delivery=False)
+        assert async_delivery_supported() is False
+        clear_session_vars(tokens)
+
+        # Same session_key later on a delivering interface -> supported again.
+        tokens = set_session_vars(
+            platform="telegram", session_key="acp-shared", async_delivery=True
+        )
+        try:
+            assert async_delivery_supported() is True
+        finally:
+            clear_session_vars(tokens)

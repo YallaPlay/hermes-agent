@@ -207,7 +207,7 @@ TOOLSETS = {
         "tools": ["todo"],
         "includes": []
     },
-    
+
     "memory": {
         "description": "Persistent memory across sessions (personal notes + user profile)",
         "tools": ["memory"],

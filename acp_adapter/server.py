@@ -16,6 +16,7 @@ from typing import Any, Deque, Optional
 from urllib.parse import unquote, urlparse
 
 import acp
+from acp import RequestError
 from acp.schema import (
     AgentCapabilities,
     AgentMessageChunk,
@@ -46,6 +47,8 @@ from acp.schema import (
     SetSessionModeResponse,
     ResourceContentBlock,
     SessionCapabilities,
+    SessionConfigOptionSelect,
+    SessionConfigSelectOption,
     SessionForkCapabilities,
     SessionInfoUpdate,
     SessionListCapabilities,
@@ -72,7 +75,12 @@ from acp_adapter.events import (
 )
 from acp_adapter.permissions import make_approval_callback
 from acp_adapter.provenance import session_provenance_meta
-from acp_adapter.session import SessionManager, SessionState, _expand_acp_enabled_toolsets
+from acp_adapter.session import (
+    SessionManager,
+    SessionState,
+    _apply_effort_to_agent,
+    _expand_acp_enabled_toolsets,
+)
 from acp_adapter.tools import build_tool_complete, build_tool_start
 from tools.approval import (
     reset_hermes_interactive_context,
@@ -86,8 +94,10 @@ try:
 except Exception:
     HERMES_VERSION = "0.0.0"
 
-# Thread pool for running AIAgent (synchronous) in parallel.
-_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="acp-agent")
+# Thread pool for running AIAgent (synchronous) in parallel. Bumped from the
+# upstream default of 4 to 16 so a single ACP process can serve more concurrent
+# sessions — the Claudio Slack bot multiplexes many threads over one process.
+_executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="acp-agent")
 
 # Server-side page size for list_sessions. The ACP ListSessionsRequest schema
 # does not expose a client-side limit, so this is a fixed cap that clients
@@ -105,6 +115,28 @@ _TEXT_RESOURCE_MIME_TYPES = {
     "application/toml",
     "application/sql",
 }
+
+
+def _apply_session_effort(agent: Any, level: str) -> None:
+    """Apply a reasoning-effort level to the LIVE agent.
+
+    ``agent.reasoning_config`` is read on every API call, so this takes effect
+    on the next call (same mechanism as the reasoning_effort tool).
+    "default" restores the provider default by clearing the override to None —
+    unlike the restore-time helper in acp_adapter.session, which can simply
+    skip touching a fresh agent.
+    """
+    try:
+        if str(level or "").strip().lower() == "default":
+            agent.reasoning_config = None
+            return
+        from hermes_constants import parse_reasoning_effort
+
+        parsed = parse_reasoning_effort(level)
+        if parsed is not None:
+            agent.reasoning_config = parsed
+    except Exception:
+        logger.debug("Could not apply reasoning effort %r", level, exc_info=True)
 
 
 def _resource_display_name(uri: str, name: str | None = None, title: str | None = None) -> str:
@@ -518,6 +550,21 @@ class HermesACPAgent(acp.Agent):
         value: key for key, value in _MODE_TO_EDIT_APPROVAL_POLICY.items()
     }
 
+    # Session-scoped reasoning effort, exposed as an ACP select config option.
+    # "default" means no override (provider/profile default); the rest mirror
+    # tools/reasoning_effort_tool.VALID_LEVELS and the /reasoning command.
+    _REASONING_EFFORT_CONFIG_ID = "reasoning_effort"
+    _REASONING_EFFORT_DEFAULT = "default"
+    _REASONING_EFFORT_LEVELS = (
+        ("default", "Default", "Provider/profile default reasoning effort."),
+        ("none", "None", "Disable extended reasoning."),
+        ("minimal", "Minimal", "Bare-minimum reasoning."),
+        ("low", "Low", "Light reasoning for routine work."),
+        ("medium", "Medium", "Balanced reasoning."),
+        ("high", "High", "Deep reasoning for hard tasks."),
+        ("xhigh", "XHigh", "Maximum reasoning effort."),
+    )
+
     def __init__(self, session_manager: SessionManager | None = None):
         super().__init__()
         self.session_manager = session_manager or SessionManager()
@@ -568,6 +615,26 @@ class HermesACPAgent(acp.Agent):
         mode = str(getattr(state, "mode", "") or self._MODE_DEFAULT)
         policy = self._MODE_TO_EDIT_APPROVAL_POLICY.get(mode, self._EDIT_APPROVAL_POLICY_DEFAULT)
         return policy, state.cwd
+
+    def _session_config_options(self, state: SessionState) -> list[SessionConfigOptionSelect]:
+        """ACP config options for a session: currently the reasoning-effort select."""
+        current = str(getattr(state, "effort", "") or "").strip().lower()
+        valid = {value for value, _, _ in self._REASONING_EFFORT_LEVELS}
+        if current not in valid:
+            current = self._REASONING_EFFORT_DEFAULT
+        return [
+            SessionConfigOptionSelect(
+                id=self._REASONING_EFFORT_CONFIG_ID,
+                name="Effort",
+                description="Reasoning effort for this session.",
+                type="select",
+                current_value=current,
+                options=[
+                    SessionConfigSelectOption(value=value, name=name, description=desc)
+                    for value, name, desc in self._REASONING_EFFORT_LEVELS
+                ],
+            )
+        ]
 
     @staticmethod
     def _encode_model_choice(provider: str | None, model: str | None) -> str:
@@ -888,7 +955,10 @@ class HermesACPAgent(acp.Agent):
                 load_session=True,
                 prompt_capabilities=PromptCapabilities(image=True),
                 session_capabilities=SessionCapabilities(
-                    fork=SessionForkCapabilities(),
+                    # _meta.hermes.keepHistory: this agent honors the
+                    # ``_meta.hermes.keepHistory`` fork-rewind extension on
+                    # ``session/fork`` (fork the first N history entries).
+                    fork=SessionForkCapabilities(_meta={"hermes": {"keepHistory": True}}),
                     list=SessionListCapabilities(),
                     resume=SessionResumeCapabilities(),
                 ),
@@ -1038,9 +1108,20 @@ class HermesACPAgent(acp.Agent):
 
         active_tool_calls: dict[str, tuple[str, dict[str, Any]]] = {}
 
-        async def _send(update: Any) -> bool:
+        async def _send(update: Any, meta: dict[str, Any] | None = None) -> bool:
             try:
-                await self._conn.session_update(session_id=state.session_id, update=update)
+                # ``meta`` becomes the notification-level ``_meta`` (the acp lib
+                # forwards session_update **kwargs into SessionNotification's
+                # field_meta). We use it to stamp each replayed user turn with
+                # its absolute ``state.history`` index so the client can pass
+                # that coordinate back as ``_meta.hermes.keepHistory`` on
+                # ``session/fork`` — the same list ``fork_session`` slices.
+                if meta:
+                    await self._conn.session_update(
+                        session_id=state.session_id, update=update, **meta
+                    )
+                else:
+                    await self._conn.session_update(session_id=state.session_id, update=update)
                 return True
             except Exception:
                 logger.warning(
@@ -1050,14 +1131,16 @@ class HermesACPAgent(acp.Agent):
                 )
                 return False
 
-        for message in state.history:
+        for index, message in enumerate(state.history):
             role = str(message.get("role") or "")
 
             if role == "user":
                 text = self._history_message_text(message)
                 if text:
                     update = self._history_message_update(role=role, text=text)
-                    if update is not None and not await _send(update):
+                    if update is not None and not await _send(
+                        update, {"hermes": {"historyIndex": index}}
+                    ):
                         return
                 continue
 
@@ -1116,7 +1199,13 @@ class HermesACPAgent(acp.Agent):
         mcp_servers: list | None = None,
         **kwargs: Any,
     ) -> NewSessionResponse:
-        state = self.session_manager.create_session(cwd=cwd)
+        # The authenticated owner rides the ACP extension channel as
+        # _meta.hermes.owner (the JSON-RPC router flattens _meta.<ns> into a
+        # kwarg named after the namespace). Persisted to sessions.user_id so the
+        # sessions list can filter to a user's own sessions. Soft display key.
+        hermes = kwargs.get("hermes") or {}
+        owner = str(hermes.get("owner") or "").strip() or None
+        state = self.session_manager.create_session(cwd=cwd, owner=owner)
         await self._register_session_mcp_servers(state, mcp_servers)
         logger.info("New session %s (cwd=%s)", state.session_id, cwd)
         self._schedule_available_commands_update(state.session_id)
@@ -1125,6 +1214,7 @@ class HermesACPAgent(acp.Agent):
             session_id=state.session_id,
             models=self._build_model_state(state),
             modes=self._session_modes(state),
+            config_options=self._session_config_options(state),
             field_meta=self._provenance_meta(
                 state.session_id, getattr(state.agent, "session_id", state.session_id)
             ),
@@ -1172,6 +1262,7 @@ class HermesACPAgent(acp.Agent):
         return LoadSessionResponse(
             models=self._build_model_state(state),
             modes=self._session_modes(state),
+            config_options=self._session_config_options(state),
             field_meta=self._provenance_meta(
                 session_id, getattr(state.agent, "session_id", session_id)
             ),
@@ -1207,6 +1298,7 @@ class HermesACPAgent(acp.Agent):
         return ResumeSessionResponse(
             models=self._build_model_state(state),
             modes=self._session_modes(state),
+            config_options=self._session_config_options(state),
             field_meta=self._provenance_meta(
                 state.session_id, getattr(state.agent, "session_id", state.session_id)
             ),
@@ -1226,6 +1318,31 @@ class HermesACPAgent(acp.Agent):
                 logger.debug("Failed to interrupt ACP session %s", session_id, exc_info=True)
             logger.info("Cancelled session %s", session_id)
 
+    @staticmethod
+    def _fork_keep_history(kwargs: dict[str, Any]) -> int | None:
+        """Extract the optional ``_meta.hermes.keepHistory`` fork rewind point.
+
+        ``session/fork`` has no spec-level rewind parameter, so clients pass it
+        through ACP's extensibility escape hatch: ``_meta.hermes.keepHistory``
+        is the number of leading history entries to copy into the fork (in the
+        same OpenAI-message coordinate space that ``session/load`` replays).
+        The JSON-RPC router flattens ``_meta`` keys into handler kwargs, so the
+        payload arrives here as a ``hermes`` dict. Absent → ``None`` → full
+        copy (the pre-existing behavior). Invalid types/values raise
+        ``invalid_params`` rather than silently forking the whole session —
+        a client asking for a rewind must not quietly get a full copy.
+        """
+        hermes_meta = kwargs.get("hermes")
+        if not isinstance(hermes_meta, dict) or "keepHistory" not in hermes_meta:
+            return None
+        keep = hermes_meta["keepHistory"]
+        # bool is an int subclass; reject it explicitly.
+        if isinstance(keep, bool) or not isinstance(keep, int) or keep < 0:
+            raise acp.RequestError.invalid_params(
+                {"reason": "_meta.hermes.keepHistory must be a non-negative integer"}
+            )
+        return keep
+
     async def fork_session(
         self,
         cwd: str,
@@ -1233,7 +1350,10 @@ class HermesACPAgent(acp.Agent):
         mcp_servers: list | None = None,
         **kwargs: Any,
     ) -> ForkSessionResponse:
-        state = self.session_manager.fork_session(session_id, cwd=cwd)
+        keep_history = self._fork_keep_history(kwargs)
+        state = self.session_manager.fork_session(
+            session_id, cwd=cwd, keep_history=keep_history
+        )
         new_id = state.session_id if state else ""
         if state is not None:
             await self._register_session_mcp_servers(state, mcp_servers)
@@ -1244,7 +1364,65 @@ class HermesACPAgent(acp.Agent):
             session_id=new_id,
             models=self._build_model_state(state) if state is not None else None,
             modes=self._session_modes(state) if state is not None else None,
+            config_options=self._session_config_options(state) if state is not None else None,
         )
+
+    async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle Hermes ACP extension methods (client sends `_<method>`)."""
+        if method == "setArchived":
+            session_id = params.get("sessionId")
+            archived = bool(params.get("archived"))
+            ok = self.session_manager.set_session_archived(session_id, archived) if session_id else False
+            return {"ok": bool(ok)}
+        if method == "setOwner":
+            # Stamp (or clear, with an empty string) a session's owner
+            # (sessions.user_id) — the key the sessions list filters on so a
+            # user sees only their own sessions. Soft per-user display key, not
+            # an access boundary. Mirrors setArchived; emit an info update so the
+            # client sidebar refreshes.
+            session_id = params.get("sessionId")
+            owner = str(params.get("owner") or "")
+            if not session_id:
+                return {"ok": False, "error": "sessionId required"}
+            ok = self.session_manager.set_session_owner(session_id, owner)
+            if ok:
+                await self._send_session_info_update(session_id)
+            return {"ok": bool(ok)}
+        if method == "setTitle":
+            # Set (or clear, with an empty string) a session's CANONICAL title in
+            # state.db — the thing session/list, the web UI, sessions-list CLI,
+            # and search all read. This is the write path ACP core lacks; the
+            # extension's inline rename routes here instead of a VS-Code-local
+            # override, so the name is global. Surface a uniqueness conflict as a
+            # visible error rather than a silent no-op.
+            session_id = params.get("sessionId")
+            title = str(params.get("title") or "")
+            if not session_id:
+                return {"ok": False, "error": "sessionId required"}
+            try:
+                ok = self.session_manager.set_session_title(session_id, title)
+            except ValueError as exc:
+                return {"ok": False, "error": str(exc)}
+            if ok:
+                await self._send_session_info_update(session_id)
+            return {"ok": bool(ok), "title": self.session_manager.get_session_title(session_id)}
+        if method == "deriveTitle":
+            # On-demand backfill for an untitled session (e.g. one that opened
+            # into a long first turn and missed the first-exchange auto-title).
+            # Reuses the auxiliary-model pass; no-op if already titled or no
+            # completed exchange. The aux call is blocking, so run it off the
+            # event loop, then push the new title to the client.
+            session_id = params.get("sessionId")
+            if not session_id:
+                return {"ok": False, "error": "sessionId required"}
+            loop = asyncio.get_running_loop()
+            title = await loop.run_in_executor(
+                None, self.session_manager.derive_session_title, session_id
+            )
+            if title:
+                await self._send_session_info_update(session_id)
+            return {"ok": bool(title), "title": title}
+        raise RequestError.method_not_found(f"_{method}")
 
     async def list_sessions(
         self,
@@ -1260,7 +1438,24 @@ class HermesACPAgent(acp.Agent):
         Server-side page size is capped at ``_LIST_SESSIONS_PAGE_SIZE``; when more
         results remain, ``next_cursor`` is set to the last returned ``session_id``.
         """
-        infos = self.session_manager.list_sessions(cwd=cwd)
+        hermes = kwargs.get("hermes") or {}
+        archived_only = bool(hermes.get("archivedOnly"))
+        include_archived = bool(hermes.get("includeArchived"))
+        # Per-user filter: when ownerOnly is set, restrict to the caller's own
+        # sessions (plus untagged legacy rows). owner carries the authenticated
+        # identity (Cloudflare Access email) the client resolved. Soft display
+        # filter, not an access boundary.
+        owner = (
+            str(hermes.get("owner") or "").strip()
+            if hermes.get("ownerOnly")
+            else None
+        ) or None
+        infos = self.session_manager.list_sessions(
+            cwd=cwd,
+            include_archived=include_archived,
+            archived_only=archived_only,
+            owner=owner,
+        )
 
         if cursor:
             for idx, s in enumerate(infos):
@@ -1279,12 +1474,14 @@ class HermesACPAgent(acp.Agent):
             updated_at = s.get("updated_at")
             if updated_at is not None and not isinstance(updated_at, str):
                 updated_at = str(updated_at)
+            field_meta = {"hermes": {"archived": True}} if s.get("archived") else None
             sessions.append(
                 SessionInfo(
                     session_id=s["session_id"],
                     cwd=s["cwd"],
                     title=s.get("title"),
                     updated_at=updated_at,
+                    field_meta=field_meta,
                 )
             )
 
@@ -1384,6 +1581,22 @@ class HermesACPAgent(acp.Agent):
             state.is_running = True
             state.current_prompt_text = user_text or "[Image attachment]"
 
+        # First-turn identity: when the session carries an authenticated owner
+        # (e.g. the Cloudflare Access email stamped via _meta.hermes.owner at
+        # session/new), surface it to the agent ONCE — on the first turn, when
+        # history is still empty — as a neutral context line prepended to the
+        # user message. Later turns already have it in history, so re-injecting
+        # would waste tokens. Text-only prompts only (a plain string user_content);
+        # multimodal turns keep their structured content untouched.
+        if state.owner and not state.history and isinstance(user_content, str):
+            owner_note = (
+                f"[authenticated user: {state.owner}]\n"
+                "(This is the signed-in user you are talking to, from the "
+                "surface's SSO/identity provider. Use it to address and identify "
+                "them; do not ask who they are.)\n\n"
+            )
+            user_content = owner_note + user_content
+
         logger.info("Prompt on session %s: %s", session_id, user_text[:100])
 
         conn = self._conn
@@ -1478,7 +1691,22 @@ class HermesACPAgent(acp.Agent):
                     clear_session_vars,
                     set_session_vars,
                 )
-                session_tokens = set_session_vars(session_key=session_id)
+                # ACP is a stateless request/response channel: it tears down its
+                # outbound channel when the turn ends and runs no persistent
+                # watcher/drain loop, so a background completion that finishes
+                # AFTER the turn (delegate_task background=True, terminal
+                # notify_on_complete / watch_patterns) has nowhere to route and
+                # is silently dropped until the next inbound request. Bind
+                # async_delivery=False — mirroring the stateless API server
+                # (gateway/platforms/api_server.py) — so async_delivery_supported()
+                # reports False and those tools refuse the promise (running the
+                # work inline) instead of stranding it. Without this, ACP inherits
+                # the optimistic set_session_vars default (True) because
+                # HermesACPAgent subclasses acp.Agent directly and never goes
+                # through the platform-adapter supports_async_delivery convention.
+                session_tokens = set_session_vars(
+                    session_key=session_id, async_delivery=False
+                )
             except Exception:
                 session_tokens = None
                 clear_session_vars = None  # type: ignore[assignment]
@@ -1566,6 +1794,17 @@ class HermesACPAgent(acp.Agent):
                 state.is_running = False
                 state.current_prompt_text = ""
             return PromptResponse(stop_reason="end_turn")
+
+        # Absolute index of this turn's user message in the post-turn history,
+        # in the same coordinate space ``fork_session`` slices and history
+        # replay stamps as ``_meta.hermes.historyIndex``. Returned to the client
+        # so a "fork from this message" affordance can pass it back verbatim as
+        # ``_meta.hermes.keepHistory`` without re-deriving it from replay. Read
+        # before draining queued prompts, since each drained follow-up rewrites
+        # ``_persist_user_message_idx`` for its own turn.
+        user_history_index = getattr(state.agent, "_persist_user_message_idx", None)
+        if not isinstance(user_history_index, int) or user_history_index < 0:
+            user_history_index = None
 
         if result.get("messages"):
             state.history = result["messages"]
@@ -1675,7 +1914,12 @@ class HermesACPAgent(acp.Agent):
         await self._send_usage_update(state)
 
         stop_reason = "cancelled" if cancelled else "end_turn"
-        return PromptResponse(stop_reason=stop_reason, usage=usage)
+        field_meta = (
+            {"hermes": {"userHistoryIndex": user_history_index}}
+            if user_history_index is not None
+            else None
+        )
+        return PromptResponse(stop_reason=stop_reason, usage=usage, field_meta=field_meta)
 
     # ---- Slash commands (headless) -------------------------------------------
 
@@ -1779,6 +2023,9 @@ class HermesACPAgent(acp.Agent):
             model=new_model,
             requested_provider=target_provider,
         )
+        # A fresh agent starts at the provider-default reasoning config; carry
+        # the session's effort override over so a model switch doesn't drop it.
+        _apply_effort_to_agent(state.agent, getattr(state, "effort", ""))
         self.session_manager.save_session(state.session_id)
         provider_label = getattr(state.agent, "provider", None) or target_provider or current_provider
         logger.info("Session %s: model switched to %s", state.session_id, new_model)
@@ -2015,6 +2262,8 @@ class HermesACPAgent(acp.Agent):
                 base_url=current_base_url,
                 api_mode=current_api_mode,
             )
+            # Carry the session's reasoning-effort override onto the fresh agent.
+            _apply_effort_to_agent(state.agent, getattr(state, "effort", ""))
             self.session_manager.save_session(session_id)
             logger.info(
                 "Session %s: model switched to %s via provider %s",
@@ -2054,6 +2303,17 @@ class HermesACPAgent(acp.Agent):
         if str(config_id) == self._EDIT_APPROVAL_POLICY_CONFIG_ID:
             mode = self._EDIT_APPROVAL_POLICY_TO_MODE.get(str(value), self._MODE_DEFAULT)
             setattr(state, "mode", mode)
+        elif str(config_id) == self._REASONING_EFFORT_CONFIG_ID:
+            level = str(value or "").strip().lower()
+            valid = {v for v, _, _ in self._REASONING_EFFORT_LEVELS}
+            if level not in valid:
+                level = self._REASONING_EFFORT_DEFAULT
+            # "default" clears the override; the fresh-agent path (restore/fork/
+            # model switch) then simply doesn't touch reasoning_config. On the
+            # LIVE agent, restore the provider default explicitly.
+            state.effort = "" if level == self._REASONING_EFFORT_DEFAULT else level
+            _apply_session_effort(state.agent, level)
+            logger.info("Session %s: reasoning effort set to %s", session_id, level)
         else:
             options = getattr(state, "config_options", None)
             if not isinstance(options, dict):
@@ -2062,4 +2322,6 @@ class HermesACPAgent(acp.Agent):
             setattr(state, "config_options", options)
         self.session_manager.save_session(session_id)
         logger.info("Session %s: config option %s updated", session_id, config_id)
-        return SetSessionConfigOptionResponse(config_options=[])
+        return SetSessionConfigOptionResponse(
+            config_options=self._session_config_options(state)
+        )

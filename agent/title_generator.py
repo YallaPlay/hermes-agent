@@ -9,6 +9,7 @@ import threading
 from typing import Callable, Optional
 
 from agent.auxiliary_client import call_llm
+from hermes_logging import get_session_context, run_with_session_context
 
 logger = logging.getLogger(__name__)
 
@@ -190,14 +191,23 @@ def maybe_auto_title(
     if user_msg_count > 2:
         return
 
+    # Propagate the session context into the auto-title worker thread so its
+    # log records (agent.title_generator, agent.auxiliary_client) carry the
+    # [session_id] tag — threading.local does not inherit across threads (see
+    # hermes_logging.run_with_session_context).
+    _sid = get_session_context() or session_id
     thread = threading.Thread(
-        target=auto_title_session,
-        args=(session_db, session_id, user_message, assistant_response),
-        kwargs={
-            "failure_callback": failure_callback,
-            "main_runtime": main_runtime,
-            "title_callback": title_callback,
-        },
+        target=lambda: run_with_session_context(
+            _sid,
+            auto_title_session,
+            session_db,
+            session_id,
+            user_message,
+            assistant_response,
+            failure_callback=failure_callback,
+            main_runtime=main_runtime,
+            title_callback=title_callback,
+        ),
         daemon=True,
         name="auto-title",
     )

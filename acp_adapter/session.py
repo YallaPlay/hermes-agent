@@ -70,6 +70,29 @@ def _normalize_cwd_for_compare(cwd: str | None) -> str:
     return os.path.normpath(expanded)
 
 
+def _preview_text(content: Any, limit: int = 60) -> str:
+    """Flatten an in-memory message ``content`` value into preview text.
+
+    Multimodal user messages (e.g. a prompt with a screenshot) hold ``content``
+    as a list of parts (``[{"type": "text", ...}, {"type": "image_url", ...}]``).
+    A naive ``str()`` leaks the list repr into the sessions-list title —
+    mirror SessionDB._preview_from_raw: flatten the text parts, fall back to a
+    ``[multimodal content]`` placeholder for image-only messages.
+    """
+    if isinstance(content, list):
+        parts = [
+            p.get("text", "")
+            for p in content
+            if isinstance(p, dict) and p.get("type") == "text"
+        ]
+        text = " ".join(t.strip() for t in parts if t and t.strip()).strip()
+        text = text or "[multimodal content]"
+    else:
+        text = str(content or "").strip()
+    text = " ".join(text.split())
+    return text[:limit] + ("..." if len(text) > limit else "")
+
+
 def _build_session_title(title: Any, preview: Any, cwd: str | None) -> str:
     explicit = str(title or "").strip()
     if explicit:
@@ -155,6 +178,26 @@ def _expand_acp_enabled_toolsets(
     return expanded
 
 
+def _apply_effort_to_agent(agent: Any, effort: str) -> None:
+    """Mirror a session's reasoning-effort override onto a (fresh) agent.
+
+    ``agent.reasoning_config`` is read on every API call, so mutating it here
+    takes effect on the next call (same mechanism as the reasoning_effort
+    tool). Empty/invalid levels are a no-op — the agent keeps its default.
+    """
+    effort = str(effort or "").strip().lower()
+    if not effort:
+        return
+    try:
+        from hermes_constants import parse_reasoning_effort
+
+        parsed = parse_reasoning_effort(effort)
+        if parsed is not None:
+            agent.reasoning_config = parsed
+    except Exception:
+        logger.debug("Could not apply reasoning effort %r to agent", effort, exc_info=True)
+
+
 def _clear_task_cwd(task_id: str) -> None:
     """Remove task-specific cwd overrides for an ACP session."""
     if not task_id:
@@ -174,6 +217,19 @@ class SessionState:
     agent: Any  # AIAgent instance
     cwd: str = "."
     model: str = ""
+    # ACP session mode (edit-approval policy: default / acceptEdits / dontAsk).
+    # Set by set_session_mode; persisted in the model_config JSON blob so it
+    # survives an agent restart (e.g. a VS Code window reload respawns the ACP
+    # child) instead of reverting to the server default.
+    mode: str = ""
+    # Session-scoped reasoning effort override (none/minimal/low/medium/high/
+    # xhigh), set via the reasoningEffort ACP config option. Empty = provider
+    # default. Persisted like `mode` and re-applied to the agent on restore.
+    effort: str = ""
+    # Authenticated owner (e.g. Cloudflare Access email) supplied by the client
+    # on session/new. Persisted to sessions.user_id so the ACP sessions list can
+    # filter to a user's own sessions. Soft display key, not an access boundary.
+    owner: Optional[str] = None
     history: List[Dict[str, Any]] = field(default_factory=list)
     cancel_event: Any = None  # threading.Event
     is_running: bool = False
@@ -207,8 +263,15 @@ class SessionManager:
 
     # ---- public API ---------------------------------------------------------
 
-    def create_session(self, cwd: str = ".") -> SessionState:
-        """Create a new session with a unique ID and a fresh AIAgent."""
+    def create_session(self, cwd: str = ".", owner: str | None = None) -> SessionState:
+        """Create a new session with a unique ID and a fresh AIAgent.
+
+        ``owner`` (an authenticated user identifier, e.g. the Cloudflare Access
+        email supplied by the client on ``session/new``) is persisted to
+        ``sessions.user_id`` so the ACP sessions list can show a user only
+        their own sessions. It is a soft per-user display key, not an access
+        boundary.
+        """
         import threading
 
         cwd = _translate_acp_cwd(cwd)
@@ -221,6 +284,7 @@ class SessionManager:
             model=getattr(agent, "model", "") or "",
             cancel_event=threading.Event(),
         )
+        state.owner = (owner or "").strip() or None
         with self._lock:
             self._sessions[session_id] = state
         _register_task_cwd(session_id, cwd)
@@ -250,15 +314,33 @@ class SessionManager:
             _clear_task_cwd(session_id)
         return existed or db_existed
 
-    def fork_session(self, session_id: str, cwd: str = ".") -> Optional[SessionState]:
-        """Deep-copy a session's history into a new session."""
+    def fork_session(
+        self,
+        session_id: str,
+        cwd: str = ".",
+        keep_history: Optional[int] = None,
+    ) -> Optional[SessionState]:
+        """Deep-copy a session's history into a new session.
+
+        ``keep_history`` limits the copy to the first N history entries
+        (``history[:keep_history]``), enabling "fork from here" rewind
+        semantics. ``None`` copies the full history. Negative values are
+        rejected: ``history[:-N]`` would silently mean "drop the last N
+        messages" — a destructive footgun, not a fork prefix.
+        """
         import threading
+
+        if keep_history is not None and keep_history < 0:
+            raise ValueError("keep_history must be non-negative")
 
         cwd = _translate_acp_cwd(cwd)
         original = self.get_session(session_id)  # checks DB too
         if original is None:
             return None
 
+        forked_history = (
+            original.history if keep_history is None else original.history[:keep_history]
+        )
         new_id = str(uuid.uuid4())
         agent = self._make_agent(
             session_id=new_id,
@@ -270,9 +352,15 @@ class SessionManager:
             agent=agent,
             cwd=cwd,
             model=getattr(agent, "model", original.model) or original.model,
-            history=copy.deepcopy(original.history),
+            # Carry the edit-approval mode and reasoning effort into the fork:
+            # a fork continues the same working context, so silently reverting
+            # to server defaults would surprise the user mid-flow.
+            mode=original.mode,
+            effort=original.effort,
+            history=copy.deepcopy(forked_history),
             cancel_event=threading.Event(),
         )
+        _apply_effort_to_agent(agent, original.effort)
         with self._lock:
             self._sessions[new_id] = state
         _register_task_cwd(new_id, cwd)
@@ -280,15 +368,28 @@ class SessionManager:
         logger.info("Forked ACP session %s -> %s", session_id, new_id)
         return state
 
-    def list_sessions(self, cwd: str | None = None) -> List[Dict[str, Any]]:
+    def list_sessions(
+        self,
+        cwd: str | None = None,
+        include_archived: bool = False,
+        archived_only: bool = False,
+        owner: str | None = None,
+    ) -> List[Dict[str, Any]]:
         """Return lightweight info dicts for all sessions (memory + database)."""
         normalized_cwd = _normalize_cwd_for_compare(cwd) if cwd else None
+        owner_filter = (owner or "").strip() or None
         db = self._get_db()
         persisted_rows: dict[str, dict[str, Any]] = {}
 
         if db is not None:
             try:
-                for row in db.list_sessions_rich(source="acp", limit=1000):
+                for row in db.list_sessions_rich(
+                    source="acp",
+                    limit=1000,
+                    include_archived=include_archived,
+                    archived_only=archived_only,
+                    owner=owner_filter,
+                ):
                     persisted_rows[str(row["id"])] = dict(row)
             except Exception:
                 logger.debug("Failed to load ACP sessions from DB", exc_info=True)
@@ -301,14 +402,26 @@ class SessionManager:
                 history_len = len(s.history)
                 if history_len <= 0:
                     continue
+                if archived_only:
+                    continue
                 if normalized_cwd and _normalize_cwd_for_compare(s.cwd) != normalized_cwd:
                     continue
                 persisted = persisted_rows.get(s.session_id, {})
+                if owner_filter:
+                    # Mirror the DB filter for in-memory rows: STRICT ownership —
+                    # show only the caller's own sessions, hide untagged and
+                    # other-owner rows. Prefer the in-memory owner, fall back to
+                    # the persisted user_id.
+                    row_owner = (
+                        (s.owner or persisted.get("user_id") or "").strip()
+                    )
+                    if row_owner != owner_filter:
+                        continue
                 preview = next(
                     (
-                        str(msg.get("content") or "").strip()
+                        _preview_text(msg.get("content"))
                         for msg in s.history
-                        if msg.get("role") == "user" and str(msg.get("content") or "").strip()
+                        if msg.get("role") == "user" and _preview_text(msg.get("content"))
                     ),
                     persisted.get("preview") or "",
                 )
@@ -318,10 +431,12 @@ class SessionManager:
                         "cwd": s.cwd,
                         "model": s.model,
                         "history_len": history_len,
+                        "user_id": s.owner or persisted.get("user_id") or "",
                         "title": _build_session_title(persisted.get("title"), preview, s.cwd),
                         "updated_at": _format_updated_at(
                             persisted.get("last_active") or persisted.get("started_at") or time.time()
                         ),
+                        "archived": False,
                     }
                 )
 
@@ -347,8 +462,10 @@ class SessionManager:
                 "cwd": session_cwd,
                 "model": row.get("model") or "",
                 "history_len": message_count,
+                "user_id": row.get("user_id") or "",
                 "title": _build_session_title(row.get("title"), row.get("preview"), session_cwd),
                 "updated_at": _format_updated_at(row.get("last_active") or row.get("started_at")),
+                "archived": bool(row.get("archived")),
             })
 
         results.sort(key=lambda item: _updated_at_sort_key(item.get("updated_at")), reverse=True)
@@ -442,6 +559,15 @@ class SessionManager:
             session_meta["base_url"] = base_url.strip()
         if isinstance(api_mode, str) and api_mode.strip():
             session_meta["api_mode"] = api_mode.strip()
+        # Persist the ACP session mode so it survives an agent restart; omit the
+        # default so existing rows stay byte-identical when nothing changed it.
+        session_mode = str(getattr(state, "mode", "") or "").strip()
+        if session_mode:
+            session_meta["mode"] = session_mode
+        # Same for the session's reasoning-effort override.
+        session_effort = str(getattr(state, "effort", "") or "").strip()
+        if session_effort:
+            session_meta["effort"] = session_effort
         cwd_json = json.dumps(session_meta)
 
         try:
@@ -453,6 +579,7 @@ class SessionManager:
                     source="acp",
                     model=model_str,
                     model_config={"cwd": state.cwd},
+                    user_id=getattr(state, "owner", None),
                 )
             else:
                 # Update model_config (contains cwd) if changed.
@@ -531,6 +658,8 @@ class SessionManager:
         requested_provider = row.get("billing_provider")
         restored_base_url = row.get("billing_base_url")
         restored_api_mode = None
+        restored_mode = ""
+        restored_effort = ""
         mc = row.get("model_config")
         if mc:
             try:
@@ -540,6 +669,8 @@ class SessionManager:
                     requested_provider = meta.get("provider") or requested_provider
                     restored_base_url = meta.get("base_url") or restored_base_url
                     restored_api_mode = meta.get("api_mode") or restored_api_mode
+                    restored_mode = str(meta.get("mode") or "").strip()
+                    restored_effort = str(meta.get("effort") or "").strip()
             except (json.JSONDecodeError, TypeError):
                 pass
 
@@ -570,9 +701,12 @@ class SessionManager:
             agent=agent,
             cwd=cwd,
             model=model or getattr(agent, "model", "") or "",
+            mode=restored_mode,
+            effort=restored_effort,
             history=history,
             cancel_event=threading.Event(),
         )
+        _apply_effort_to_agent(agent, restored_effort)
         with self._lock:
             self._sessions[session_id] = state
         _register_task_cwd(session_id, cwd)
@@ -589,6 +723,116 @@ class SessionManager:
         except Exception:
             logger.debug("Failed to delete ACP session %s from DB", session_id, exc_info=True)
             return False
+
+    def set_session_archived(self, session_id: str, archived: bool) -> bool:
+        """Soft-archive (hide) or restore a session. Reversible; not a delete."""
+        db = self._get_db()
+        if db is None:
+            return False
+        try:
+            return bool(db.set_session_archived(session_id, archived))
+        except Exception:
+            logger.debug("Failed to set archived on %s", session_id, exc_info=True)
+            return False
+
+    def set_session_owner(self, session_id: str, user_id: str) -> bool:
+        """Stamp (or clear, when *user_id* is empty) a session's owner in
+        state.db. The owner is the authenticated user identifier the ACP
+        sessions list filters on. Soft per-user display key, not a boundary.
+        Also mirrors the value onto the in-memory session so a subsequent
+        ``_persist`` doesn't drop it. Returns True when a row was updated.
+        """
+        db = self._get_db()
+        if db is None:
+            return False
+        owner = (user_id or "").strip() or None
+        with self._lock:
+            state = self._sessions.get(session_id)
+            if state is not None:
+                state.owner = owner
+        try:
+            return bool(db.set_session_owner(session_id, owner or ""))
+        except Exception:
+            logger.debug("Failed to set owner on %s", session_id, exc_info=True)
+            return False
+
+    def set_session_title(self, session_id: str, title: str) -> bool:
+        """Set (or clear, when *title* is empty/whitespace) a session's canonical
+        title in state.db. Returns True when a row was updated.
+
+        Raises ValueError on validation failure or a title-uniqueness conflict —
+        callers (the ACP ext-method) surface that to the client so an inline
+        rename collision is a visible error, not a silent no-op.
+        """
+        db = self._get_db()
+        if db is None:
+            return False
+        return bool(db.set_session_title(session_id, title))
+
+    def get_session_title(self, session_id: str) -> Optional[str]:
+        """Return the session's canonical title, or None."""
+        db = self._get_db()
+        if db is None:
+            return None
+        try:
+            return db.get_session_title(session_id)
+        except Exception:
+            logger.debug("Failed to read title for %s", session_id, exc_info=True)
+            return None
+
+    def derive_session_title(self, session_id: str) -> Optional[str]:
+        """Derive and persist a title from the session's FIRST user→assistant
+        exchange, reusing the same auxiliary-model pass as auto-titling.
+
+        Unlike ``maybe_auto_title`` this is NOT gated to the first turn — it is
+        the on-demand backfill for sessions that opened into a long/interrupted
+        first turn and never got auto-titled (the classic ``source='acp'``
+        untitled case). Runs synchronously (the caller invokes it off-thread) and
+        is a no-op when the session already has a title. Returns the new title,
+        or None when nothing was set (no exchange yet / already titled / aux
+        failure)."""
+        db = self._get_db()
+        if db is None:
+            return None
+        try:
+            if db.get_session_title(session_id):
+                return None  # already titled — never overwrite
+            messages = db.get_messages(session_id)
+        except Exception:
+            logger.debug("derive_session_title: could not read %s", session_id, exc_info=True)
+            return None
+
+        def _text(m):
+            c = m.get("content")
+            if isinstance(c, str):
+                return c
+            if isinstance(c, list):
+                return " ".join(
+                    p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text"
+                )
+            return ""
+
+        first_user = next((_text(m) for m in messages if m.get("role") == "user"), "")
+        first_assistant = next((_text(m) for m in messages if m.get("role") == "assistant"), "")
+        if not first_user or not first_assistant:
+            return None  # no completed exchange yet — nothing to title from
+
+        try:
+            from agent.title_generator import generate_title
+            title = generate_title(first_user, first_assistant)
+        except Exception:
+            logger.debug("derive_session_title: generation failed for %s", session_id, exc_info=True)
+            return None
+        if not title:
+            return None
+        try:
+            if db.set_session_title(session_id, title):
+                return title
+        except ValueError:
+            # Extremely unlikely (a derived title colliding with another
+            # session); leave untitled rather than error a background derive.
+            logger.debug("derive_session_title: title collision for %s", session_id, exc_info=True)
+        return None
 
     # ---- internal -----------------------------------------------------------
 

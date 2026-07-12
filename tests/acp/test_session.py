@@ -204,8 +204,74 @@ class TestForkSession:
         assert forked is not None
         assert forked.session_id != original.session_id
 
+    def test_fork_session_preserves_mode(self, manager):
+        original = manager.create_session()
+        original.mode = "acceptEdits"
+        forked = manager.fork_session(original.session_id, cwd="/new")
+        assert forked is not None
+        assert forked.mode == "acceptEdits"
+
+    def test_fork_session_default_mode_stays_empty(self, manager):
+        original = manager.create_session()
+        forked = manager.fork_session(original.session_id, cwd="/new")
+        assert forked is not None
+        assert forked.mode == ""
+
     def test_fork_nonexistent_returns_none(self, manager):
         assert manager.fork_session("bogus-id") is None
+
+    def test_fork_session_keep_history_slices_prefix(self, manager):
+        original = manager.create_session()
+        original.history.append({"role": "user", "content": "first"})
+        original.history.append({"role": "assistant", "content": "reply"})
+        original.history.append({"role": "user", "content": "second"})
+        original.history.append({"role": "assistant", "content": "reply 2"})
+
+        forked = manager.fork_session(original.session_id, cwd="/new", keep_history=2)
+        assert forked is not None
+
+        assert len(forked.history) == 2
+        assert forked.history[0]["content"] == "first"
+        assert forked.history[1]["content"] == "reply"
+        # Original is untouched.
+        assert len(original.history) == 4
+
+        # Still a deep copy — mutating the fork doesn't affect the original.
+        forked.history[0]["content"] = "mutated"
+        assert original.history[0]["content"] == "first"
+
+    def test_fork_session_keep_history_zero_gives_empty_fork(self, manager):
+        original = manager.create_session()
+        original.history.append({"role": "user", "content": "hello"})
+
+        forked = manager.fork_session(original.session_id, cwd="/new", keep_history=0)
+        assert forked is not None
+        assert forked.history == []
+        assert len(original.history) == 1
+
+    def test_fork_session_keep_history_beyond_length_copies_all(self, manager):
+        original = manager.create_session()
+        original.history.append({"role": "user", "content": "hello"})
+
+        forked = manager.fork_session(original.session_id, cwd="/new", keep_history=99)
+        assert forked is not None
+        assert len(forked.history) == 1
+
+    def test_fork_session_keep_history_none_copies_all(self, manager):
+        original = manager.create_session()
+        original.history.append({"role": "user", "content": "hello"})
+        original.history.append({"role": "assistant", "content": "hi"})
+
+        forked = manager.fork_session(original.session_id, cwd="/new", keep_history=None)
+        assert forked is not None
+        assert len(forked.history) == 2
+
+    def test_fork_session_keep_history_negative_raises(self, manager):
+        original = manager.create_session()
+        original.history.append({"role": "user", "content": "hello"})
+
+        with pytest.raises(ValueError, match="non-negative"):
+            manager.fork_session(original.session_id, cwd="/new", keep_history=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +297,41 @@ class TestListAndCleanup:
     def test_list_sessions_hides_empty_threads(self, manager):
         manager.create_session(cwd="/empty")
         assert manager.list_sessions() == []
+
+    def test_list_sessions_flattens_multimodal_first_message(self, manager):
+        """A multimodal first user message (text + image parts) must surface its
+        text in the title, not the raw list repr (leaking-code-in-title bug)."""
+        s = manager.create_session(cwd="/mm")
+        s.history.append(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "sometimes i send a screenshot"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                ],
+            }
+        )
+        listing = manager.list_sessions()
+        assert len(listing) == 1
+        title = listing[0]["title"]
+        assert "sometimes i send a screenshot" in title
+        assert "[{" not in title and "'type'" not in title
+
+    def test_list_sessions_image_only_first_message_placeholder(self, manager):
+        s = manager.create_session(cwd="/imgonly")
+        s.history.append(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+                ],
+            }
+        )
+        s.history.append({"role": "user", "content": "follow-up words"})
+        listing = manager.list_sessions()
+        assert len(listing) == 1
+        # First user message is image-only → placeholder wins (first match).
+        assert listing[0]["title"] == "[multimodal content]"
 
     def test_save_session_preserves_existing_messages_on_encode_failure(self, manager):
         """Regression for #13675: a bad message in state.history must not
@@ -474,6 +575,68 @@ class TestPersistence:
         assert restored.history[1]["content"] == "hi there"
         # Agent should have been recreated.
         assert restored.agent is not None
+
+    def test_mode_survives_restore_from_db(self, manager):
+        """A non-default session mode must survive a process restart.
+
+        set_session_mode stores the mode on SessionState and persists it into
+        the model_config JSON blob; _restore must read it back so a VS Code
+        window reload (which respawns the ACP agent) doesn't revert the mode
+        to the server default.
+        """
+        state = manager.create_session(cwd="/work")
+        state.mode = "acceptEdits"
+        manager.save_session(state.session_id)
+        sid = state.session_id
+
+        # Drop from in-memory store (simulates process restart).
+        with manager._lock:
+            del manager._sessions[sid]
+
+        restored = manager.get_session(sid)
+        assert restored is not None
+        assert restored.mode == "acceptEdits"
+
+    def test_default_mode_not_written_to_model_config(self, manager):
+        """An unset/default mode leaves no `mode` key in the meta blob."""
+        state = manager.create_session(cwd="/work")
+        manager.save_session(state.session_id)
+        row = manager._get_db().get_session(state.session_id)
+        meta = json.loads(row["model_config"])
+        assert "mode" not in meta
+
+    def test_effort_survives_restore_from_db(self, manager):
+        """A session's reasoning-effort override must survive a restart,
+        and be re-applied to the freshly minted agent's reasoning_config."""
+        state = manager.create_session(cwd="/work")
+        state.effort = "high"
+        manager.save_session(state.session_id)
+        sid = state.session_id
+
+        with manager._lock:
+            del manager._sessions[sid]
+
+        restored = manager.get_session(sid)
+        assert restored is not None
+        assert restored.effort == "high"
+        assert restored.agent.reasoning_config == {"enabled": True, "effort": "high"}
+
+    def test_default_effort_not_written_to_model_config(self, manager):
+        """An unset effort leaves no `effort` key in the meta blob and does
+        not touch the restored agent's reasoning_config."""
+        state = manager.create_session(cwd="/work")
+        manager.save_session(state.session_id)
+        row = manager._get_db().get_session(state.session_id)
+        meta = json.loads(row["model_config"])
+        assert "effort" not in meta
+
+    def test_fork_session_preserves_effort(self, manager):
+        original = manager.create_session()
+        original.effort = "xhigh"
+        forked = manager.fork_session(original.session_id, cwd="/new")
+        assert forked is not None
+        assert forked.effort == "xhigh"
+        assert forked.agent.reasoning_config == {"enabled": True, "effort": "xhigh"}
 
     def test_save_session_updates_db(self, manager):
         state = manager.create_session()
@@ -763,3 +926,37 @@ class TestPersistence:
 
         assert stdout_buf.getvalue() == ""
         assert stderr_buf.getvalue() == "ACP noise\n"
+
+
+# ---------------------------------------------------------------------------
+# archived support
+# ---------------------------------------------------------------------------
+
+
+def _mgr_with_db(rows, archived_ok=True):
+    mgr = SessionManager(agent_factory=lambda: MagicMock(name="MockAIAgent"))
+    db = MagicMock(name="db")
+    db.list_sessions_rich.return_value = rows
+    db.set_session_archived.return_value = archived_ok
+    mgr._get_db = lambda: db  # type: ignore[method-assign]
+    return mgr, db
+
+
+def test_list_sessions_forwards_archived_flags_and_maps_archived_field():
+    rows = [{
+        "id": "s1", "cwd": ".", "model": "m", "message_count": 3,
+        "title": "T", "last_active": 1.0, "started_at": 0.0, "archived": 1,
+    }]
+    mgr, db = _mgr_with_db(rows)
+    out = mgr.list_sessions(archived_only=True)
+    # forwarded to the DB layer
+    _, kwargs = db.list_sessions_rich.call_args
+    assert kwargs.get("archived_only") is True
+    # archived surfaced as a bool on the result dict
+    assert out and out[0]["archived"] is True
+
+
+def test_set_session_archived_delegates_to_db():
+    mgr, db = _mgr_with_db([], archived_ok=True)
+    assert mgr.set_session_archived("s1", True) is True
+    db.set_session_archived.assert_called_once_with("s1", True)

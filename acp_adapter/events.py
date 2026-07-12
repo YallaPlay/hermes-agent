@@ -132,6 +132,45 @@ def make_tool_progress_cb(
     """
 
     def _tool_progress(event_type: str, name: str = None, preview: str = None, args: Any = None, **kwargs) -> None:
+        # A completed ``todo`` carries the authoritative task list in its result.
+        # Emit the native ACP plan update here, on the live completion event, so
+        # the turn's FINAL todo is reflected too. The step callback only observes
+        # a tool's result on the *next* step (via ``prev_tools``), which never
+        # arrives for the last tool of a turn — leaving the plan panel one todo
+        # behind whenever the turn ends on a todo update.
+        if event_type == "tool.completed":
+            if name == "todo":
+                plan_update = _build_plan_update_from_todo_result(kwargs.get("result"))
+                if plan_update is not None:
+                    _send_update(conn, session_id, loop, plan_update)
+            # Emit the ACP tool-call completion live, the instant the tool
+            # finishes. The step callback only reports a tool's result on the
+            # *next* API step (via ``prev_tools``), so the last tool(s) of a turn
+            # — or any turn that ends without a further step — never received a
+            # "completed" update and the client spun their spinner forever
+            # (until the turn-end sweep marked them failed, which is also wrong:
+            # they succeeded). Completing here, correlated by the same FIFO
+            # queue, clears the spinner immediately; the step callback's pop is
+            # now a redundant no-op for these ids (guarded there).
+            queue = tool_call_ids.get(name or "")
+            if isinstance(queue, str):
+                queue = deque([queue])
+                tool_call_ids[name] = queue
+            if name and queue:
+                tc_id = queue.popleft()
+                meta = tool_call_meta.pop(tc_id, {})
+                result = kwargs.get("result")
+                update = build_tool_complete(
+                    tc_id,
+                    name,
+                    result=str(result) if result is not None else None,
+                    function_args=meta.get("args"),
+                    snapshot=meta.get("snapshot"),
+                )
+                _send_update(conn, session_id, loop, update)
+                if not queue:
+                    tool_call_ids.pop(name, None)
+            return
         # Only emit ACP ToolCallStart for tool.started; ignore other event types
         if event_type != "tool.started":
             return
@@ -249,10 +288,11 @@ def make_step_cb(
                         snapshot=meta.get("snapshot"),
                     )
                     _send_update(conn, session_id, loop, update)
-                    if tool_name == "todo":
-                        plan_update = _build_plan_update_from_todo_result(result)
-                        if plan_update is not None:
-                            _send_update(conn, session_id, loop, plan_update)
+                    # NOTE: the native ``plan`` update for ``todo`` results is now
+                    # emitted live from the ``tool.completed`` progress event (see
+                    # ``make_tool_progress_cb``), which also covers a turn's final
+                    # todo. Emitting it here too would double-send and still miss
+                    # the last todo, so it is intentionally not done here.
                     if not queue:
                         tool_call_ids.pop(tool_name, None)
 

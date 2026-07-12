@@ -1182,3 +1182,97 @@ class TestAsyncQueueLogging:
         # INFO must not reach the WARNING+ errors.log even through the queue.
         if errors_log.exists():
             assert "info-level line" not in errors_log.read_text()
+
+
+class TestWorkerThreadSessionContext:
+    """run_with_session_context / get_session_context propagate the session
+    tag into spawned worker threads (which do NOT inherit threading.local).
+
+    Hermes runs model API calls + auxiliary work on freshly spawned daemon
+    threads.  Before the fix those threads emitted UNTAGGED log lines because
+    they never inherited the main turn thread's threading.local session
+    context.  These tests prove the helper re-applies the id inside the worker
+    so its records carry ``[session_id]``, and that with no context the tag
+    stays empty (no crash, no KeyError).
+    """
+
+    def test_get_session_context_roundtrip(self):
+        hermes_logging.clear_session_context()
+        assert hermes_logging.get_session_context() is None
+        hermes_logging.set_session_context("gsc_1")
+        assert hermes_logging.get_session_context() == "gsc_1"
+
+    def test_worker_thread_record_is_tagged(self):
+        """A record created INSIDE a worker thread wrapped by the helper
+        carries the session_tag, even though the thread never called
+        set_session_context itself."""
+        hermes_logging.clear_session_context()
+        captured = {}
+
+        def _worker():
+            factory = logging.getLogRecordFactory()
+            rec = factory("test.worker", logging.INFO, "", 0, "msg", (), None)
+            captured["tag"] = rec.session_tag
+
+        t = threading.Thread(
+            target=lambda: hermes_logging.run_with_session_context(
+                "worker_sess", _worker
+            )
+        )
+        t.start()
+        t.join()
+        assert captured["tag"] == " [worker_sess]"
+
+    def test_worker_thread_untagged_without_context(self):
+        """With no session id (falsy), the helper is a transparent
+        pass-through and the worker's record tag stays empty."""
+        hermes_logging.clear_session_context()
+        captured = {}
+
+        def _worker():
+            factory = logging.getLogRecordFactory()
+            rec = factory("test.worker", logging.INFO, "", 0, "msg", (), None)
+            captured["tag"] = rec.session_tag
+
+        t = threading.Thread(
+            target=lambda: hermes_logging.run_with_session_context(None, _worker)
+        )
+        t.start()
+        t.join()
+        assert captured["tag"] == ""
+
+    def test_worker_thread_line_tagged_in_agent_log(self, hermes_home):
+        """End-to-end: a log line emitted from a spawned worker thread lands
+        in agent.log WITH the [session_id] tag when the helper wraps it."""
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+        hermes_logging.clear_session_context()
+
+        def _worker():
+            logging.getLogger("test.worker_e2e").info("emitted from worker thread")
+
+        # Capture the id on the *spawning* thread, as the real spawn sites do.
+        hermes_logging.set_session_context("spawn_sess")
+        _sid = hermes_logging.get_session_context()
+        t = threading.Thread(
+            target=lambda: hermes_logging.run_with_session_context(_sid, _worker),
+            daemon=True,
+        )
+        t.start()
+        t.join()
+
+        hermes_logging.flush_log_queue()
+        content = (hermes_home / "logs" / "agent.log").read_text()
+        for line in content.splitlines():
+            if "emitted from worker thread" in line:
+                assert "[spawn_sess]" in line
+                break
+        else:  # pragma: no cover - defensive
+            raise AssertionError("worker-thread log line not found in agent.log")
+
+    def test_helper_restores_prior_thread_context(self):
+        """The helper restores the emitting thread's prior context in finally
+        so it is safe on reused/pooled threads."""
+        hermes_logging.set_session_context("outer")
+        hermes_logging.run_with_session_context("inner", lambda: None)
+        assert hermes_logging.get_session_context() == "outer"
+        hermes_logging.clear_session_context()

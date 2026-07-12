@@ -54,10 +54,11 @@ def agent(mock_manager):
 
 
 @pytest.mark.asyncio
-async def test_new_session_exposes_edit_approvals_as_modes_not_config_options(agent):
+async def test_new_session_exposes_edit_approvals_as_modes(agent):
+    """Edit approval stays on the modes channel (Zed keeps its model picker);
+    config_options carries only the reasoning-effort select."""
     resp = await agent.new_session(cwd="/tmp")
 
-    assert resp.config_options is None
     assert isinstance(resp.modes, SessionModeState)
     assert resp.modes.current_mode_id == "default"
     assert [(mode.id, mode.name) for mode in resp.modes.available_modes] == [
@@ -65,10 +66,22 @@ async def test_new_session_exposes_edit_approvals_as_modes_not_config_options(ag
         ("accept_edits", "Accept Edits"),
         ("dont_ask", "Don't Ask"),
     ]
+    assert [opt.id for opt in resp.config_options] == ["reasoning_effort"]
 
 
 @pytest.mark.asyncio
-async def test_set_config_option_persists_edit_approval_policy_without_advertising_config(agent):
+async def test_new_session_advertises_reasoning_effort_config_option(agent):
+    resp = await agent.new_session(cwd="/tmp")
+    (opt,) = resp.config_options
+    assert opt.type == "select"
+    assert opt.current_value == "default"
+    assert [o.value for o in opt.options] == [
+        "default", "none", "minimal", "low", "medium", "high", "xhigh",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_set_config_option_persists_edit_approval_policy(agent):
     resp = await agent.new_session(cwd="/tmp")
     update = await agent.set_config_option(
         "edit_approval_policy",
@@ -78,8 +91,46 @@ async def test_set_config_option_persists_edit_approval_policy_without_advertisi
     state = agent.session_manager.get_session(resp.session_id)
 
     assert isinstance(update, SetSessionConfigOptionResponse)
-    assert update.config_options == []
     assert getattr(state, "mode", None) == "accept_edits"
+
+
+@pytest.mark.asyncio
+async def test_set_config_option_reasoning_effort_applies_and_persists(agent):
+    resp = await agent.new_session(cwd="/tmp")
+    update = await agent.set_config_option(
+        "reasoning_effort",
+        resp.session_id,
+        "high",
+    )
+    state = agent.session_manager.get_session(resp.session_id)
+
+    assert state.effort == "high"
+    assert state.agent.reasoning_config == {"enabled": True, "effort": "high"}
+    (opt,) = update.config_options
+    assert opt.id == "reasoning_effort"
+    assert opt.current_value == "high"
+
+
+@pytest.mark.asyncio
+async def test_set_config_option_reasoning_effort_default_clears_override(agent):
+    resp = await agent.new_session(cwd="/tmp")
+    await agent.set_config_option("reasoning_effort", resp.session_id, "xhigh")
+    update = await agent.set_config_option("reasoning_effort", resp.session_id, "default")
+    state = agent.session_manager.get_session(resp.session_id)
+
+    assert state.effort == ""
+    assert state.agent.reasoning_config is None
+    assert update.config_options[0].current_value == "default"
+
+
+@pytest.mark.asyncio
+async def test_set_config_option_reasoning_effort_invalid_falls_back_to_default(agent):
+    resp = await agent.new_session(cwd="/tmp")
+    await agent.set_config_option("reasoning_effort", resp.session_id, "ludicrous")
+    state = agent.session_manager.get_session(resp.session_id)
+
+    assert state.effort == ""
+    assert state.agent.reasoning_config is None
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +472,47 @@ class TestSessionOps:
         assert tool_updates[1].tool_call_id == "call_search_1"
         assert "Search results" in tool_updates[1].content[0].content.text
         assert "cli.py:42" in tool_updates[1].content[0].content.text
+
+    @pytest.mark.asyncio
+    async def test_load_session_stamps_history_index_on_user_chunks(self, agent):
+        """Replayed user chunks carry _meta.hermes.historyIndex — the absolute
+        state.history coordinate a client passes back as keepHistory on fork."""
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        new_resp = await agent.new_session(cwd="/tmp")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        # Index 0 is a hidden system message replay skips; the user turns sit at
+        # absolute indices 1 and 3, which is exactly what must be stamped.
+        state.history = [
+            {"role": "system", "content": "hidden system"},
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": "first answer"},
+            {"role": "user", "content": "second question"},
+            {"role": "assistant", "content": "second answer"},
+        ]
+
+        mock_conn.session_update.reset_mock()
+        await agent.load_session(cwd="/tmp", session_id=new_resp.session_id)
+        await asyncio.sleep(0)
+
+        user_calls = [
+            call for call in mock_conn.session_update.await_args_list
+            if getattr(call.kwargs.get("update"), "session_update", None) == "user_message_chunk"
+        ]
+        assert len(user_calls) == 2
+        assert user_calls[0].kwargs["update"].content.text == "first question"
+        assert user_calls[0].kwargs["hermes"] == {"historyIndex": 1}
+        assert user_calls[1].kwargs["update"].content.text == "second question"
+        assert user_calls[1].kwargs["hermes"] == {"historyIndex": 3}
+
+        # Assistant chunks are not stamped — only user turns are fork points.
+        assistant_calls = [
+            call for call in mock_conn.session_update.await_args_list
+            if getattr(call.kwargs.get("update"), "session_update", None) == "agent_message_chunk"
+        ]
+        assert assistant_calls and all("hermes" not in c.kwargs for c in assistant_calls)
 
     @pytest.mark.asyncio
     async def test_load_session_replays_native_plan_for_persisted_todo_tool(self, agent):
@@ -808,6 +900,78 @@ class TestListAndFork:
         assert fork_resp.session_id != new_resp.session_id
 
     @pytest.mark.asyncio
+    async def test_fork_session_keep_history_meta_slices_prefix(self, agent):
+        new_resp = await agent.new_session(cwd="/original")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        state.history.extend(
+            [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "reply"},
+                {"role": "user", "content": "second"},
+                {"role": "assistant", "content": "reply 2"},
+            ]
+        )
+
+        # The JSON-RPC router flattens _meta into handler kwargs, so
+        # {"_meta": {"hermes": {"keepHistory": 2}}} arrives as hermes={...}.
+        fork_resp = await agent.fork_session(
+            cwd="/forked",
+            session_id=new_resp.session_id,
+            hermes={"keepHistory": 2},
+        )
+
+        forked = agent.session_manager.get_session(fork_resp.session_id)
+        assert len(forked.history) == 2
+        assert forked.history[1]["content"] == "reply"
+        assert len(state.history) == 4
+
+    @pytest.mark.asyncio
+    async def test_fork_session_keep_history_meta_invalid_raises(self, agent):
+        new_resp = await agent.new_session(cwd="/original")
+
+        for bad in ("2", -1, True, 1.5):
+            with pytest.raises(acp.RequestError):
+                await agent.fork_session(
+                    cwd="/forked",
+                    session_id=new_resp.session_id,
+                    hermes={"keepHistory": bad},
+                )
+
+    @pytest.mark.asyncio
+    async def test_fork_session_router_delivers_keep_history_meta(self, agent):
+        """End-to-end through the JSON-RPC router: _meta survives the wire shape."""
+        new_resp = await agent.new_session(cwd="/original")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        state.history.extend(
+            [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "reply"},
+                {"role": "user", "content": "second"},
+            ]
+        )
+        router = build_agent_router(agent, use_unstable_protocol=True)
+
+        result = await router(
+            "session/fork",
+            {
+                "cwd": "/forked",
+                "sessionId": new_resp.session_id,
+                "_meta": {"hermes": {"keepHistory": 1}},
+            },
+            False,
+        )
+
+        forked = agent.session_manager.get_session(result.session_id)
+        assert len(forked.history) == 1
+        assert forked.history[0]["content"] == "first"
+
+    @pytest.mark.asyncio
+    async def test_initialize_advertises_fork_keep_history_extension(self, agent):
+        resp = await agent.initialize(protocol_version=1)
+        fork_caps = resp.agent_capabilities.session_capabilities.fork
+        assert fork_caps.field_meta == {"hermes": {"keepHistory": True}}
+
+    @pytest.mark.asyncio
     async def test_list_sessions_includes_title_and_updated_at(self, agent):
         with patch.object(
             agent.session_manager,
@@ -832,7 +996,12 @@ class TestListAndFork:
         with patch.object(agent.session_manager, "list_sessions", return_value=[]) as mock_list:
             await agent.list_sessions(cwd="/mnt/e/Projects/AI/browser-link-3")
 
-        mock_list.assert_called_once_with(cwd="/mnt/e/Projects/AI/browser-link-3")
+        mock_list.assert_called_once_with(
+            cwd="/mnt/e/Projects/AI/browser-link-3",
+            include_archived=False,
+            archived_only=False,
+            owner=None,
+        )
 
     @pytest.mark.asyncio
     async def test_list_sessions_pagination_first_page(self, agent):
@@ -885,6 +1054,139 @@ class TestListAndFork:
         assert resp.sessions == []
         assert resp.next_cursor is None
 
+    @pytest.mark.asyncio
+    async def test_ext_method_set_archived_delegates_and_returns_ok(self, agent):
+        with patch.object(
+            agent.session_manager, "set_session_archived", return_value=True
+        ) as mock_set:
+            result = await agent.ext_method("setArchived", {"sessionId": "s1", "archived": True})
+        assert result == {"ok": True}
+        mock_set.assert_called_once_with("s1", True)
+
+    @pytest.mark.asyncio
+    async def test_ext_method_set_title_delegates_persists_and_emits(self, agent):
+        with patch.object(
+            agent.session_manager, "set_session_title", return_value=True
+        ) as mock_set, patch.object(
+            agent.session_manager, "get_session_title", return_value="My Title"
+        ), patch.object(agent, "_send_session_info_update") as mock_emit:
+            result = await agent.ext_method("setTitle", {"sessionId": "s1", "title": "My Title"})
+        assert result == {"ok": True, "title": "My Title"}
+        mock_set.assert_called_once_with("s1", "My Title")
+        mock_emit.assert_awaited_once_with("s1")
+
+    @pytest.mark.asyncio
+    async def test_ext_method_set_title_conflict_returns_error_no_emit(self, agent):
+        with patch.object(
+            agent.session_manager,
+            "set_session_title",
+            side_effect=ValueError("Title 'X' is already in use by session s2"),
+        ), patch.object(agent, "_send_session_info_update") as mock_emit:
+            result = await agent.ext_method("setTitle", {"sessionId": "s1", "title": "X"})
+        assert result["ok"] is False
+        assert "already in use" in result["error"]
+        mock_emit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ext_method_set_title_requires_session_id(self, agent):
+        result = await agent.ext_method("setTitle", {"title": "X"})
+        assert result["ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_ext_method_derive_title_success_persists_and_emits(self, agent):
+        with patch.object(
+            agent.session_manager, "derive_session_title", return_value="Derived Title"
+        ) as mock_derive, patch.object(agent, "_send_session_info_update") as mock_emit:
+            result = await agent.ext_method("deriveTitle", {"sessionId": "s1"})
+        assert result == {"ok": True, "title": "Derived Title"}
+        mock_derive.assert_called_once_with("s1")
+        mock_emit.assert_awaited_once_with("s1")
+
+    @pytest.mark.asyncio
+    async def test_ext_method_derive_title_noop_returns_false_no_emit(self, agent):
+        # Already titled / no exchange yet / aux failure → derive returns None.
+        with patch.object(
+            agent.session_manager, "derive_session_title", return_value=None
+        ), patch.object(agent, "_send_session_info_update") as mock_emit:
+            result = await agent.ext_method("deriveTitle", {"sessionId": "s1"})
+        assert result == {"ok": False, "title": None}
+        mock_emit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ext_method_unknown_raises_method_not_found(self, agent):
+        from acp import RequestError
+        with pytest.raises(RequestError):
+            await agent.ext_method("nope", {})
+
+    @pytest.mark.asyncio
+    async def test_list_sessions_archived_only_forwards_and_stamps_meta(self, agent):
+        with patch.object(
+            agent.session_manager, "list_sessions",
+            return_value=[{
+                "session_id": "s1", "cwd": "/tmp", "title": "T",
+                "updated_at": 1.0, "archived": True,
+            }],
+        ) as mock_list:
+            resp = await agent.list_sessions(cwd="/tmp", hermes={"archivedOnly": True})
+        _, kwargs = mock_list.call_args
+        assert kwargs.get("archived_only") is True
+        assert kwargs.get("include_archived") is False
+        s = resp.sessions[0]
+        assert (s.field_meta or {}).get("hermes", {}).get("archived") is True
+
+    @pytest.mark.asyncio
+    async def test_ext_method_set_owner_delegates_persists_and_emits(self, agent):
+        with patch.object(
+            agent.session_manager, "set_session_owner", return_value=True
+        ) as mock_set, patch.object(agent, "_send_session_info_update") as mock_emit:
+            result = await agent.ext_method(
+                "setOwner", {"sessionId": "s1", "owner": "user@yallaplay.com"}
+            )
+        assert result == {"ok": True}
+        mock_set.assert_called_once_with("s1", "user@yallaplay.com")
+        mock_emit.assert_awaited_once_with("s1")
+
+    @pytest.mark.asyncio
+    async def test_ext_method_set_owner_noop_returns_false_no_emit(self, agent):
+        # Unknown session id → set returns False → no info update emitted.
+        with patch.object(
+            agent.session_manager, "set_session_owner", return_value=False
+        ), patch.object(agent, "_send_session_info_update") as mock_emit:
+            result = await agent.ext_method("setOwner", {"sessionId": "s1", "owner": ""})
+        assert result == {"ok": False}
+        mock_emit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ext_method_set_owner_requires_session_id(self, agent):
+        result = await agent.ext_method("setOwner", {"owner": "x@y.com"})
+        assert result["ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_list_sessions_owner_only_forwards_owner(self, agent):
+        with patch.object(
+            agent.session_manager, "list_sessions",
+            return_value=[{
+                "session_id": "s1", "cwd": "/tmp", "title": "T",
+                "updated_at": 1.0, "user_id": "me@yallaplay.com",
+            }],
+        ) as mock_list:
+            resp = await agent.list_sessions(
+                cwd="/tmp", hermes={"ownerOnly": True, "owner": "me@yallaplay.com"}
+            )
+        _, kwargs = mock_list.call_args
+        assert kwargs.get("owner") == "me@yallaplay.com"
+        assert len(resp.sessions) == 1
+
+    @pytest.mark.asyncio
+    async def test_list_sessions_owner_ignored_without_owner_only(self, agent):
+        # owner without ownerOnly must NOT filter (owner passed through as None).
+        with patch.object(
+            agent.session_manager, "list_sessions", return_value=[],
+        ) as mock_list:
+            await agent.list_sessions(cwd="/tmp", hermes={"owner": "me@yallaplay.com"})
+        _, kwargs = mock_list.call_args
+        assert kwargs.get("owner") is None
+
 # ---------------------------------------------------------------------------
 # session configuration / model routing
 # ---------------------------------------------------------------------------
@@ -921,7 +1223,9 @@ class TestSessionConfiguration:
         )
 
         assert mode_result == {}
-        assert config_result["configOptions"] == []
+        # The response advertises the full option set (currently the
+        # reasoning-effort select) so clients can re-render their pickers.
+        assert [opt["id"] for opt in config_result["configOptions"]] == ["reasoning_effort"]
 
     @pytest.mark.asyncio
     async def test_router_accepts_unstable_model_switch_when_enabled(self, agent):
@@ -1051,6 +1355,94 @@ class TestPrompt:
         assert state.agent.thinking_callback is None
 
     @pytest.mark.asyncio
+    async def test_prompt_injects_authenticated_owner_on_first_turn(self, agent):
+        """A session with an authenticated owner surfaces the identity to the
+        agent ONCE, on the first turn (empty history), prepended to the user
+        message. The persisted user message stays clean (original text)."""
+        new_resp = await agent.new_session(cwd=".", hermes={"owner": "kareem@yallaplay.com"})
+        state = agent.session_manager.get_session(new_resp.session_id)
+        assert state.owner == "kareem@yallaplay.com"
+        assert not state.history  # first turn
+
+        captured = {}
+
+        def _run(**kwargs):
+            captured.update(kwargs)
+            return {"final_response": "hi", "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+            ]}
+
+        state.agent.run_conversation = MagicMock(side_effect=_run)
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        await agent.prompt(prompt=[TextContentBlock(type="text", text="hello")],
+                           session_id=new_resp.session_id)
+
+        # The owner note is prepended to what the model sees this turn...
+        assert "kareem@yallaplay.com" in captured["user_message"]
+        assert "authenticated user" in captured["user_message"]
+        assert captured["user_message"].endswith("hello")
+        # ...but the persisted message is the clean original.
+        assert captured["persist_user_message"] == "hello"
+
+    @pytest.mark.asyncio
+    async def test_prompt_omits_owner_note_on_later_turns(self, agent):
+        """Once history exists, the owner note is NOT re-injected (already in
+        history — re-sending wastes tokens)."""
+        new_resp = await agent.new_session(cwd=".", hermes={"owner": "kareem@yallaplay.com"})
+        state = agent.session_manager.get_session(new_resp.session_id)
+        state.history = [
+            {"role": "user", "content": "prior"},
+            {"role": "assistant", "content": "ok"},
+        ]
+
+        captured = {}
+
+        def _run(**kwargs):
+            captured.update(kwargs)
+            return {"final_response": "hi", "messages": state.history}
+
+        state.agent.run_conversation = MagicMock(side_effect=_run)
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        await agent.prompt(prompt=[TextContentBlock(type="text", text="second")],
+                           session_id=new_resp.session_id)
+
+        assert captured["user_message"] == "second"
+        assert "authenticated user" not in captured["user_message"]
+
+    @pytest.mark.asyncio
+    async def test_prompt_no_owner_note_when_unowned(self, agent):
+        """A session without an owner injects nothing."""
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        assert state.owner is None
+
+        captured = {}
+
+        def _run(**kwargs):
+            captured.update(kwargs)
+            return {"final_response": "hi", "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+            ]}
+
+        state.agent.run_conversation = MagicMock(side_effect=_run)
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        await agent.prompt(prompt=[TextContentBlock(type="text", text="hello")],
+                           session_id=new_resp.session_id)
+
+        assert captured["user_message"] == "hello"
+
+    @pytest.mark.asyncio
     async def test_prompt_updates_history(self, agent):
         """After a prompt, session history should be updated."""
         new_resp = await agent.new_session(cwd=".")
@@ -1073,6 +1465,61 @@ class TestPrompt:
         await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
 
         assert state.history == expected_history
+
+    @pytest.mark.asyncio
+    async def test_prompt_returns_user_history_index_meta(self, agent):
+        """PromptResponse carries _meta.hermes.userHistoryIndex — the absolute
+        post-turn index of this turn's user message, for fork-from-here."""
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        # Simulate a turn appended after a prior user/assistant exchange, so the
+        # new user message lands at absolute index 2 in the post-turn history.
+        def _run(*_args, **_kwargs):
+            state.agent._persist_user_message_idx = 2
+            return {
+                "final_response": "sure",
+                "messages": [
+                    {"role": "user", "content": "earlier"},
+                    {"role": "assistant", "content": "earlier reply"},
+                    {"role": "user", "content": "now"},
+                    {"role": "assistant", "content": "sure"},
+                ],
+            }
+
+        state.agent.run_conversation = MagicMock(side_effect=_run)
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        resp = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="now")],
+            session_id=new_resp.session_id,
+        )
+        assert resp.field_meta == {"hermes": {"userHistoryIndex": 2}}
+
+    @pytest.mark.asyncio
+    async def test_prompt_omits_user_history_index_when_unavailable(self, agent):
+        """No _persist_user_message_idx (e.g. a bare turn) → no _meta stamp."""
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        # Ensure the attribute is absent so the getattr fallback fires.
+        if hasattr(state.agent, "_persist_user_message_idx"):
+            delattr(state.agent, "_persist_user_message_idx")
+
+        state.agent.run_conversation = MagicMock(return_value={
+            "final_response": "hi",
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        resp = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="hi")],
+            session_id=new_resp.session_id,
+        )
+        assert resp.field_meta is None
 
     @pytest.mark.asyncio
     async def test_prompt_sends_final_message_update(self, agent):

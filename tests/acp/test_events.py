@@ -126,6 +126,63 @@ class TestToolProgressCallback:
             step_cb(2, [{"name": "terminal", "result": "ok-2"}])
             assert "terminal" not in tool_call_ids
 
+    def test_completes_tool_live_on_tool_completed(self, mock_conn, event_loop_fixture):
+        """A tool.completed event emits the ACP completion immediately.
+
+        The step callback only reports a tool's result on the *next* step, so
+        the last tool of a turn never got a "completed" update and the client
+        spun forever. tool.completed must clear it live, correlated by the FIFO
+        queue and carrying the result.
+        """
+        from collections import deque
+
+        tool_call_ids = {}
+        tool_call_meta = {}
+        loop = event_loop_fixture
+
+        cb = make_tool_progress_cb(mock_conn, "session-1", loop, tool_call_ids, tool_call_meta)
+
+        with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts, \
+             patch("acp_adapter.events.build_tool_complete") as mock_btc:
+            future = MagicMock(spec=Future)
+            future.result.return_value = None
+            mock_rcts.return_value = future
+
+            cb("tool.started", "read_file", "Reading /etc/hosts", {"path": "/etc/hosts"})
+            assert len(tool_call_ids["read_file"]) == 1
+            tc_id = tool_call_ids["read_file"][0]
+
+            cb("tool.completed", "read_file", None, None, result="file contents")
+
+        # Completion built with the started id, args, and the live result.
+        mock_btc.assert_called_once_with(
+            tc_id, "read_file", result="file contents", function_args={"path": "/etc/hosts"}, snapshot=None
+        )
+        # The id is consumed so the step callback won't double-complete it.
+        assert "read_file" not in tool_call_ids
+
+    def test_tool_completed_is_noop_in_step_after_live_completion(self, mock_conn, event_loop_fixture):
+        """After a live completion, the step callback has nothing left to pop."""
+        tool_call_ids = {}
+        tool_call_meta = {}
+        loop = event_loop_fixture
+
+        progress_cb = make_tool_progress_cb(mock_conn, "session-1", loop, tool_call_ids, tool_call_meta)
+        step_cb = make_step_cb(mock_conn, "session-1", loop, tool_call_ids, tool_call_meta)
+
+        with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts, \
+             patch("acp_adapter.events.build_tool_complete") as mock_btc:
+            future = MagicMock(spec=Future)
+            future.result.return_value = None
+            mock_rcts.return_value = future
+
+            progress_cb("tool.started", "terminal", "$ ls", {"command": "ls"})
+            progress_cb("tool.completed", "terminal", None, None, result="ok")
+            assert mock_btc.call_count == 1
+            # The next step sees the id already consumed → no second completion.
+            step_cb(1, [{"name": "terminal", "result": "ok"}])
+            assert mock_btc.call_count == 1
+
 
 # ---------------------------------------------------------------------------
 # Thinking callback
@@ -297,12 +354,36 @@ class TestStepCallback:
         }
         mock_send.assert_called_once()
 
-    def test_todo_completion_emits_native_plan_update_after_tool_completion(self, mock_conn, event_loop_fixture):
+    def test_step_callback_completes_todo_without_emitting_plan(self, mock_conn, event_loop_fixture):
+        """The deferred step callback finalizes the tool call but no longer emits
+        the plan update — that now happens live on ``tool.completed`` so the
+        turn's final todo is not stranded one step behind."""
         from collections import deque
 
         tool_call_ids = {"todo": deque(["tc-todo"])}
         loop = event_loop_fixture
         cb = make_step_cb(mock_conn, "session-1", loop, tool_call_ids, {})
+        todo_result = (
+            '{"todos":['
+            '{"id":"inspect","content":"Inspect ACP","status":"completed"}'
+            '],"summary":{"total":1}}'
+        )
+
+        with patch("acp_adapter.events._send_update") as mock_send:
+            cb(1, [{"name": "todo", "result": todo_result}])
+
+        updates = [call.args[3] for call in mock_send.call_args_list]
+        assert [getattr(update, "session_update", None) for update in updates] == [
+            "tool_call_update",
+        ]
+
+    def test_todo_completion_emits_native_plan_update_live(self, mock_conn, event_loop_fixture):
+        """A live ``tool.completed`` event for ``todo`` emits the native ACP plan
+        update immediately, covering the final todo of a turn."""
+        tool_call_ids = {}
+        tool_call_meta = {}
+        loop = event_loop_fixture
+        cb = make_tool_progress_cb(mock_conn, "session-1", loop, tool_call_ids, tool_call_meta)
         todo_result = (
             '{"todos":['
             '{"id":"inspect","content":"Inspect ACP","status":"completed"},'
@@ -312,14 +393,11 @@ class TestStepCallback:
         )
 
         with patch("acp_adapter.events._send_update") as mock_send:
-            cb(1, [{"name": "todo", "result": todo_result}])
+            cb("tool.completed", "todo", None, None, result=todo_result)
 
         updates = [call.args[3] for call in mock_send.call_args_list]
-        assert [getattr(update, "session_update", None) for update in updates] == [
-            "tool_call_update",
-            "plan",
-        ]
-        plan = updates[1]
+        assert [getattr(update, "session_update", None) for update in updates] == ["plan"]
+        plan = updates[0]
         assert isinstance(plan, AgentPlanUpdate)
         assert [entry.content for entry in plan.entries] == [
             "Inspect ACP",
@@ -328,6 +406,18 @@ class TestStepCallback:
         ]
         assert [entry.status for entry in plan.entries] == ["completed", "in_progress", "completed"]
         assert [entry.priority for entry in plan.entries] == ["medium", "medium", "medium"]
+
+    def test_non_todo_completion_emits_nothing(self, mock_conn, event_loop_fixture):
+        """A ``tool.completed`` for a non-todo tool must not emit a plan update."""
+        tool_call_ids = {}
+        tool_call_meta = {}
+        loop = event_loop_fixture
+        cb = make_tool_progress_cb(mock_conn, "session-1", loop, tool_call_ids, tool_call_meta)
+
+        with patch("acp_adapter.events._send_update") as mock_send:
+            cb("tool.completed", "terminal", None, None, result="done")
+
+        mock_send.assert_not_called()
 
     def test_todo_plan_update_parses_json_with_trailing_hint(self):
         result = '{"todos":[{"id":"ship","content":"Ship ACP plan","status":"pending"}]}\n\n[Hint: persisted]'

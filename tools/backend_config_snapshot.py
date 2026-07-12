@@ -146,7 +146,7 @@ def unwrap_config(payload: Any) -> Any:
 
 def dump_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def ensure_app_scaffold(app_dir: Path, app: str, env: str) -> None:

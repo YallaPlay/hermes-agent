@@ -3052,6 +3052,32 @@ class SessionDB:
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
+    def set_session_owner(self, session_id: str, user_id: str) -> bool:
+        """Stamp a session's owner (``user_id``). Reversible; pass an empty
+        string to clear ownership. Returns True when a row was updated.
+
+        Ownership is a soft, per-user display key (used by the ACP sessions
+        list to show a user only their own sessions), not a security boundary —
+        it does not gate ``session/load``. Unlike archiving there is no
+        compression-lineage walk: ownership is a property of the individual
+        session row a client created, and continuations inherit their own
+        ``user_id`` at creation time.
+        """
+        owner = (user_id or "").strip() or None
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE sessions SET user_id = ? WHERE id = ?",
+                (owner, session_id),
+            )
+            rowcount = cursor.rowcount
+            if rowcount is None or rowcount < 0:
+                rowcount = conn.execute("SELECT changes()").fetchone()[0]
+            return rowcount
+
+        rowcount = self._execute_write(_do)
+        return rowcount > 0
+
     def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
         """Look up a session by exact title. Returns session dict or None."""
         with self._lock:
@@ -3252,6 +3278,7 @@ class SessionDB:
         id_query: str = None,
         search_query: str = None,
         compact_rows: bool = False,
+        owner: str = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -3331,6 +3358,15 @@ class SessionDB:
             where_clauses.append("s.archived = 1")
         elif not include_archived:
             where_clauses.append("s.archived = 0")
+        if owner:
+            # Per-user session list: STRICT ownership — show only the caller's
+            # own sessions. Untagged (legacy / pre-ownership / non-interactive
+            # e.g. slack-bot, jobs-cron) rows are HIDDEN under "My Sessions" so
+            # the view is truly the caller's own. Soft display filter toggled by
+            # the client's ownerOnly flag, not an access boundary; "All" (ownerOnly
+            # off) still shows everything.
+            where_clauses.append("s.user_id = ?")
+            params.append(owner)
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
@@ -3434,7 +3470,7 @@ class SessionDB:
                 )
                 SELECT {_sel},
                     COALESCE(
-                        (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                        (SELECT SUBSTR(CAST(m.content AS BLOB), 1, 800)
                          FROM messages m
                          WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
                          ORDER BY m.timestamp, m.id LIMIT 1),
@@ -3459,7 +3495,7 @@ class SessionDB:
             query = f"""
                 SELECT {_sel},
                     COALESCE(
-                        (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                        (SELECT SUBSTR(CAST(m.content AS BLOB), 1, 800)
                          FROM messages m
                          WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
                          ORDER BY m.timestamp, m.id LIMIT 1),
@@ -3481,13 +3517,9 @@ class SessionDB:
         sessions = []
         for row in rows:
             s = dict(row)
-            # Build the preview from the raw substring
-            raw = s.pop("_preview_raw", "").strip()
-            if raw:
-                text = raw[:60]
-                s["preview"] = text + ("..." if len(raw) > 60 else "")
-            else:
-                s["preview"] = ""
+            # Build the preview from the raw substring, flattening any
+            # multimodal content list so it doesn't leak its repr.
+            s["preview"] = self._preview_from_raw(s.pop("_preview_raw", "") or "")
             # Drop the internal ordering column so callers see a clean dict.
             s.pop("_effective_last_active", None)
             sessions.append(s)
@@ -3563,7 +3595,7 @@ class SessionDB:
         query = """
             SELECT s.*,
                 COALESCE(
-                    (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                    (SELECT SUBSTR(CAST(m.content AS BLOB), 1, 800)
                      FROM messages m
                      WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
                      ORDER BY m.timestamp, m.id LIMIT 1),
@@ -3585,12 +3617,7 @@ class SessionDB:
         runs: List[Dict[str, Any]] = []
         for row in rows:
             s = dict(row)
-            raw = s.pop("_preview_raw", "").strip()
-            if raw:
-                text = raw[:60]
-                s["preview"] = text + ("..." if len(raw) > 60 else "")
-            else:
-                s["preview"] = ""
+            s["preview"] = self._preview_from_raw(s.pop("_preview_raw", "") or "")
             runs.append(s)
         return runs
 
@@ -3606,7 +3633,7 @@ class SessionDB:
         query = f"""
             SELECT {_sel},
                 COALESCE(
-                    (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                    (SELECT SUBSTR(CAST(m.content AS BLOB), 1, 800)
                      FROM messages m
                      WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
                      ORDER BY m.timestamp, m.id LIMIT 1),
@@ -3625,12 +3652,7 @@ class SessionDB:
         if not row:
             return None
         s = dict(row)
-        raw = s.pop("_preview_raw", "").strip()
-        if raw:
-            text = raw[:60]
-            s["preview"] = text + ("..." if len(raw) > 60 else "")
-        else:
-            s["preview"] = ""
+        s["preview"] = self._preview_from_raw(s.pop("_preview_raw", "") or "")
         return s
 
     # =========================================================================
@@ -3676,8 +3698,59 @@ class SessionDB:
                     "Failed to decode JSON-encoded message content; "
                     "returning raw string"
                 )
-                return content
         return content
+
+    @classmethod
+    def _preview_from_raw(cls, raw: Any, limit: int = 60) -> str:
+        """Build a display preview from a raw ``messages.content`` value.
+
+        Multimodal messages persist ``content`` as a list of parts
+        (``[{"type": "text", ...}, {"type": "image_url", ...}]``), stored with
+        the ``\\x00json:`` sentinel prefix. A naive ``SUBSTR`` on that value
+        truncates at the leading NUL, so the preview SELECTs read it as a
+        ``BLOB`` (this arrives here as ``bytes``). Decode, peel the sentinel,
+        and flatten the text parts so the preview shows the user's actual words
+        instead of the ``[{'type': 'text', ...}]`` repr — mirroring the
+        flattening in :meth:`get_session_messages_preview`.
+        """
+        if not raw:
+            return ""
+        if isinstance(raw, (bytes, bytearray)):
+            raw = bytes(raw).decode("utf-8", "replace")
+        # Peel the ``\x00json:`` sentinel (full, or a NUL-stripped ``json:``
+        # remnant from older/alternate SELECT paths) before decoding.
+        if raw.startswith(cls._CONTENT_JSON_PREFIX):
+            raw = raw[len(cls._CONTENT_JSON_PREFIX):]
+        elif raw.startswith("json:"):
+            raw = raw[len("json:"):]
+        decoded: Any = raw
+        stripped = raw.lstrip()
+        if stripped.startswith("["):
+            # The 800-char BLOB slice may cut a multimodal list mid-part; retry
+            # against a trimmed-to-last-complete-object candidate.
+            for candidate in (stripped, stripped.rsplit("}", 1)[0] + "}]"):
+                try:
+                    decoded = json.loads(candidate)
+                    break
+                except (json.JSONDecodeError, TypeError):
+                    try:
+                        import ast
+                        decoded = ast.literal_eval(candidate)
+                        break
+                    except (ValueError, SyntaxError):
+                        continue
+        if isinstance(decoded, list):
+            text_parts = [
+                p.get("text", "") for p in decoded
+                if isinstance(p, dict) and p.get("type") == "text"
+            ]
+            text = " ".join(t for t in text_parts if t).strip() or "[multimodal content]"
+        elif isinstance(decoded, str):
+            text = decoded
+        else:
+            text = str(decoded)
+        text = " ".join(text.split())  # collapse whitespace/newlines
+        return text[:limit] + ("..." if len(text) > limit else "")
 
     def append_message(
         self,
@@ -6366,7 +6439,7 @@ class SessionDB:
                     """
                     SELECT s.*,
                         COALESCE(
-                            (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                            (SELECT SUBSTR(CAST(m.content AS BLOB), 1, 800)
                              FROM messages m
                              WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
                              ORDER BY m.timestamp, m.id LIMIT 1),
@@ -6395,7 +6468,7 @@ class SessionDB:
                     """
                     SELECT s.*,
                         COALESCE(
-                            (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                            (SELECT SUBSTR(CAST(m.content AS BLOB), 1, 800)
                              FROM messages m
                              WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
                              ORDER BY m.timestamp, m.id LIMIT 1),
@@ -6417,8 +6490,7 @@ class SessionDB:
         sessions: List[Dict[str, Any]] = []
         for row in rows:
             session = dict(row)
-            raw = str(session.pop("_preview_raw", "") or "").strip()
-            session["preview"] = raw[:60] + ("..." if len(raw) > 60 else "") if raw else ""
+            session["preview"] = self._preview_from_raw(session.pop("_preview_raw", "") or "")
             sessions.append(session)
         return sessions
 

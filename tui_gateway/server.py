@@ -5159,6 +5159,52 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     return True
 
 
+def _deliver_leftover_steer(rid, sid: str, session: dict, text: Any) -> bool:
+    """Deliver a /steer that couldn't be injected as the next user turn.
+
+    A steer that lands after the final tool batch (e.g. during the final API
+    call, when the model returns a text answer with no further tool calls) can't
+    be folded into any tool result — ``run_conversation()`` hands it back in
+    ``result["pending_steer"]``. Without re-delivery the desktop/web UI accepts
+    the steer, shows "queued", then silently loses it. This mirrors the
+    re-delivery in ``gateway/run.py`` and ``cli.py``.
+
+    Called from ``_run_prompt_submit``'s tail AFTER ``_drain_queued_prompt`` so
+    an explicit queued/interrupt prompt always wins. If a fresh user turn has
+    already claimed the session, the steer is re-stashed on the agent so that
+    turn's own tail (or next tool batch) drains it, and no new turn is fired.
+
+    Returns True if it handled the steer (dispatched a turn OR re-stashed it),
+    so the caller skips lower-priority follow-ups this cycle.
+    """
+    cleaned = (text or "").strip() if isinstance(text, str) else ""
+    if not cleaned:
+        return False
+    with session["history_lock"]:
+        if session.get("running"):
+            # A fresh user turn already claimed the session — it wins; re-stash
+            # the steer so that turn's own drain point picks it up.
+            agent = session.get("agent")
+            if agent is not None and hasattr(agent, "steer"):
+                try:
+                    agent.steer(cleaned)
+                except Exception:
+                    pass
+            return True
+        session["running"] = True
+    try:
+        _run_prompt_submit(rid, sid, session, cleaned)
+    except Exception as exc:
+        print(
+            f"[tui_gateway] leftover steer dispatch failed: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        with session["history_lock"]:
+            session["running"] = False
+    return True
+
+
 def _inflight_snapshot(session: dict) -> dict | None:
     turn = session.get("inflight_turn")
     if not isinstance(turn, dict):
@@ -8927,6 +8973,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         goal_followup = None  # set by the post-turn goal hook below
+        leftover_steer = None  # a /steer that landed after the final tool batch
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -9163,6 +9210,16 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 lr = result.get("last_reasoning")
                 if isinstance(lr, str) and lr.strip():
                     last_reasoning = lr.strip()
+                # A /steer that landed after the final tool batch (e.g. during
+                # the final API call, when the model returned a text answer with
+                # no further tool calls) can't be injected — run_conversation()
+                # hands it back here. Deliver it as the next user turn in the
+                # tail below instead of silently dropping it (parity with
+                # gateway/run.py and cli.py; without this the desktop/web UI
+                # accepts the steer, shows "queued", then loses it).
+                _ls = result.get("pending_steer")
+                if isinstance(_ls, str) and _ls.strip():
+                    leftover_steer = _ls
             else:
                 raw = str(result)
                 status = "complete"
@@ -9337,6 +9394,13 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         # every auto follow-up below — drain it first and skip them this cycle;
         # the goal judge / notifications re-evaluate at the end of that turn.
         if _drain_queued_prompt(rid, sid, session):
+            return
+
+        # A /steer that couldn't be injected (landed after the final tool
+        # batch) is delivered here as the next user turn — but only if no real
+        # queued prompt beat it above. Mirrors gateway/run.py's ordering: an
+        # explicit queued/interrupt message always wins over a leftover steer.
+        if leftover_steer and _deliver_leftover_steer(rid, sid, session, leftover_steer):
             return
 
         # Chain a goal-continuation turn if the judge said so. We do
