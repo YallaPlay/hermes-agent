@@ -1119,6 +1119,43 @@ class TestListAndFork:
             await agent.ext_method("nope", {})
 
     @pytest.mark.asyncio
+    async def test_ext_method_context_breakdown_returns_payload(self, agent):
+        payload = {
+            "categories": [
+                {"color": "var(--context-usage-system)", "id": "system_prompt", "label": "System prompt", "tokens": 3200},
+                {"color": "var(--context-usage-conversation)", "id": "conversation", "label": "Conversation", "tokens": 1500},
+            ],
+            "context_max": 200000,
+            "context_percent": 2,
+            "context_used": 4700,
+            "estimated_total": 4700,
+            "model": "test-model",
+        }
+        state = SimpleNamespace(agent=MagicMock(), history=[{"role": "user", "content": "hi"}])
+        with patch.object(
+            agent.session_manager, "get_session", return_value=state
+        ) as mock_get, patch(
+            "agent.context_breakdown.compute_session_context_breakdown",
+            return_value=payload,
+        ) as mock_compute:
+            result = await agent.ext_method("contextBreakdown", {"sessionId": "s1"})
+        assert result == {"ok": True, "breakdown": payload}
+        mock_get.assert_called_once_with("s1")
+        mock_compute.assert_called_once_with(state.agent, state.history)
+
+    @pytest.mark.asyncio
+    async def test_ext_method_context_breakdown_unknown_session(self, agent):
+        with patch.object(agent.session_manager, "get_session", return_value=None):
+            result = await agent.ext_method("contextBreakdown", {"sessionId": "nope"})
+        assert result["ok"] is False
+        assert "not loaded" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_ext_method_context_breakdown_requires_session_id(self, agent):
+        result = await agent.ext_method("contextBreakdown", {})
+        assert result == {"ok": False, "error": "sessionId required"}
+
+    @pytest.mark.asyncio
     async def test_list_sessions_archived_only_forwards_and_stamps_meta(self, agent):
         with patch.object(
             agent.session_manager, "list_sessions",

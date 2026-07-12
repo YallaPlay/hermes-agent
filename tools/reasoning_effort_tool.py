@@ -1,143 +1,87 @@
-"""set_reasoning_effort — let the model tune its own reasoning effort mid-task.
+#!/usr/bin/env python3
+"""Reasoning effort tool — adjust the agent's reasoning effort at runtime.
 
-The model calls this FIRST, before doing heavy work, to raise effort (e.g. when
-an analytically heavy skill/domain is in play), or to drop it for routine work.
-
-Mechanism (verified against fork runtime 2026-07-05):
-
-* ``agent.reasoning_config`` is a mutable dict read on *every* API call inside
-  the turn loop (``agent/chat_completion_helpers.py`` reads ``agent.reasoning_config``
-  per call, not cached per turn). Mutating it here therefore takes effect on the
-  model's *next* API call — including the next call of the SAME turn — with no
-  agent re-init required.
-* This is the opposite lifecycle from the ``/reasoning`` slash command
-  (``hermes_cli/cli_commands_mixin.py``), which runs *between* turns and must set
-  ``self.agent = None`` to force a rebuild. Our tool runs *inside* a turn against
-  the live agent object, so it mutates ``agent.reasoning_config`` directly.
-
-Design guarantees:
-
-* Session-scoped only. It NEVER persists to profile config (no ``save_config_value``),
-  so a task-local escalation cannot silently change ``agent.reasoning_effort`` for
-  future sessions.
-* Idempotent. Re-requesting the current level is a cheap no-op (no log spam).
-* Provider-honest. Reports the requested level; some providers ignore/remap effort
-  (e.g. codex clamps ``minimal`` -> ``low``). We do not claim provider acceptance.
+The tool itself is a thin validation + dispatch layer: the actual state
+change lives in the agent loop (``AIAgent._apply_reasoning_effort``), which
+mutates the live agent's ``reasoning_config`` and, when the platform provides
+one, routes scope handling through ``reasoning_update_callback`` (session
+override on the gateway, config persistence on request). Request construction
+reads ``agent.reasoning_config`` on every API call, so a change takes effect
+on the next request without touching the lifetime-stable system prompt.
 """
 
-from __future__ import annotations
-
 import json
-import logging
-from typing import Any, Dict, Optional
 
-logger = logging.getLogger(__name__)
-
-# Levels the model may request. Mirrors hermes_constants.parse_reasoning_effort
-# and the /reasoning slash command's accepted values.
-VALID_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh")
+from hermes_constants import VALID_REASONING_EFFORTS, parse_reasoning_effort
+from tools.registry import registry
 
 
-def _parse_level(level: str) -> Optional[Dict[str, Any]]:
-    """Return the reasoning_config dict for *level*, or None if invalid.
-
-    Reuses the single source of truth so this tool and /reasoning produce
-    identical config shapes:
-      none   -> {"enabled": False}
-      <lvl>  -> {"enabled": True, "effort": "<lvl>"}
-      bad    -> None
-    """
-    from hermes_constants import parse_reasoning_effort
-
-    return parse_reasoning_effort(level)
+def check_reasoning_effort_requirements() -> bool:
+    """Reasoning effort has no external requirements."""
+    return True
 
 
-def set_reasoning_effort(agent: Any, level: str, reason: str = "") -> str:
-    """Mutate the live agent's reasoning_config. Returns a JSON result string."""
-    level = str(level or "").strip().lower()
-    reason = str(reason or "").strip()
+def reasoning_effort_tool(level: str, persist: bool = False, callback=None) -> str:
+    """Validate and dispatch a reasoning-effort update through a runtime callback."""
+    if not level or not str(level).strip():
+        return json.dumps({"error": "level is required"}, ensure_ascii=False)
 
-    if level not in VALID_LEVELS:
-        return json.dumps({
-            "success": False,
-            "error": f"invalid level {level!r}; valid levels: {list(VALID_LEVELS)}",
-        })
-
-    parsed = _parse_level(level)
+    normalized = str(level).strip().lower()
+    parsed = parse_reasoning_effort(normalized)
     if parsed is None:
-        return json.dumps({
-            "success": False,
-            "error": f"could not parse reasoning level {level!r}",
-        })
+        return json.dumps(
+            {
+                "error": f"invalid level '{normalized}'",
+                "valid_levels": ["none", *VALID_REASONING_EFFORTS],
+            },
+            ensure_ascii=False,
+        )
 
-    prev = getattr(agent, "reasoning_config", None)
+    if callback is None:
+        return json.dumps(
+            {"error": "reasoning_effort tool is not available in this execution context"},
+            ensure_ascii=False,
+        )
 
-    # Idempotent no-op: already at the requested config.
-    if prev == parsed:
-        return json.dumps({
-            "success": True,
-            "level": level,
-            "changed": False,
-            "note": "already at this effort level",
-        })
+    try:
+        result = callback(parsed, level=normalized, persist=bool(persist))
+    except Exception as exc:
+        return json.dumps(
+            {"error": f"Failed to set reasoning effort: {exc}"},
+            ensure_ascii=False,
+        )
 
-    agent.reasoning_config = parsed
-
-    # Best-effort: if the agent exposes a back-ref to the CLI/session wrapper,
-    # mirror the level so a later in-session agent re-init keeps it. Never persist.
-    owner = getattr(agent, "_cli_owner", None)
-    if owner is not None and hasattr(owner, "reasoning_config"):
-        try:
-            owner.reasoning_config = parsed
-        except Exception:  # defensive: never let a back-ref quirk break the tool
-            pass
-
-    logger.info(
-        "set_reasoning_effort: %r -> %r (reason: %s)",
-        prev, parsed, reason or "(none given)",
-    )
-
-    return json.dumps({
-        "success": True,
-        "level": level,
-        "changed": True,
-        "note": (
-            "applies from your next model call (may be same turn); "
-            "session-scoped, not persisted; provider may ignore/remap the level"
-        ),
-    })
+    if isinstance(result, str):
+        return result
+    return json.dumps(result, ensure_ascii=False)
 
 
-# =============================================================================
-# OpenAI Function-Calling Schema
-# =============================================================================
-
-SET_REASONING_EFFORT_SCHEMA = {
-    "name": "set_reasoning_effort",
+REASONING_EFFORT_SCHEMA = {
+    "name": "reasoning_effort",
     "description": (
-        "Set your own reasoning effort for the rest of this task. Call this FIRST, "
-        "before doing the work, when the task is analytically heavy — data analysis, "
-        "debugging, multi-file code changes, revenue/cohort/retention reasoning, or "
-        "any task where a loaded skill marks its domain as heavy. Use 'high' or "
-        "'xhigh' for hard tasks; drop to 'low'/'none' for trivial lookups and routine "
-        "formatting. Takes effect on your next model call (may be the same turn). "
-        "Session-scoped: it does NOT change profile defaults. Some providers may "
-        "ignore or remap the level."
+        "Adjust your own reasoning effort for the current session. "
+        "Use it when the task at hand needs materially more or less thinking "
+        "depth. The change applies from the next model request onward. "
+        "Levels from lowest to highest: none, "
+        + ", ".join(VALID_REASONING_EFFORTS)
+        + "."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "level": {
                 "type": "string",
-                "enum": list(VALID_LEVELS),
-                "description": "Reasoning effort level to switch to.",
+                "enum": ["none", *VALID_REASONING_EFFORTS],
+                "description": "Desired reasoning effort level.",
             },
-            "reason": {
-                "type": "string",
+            "persist": {
+                "type": "boolean",
                 "description": (
-                    "Brief why, for the audit log "
-                    "(e.g. 'loaded analytics skill for a cohort query')."
+                    "If true, also persist the level as the global default "
+                    "via the platform layer. Only use when the user asked "
+                    "for a permanent change."
                 ),
+                "default": False,
             },
         },
         "required": ["level"],
@@ -145,25 +89,15 @@ SET_REASONING_EFFORT_SCHEMA = {
 }
 
 
-def check_set_reasoning_effort_requirements() -> bool:
-    """No external requirements -- always available."""
-    return True
-
-
-# --- Registry ---
-from tools.registry import registry  # noqa: E402
-
 registry.register(
-    name="set_reasoning_effort",
+    name="reasoning_effort",
     toolset="reasoning",
-    schema=SET_REASONING_EFFORT_SCHEMA,
-    # Fallback handler for non-agent dispatch paths (no live agent in scope).
-    # The real, agent-aware path is the dispatch branch in
-    # agent/agent_runtime_helpers.py, which calls set_reasoning_effort(agent, ...).
-    handler=lambda args, **kw: json.dumps({
-        "success": False,
-        "error": "set_reasoning_effort requires an active agent context",
-    }),
-    check_fn=check_set_reasoning_effort_requirements,
-    emoji="⚙️",
+    schema=REASONING_EFFORT_SCHEMA,
+    handler=lambda args, **kw: reasoning_effort_tool(
+        level=args.get("level", ""),
+        persist=args.get("persist", False),
+        callback=kw.get("callback"),
+    ),
+    check_fn=check_reasoning_effort_requirements,
+    emoji="🧠",
 )

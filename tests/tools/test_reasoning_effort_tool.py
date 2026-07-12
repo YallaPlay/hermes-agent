@@ -1,142 +1,102 @@
-"""Tests for the set_reasoning_effort agent tool."""
+"""Tests for tools/reasoning_effort_tool.py — validation and dispatch."""
 
 import json
 
-import pytest
-
-from tools.reasoning_effort_tool import set_reasoning_effort, VALID_LEVELS
-
-
-class FakeAgent:
-    """Minimal stand-in for the live agent object."""
-    def __init__(self, reasoning_config=None, cli_owner=None):
-        self.reasoning_config = reasoning_config
-        if cli_owner is not None:
-            self._cli_owner = cli_owner
+from tools.reasoning_effort_tool import (
+    REASONING_EFFORT_SCHEMA,
+    check_reasoning_effort_requirements,
+    reasoning_effort_tool,
+)
 
 
-class FakeOwner:
-    def __init__(self):
-        self.reasoning_config = None
+class TestReasoningEffortTool:
+    def test_requirements_always_met(self):
+        assert check_reasoning_effort_requirements() is True
 
+    def test_missing_level_errors(self):
+        result = json.loads(reasoning_effort_tool("", callback=lambda *a, **k: None))
+        assert result["error"] == "level is required"
 
-def _load(result: str) -> dict:
-    return json.loads(result)
-
-
-def test_sets_high_effort():
-    agent = FakeAgent()
-    out = _load(set_reasoning_effort(agent, "high", "analytics cohort query"))
-    assert out["success"] is True
-    assert out["level"] == "high"
-    assert out["changed"] is True
-    assert agent.reasoning_config == {"enabled": True, "effort": "high"}
-
-
-def test_none_disables_reasoning():
-    agent = FakeAgent(reasoning_config={"enabled": True, "effort": "medium"})
-    out = _load(set_reasoning_effort(agent, "none"))
-    assert out["success"] is True
-    assert agent.reasoning_config == {"enabled": False}
-
-
-def test_idempotent_noop_when_already_at_level():
-    agent = FakeAgent(reasoning_config={"enabled": True, "effort": "high"})
-    out = _load(set_reasoning_effort(agent, "high"))
-    assert out["success"] is True
-    assert out["changed"] is False
-    assert "already" in out["note"].lower()
-
-
-def test_rejects_invalid_level():
-    agent = FakeAgent()
-    out = _load(set_reasoning_effort(agent, "banana"))
-    assert out["success"] is False
-    assert "invalid" in out["error"].lower()
-    # unchanged
-    assert agent.reasoning_config is None
-
-
-def test_rejects_empty_level():
-    agent = FakeAgent()
-    out = _load(set_reasoning_effort(agent, ""))
-    assert out["success"] is False
-    assert agent.reasoning_config is None
-
-
-@pytest.mark.parametrize("level", VALID_LEVELS)
-def test_all_valid_levels_accepted(level):
-    agent = FakeAgent()
-    out = _load(set_reasoning_effort(agent, level))
-    assert out["success"] is True
-    assert out["level"] == level
-
-
-def test_case_and_whitespace_normalized():
-    agent = FakeAgent()
-    out = _load(set_reasoning_effort(agent, "  HIGH  "))
-    assert out["success"] is True
-    assert agent.reasoning_config == {"enabled": True, "effort": "high"}
-
-
-def test_propagates_to_cli_owner_when_present():
-    owner = FakeOwner()
-    agent = FakeAgent(cli_owner=owner)
-    set_reasoning_effort(agent, "xhigh")
-    assert agent.reasoning_config == {"enabled": True, "effort": "xhigh"}
-    assert owner.reasoning_config == {"enabled": True, "effort": "xhigh"}
-
-
-def test_never_persists_to_config(monkeypatch):
-    """Guard: the tool must never call save_config_value (session-scoped only)."""
-    import cli
-    called = {"save": False}
-
-    def _boom(*a, **k):
-        called["save"] = True
-        return True
-
-    monkeypatch.setattr(cli, "save_config_value", _boom, raising=False)
-    agent = FakeAgent()
-    set_reasoning_effort(agent, "high")
-    assert called["save"] is False
-
-
-def test_registered_in_agent_loop_tools():
-    """The tool must be routed through the agent loop, not the inert registry stub."""
-    import model_tools
-    assert "set_reasoning_effort" in model_tools._AGENT_LOOP_TOOLS
-
-
-def test_registered_in_tool_registry():
-    from tools.registry import discover_builtin_tools, registry
-    discover_builtin_tools()
-    entry = registry.get_entry("set_reasoning_effort")
-    assert entry is not None
-    assert entry.toolset == "reasoning"
-
-
-def test_effort_reaches_bedrock_request_wire():
-    """End-to-end wire proof: mutating reasoning_config changes the effort sent
-    to the Anthropic/Bedrock request. This is what makes same-turn escalation real
-    (agent.reasoning_config is re-read per API call, then mapped here)."""
-    from agent.anthropic_adapter import build_anthropic_kwargs, _supports_adaptive_thinking
-
-    model = "global.anthropic.claude-opus-4-8"
-    if not _supports_adaptive_thinking(model):
-        import pytest as _pytest
-        _pytest.skip("model does not use adaptive thinking")
-
-    def effort_on_wire(reasoning_config):
-        kw = build_anthropic_kwargs(
-            model, [{"role": "user", "content": "hi"}], [], 1024, reasoning_config
+    def test_invalid_level_errors_with_valid_levels(self):
+        result = json.loads(
+            reasoning_effort_tool("galaxy-brain", callback=lambda *a, **k: None)
         )
-        oc = kw.get("output_config") or {}
-        return oc.get("effort")
+        assert "invalid level" in result["error"]
+        assert "none" in result["valid_levels"]
+        assert "medium" in result["valid_levels"]
 
-    # The tool sets these exact shapes via parse_reasoning_effort.
-    assert effort_on_wire({"enabled": True, "effort": "medium"}) == "medium"
-    assert effort_on_wire({"enabled": True, "effort": "high"}) == "high"
-    assert effort_on_wire({"enabled": True, "effort": "xhigh"}) == "xhigh"
-    # 'none' disables thinking entirely (no output_config effort).
-    assert effort_on_wire({"enabled": False}) is None
+    def test_no_callback_errors(self):
+        result = json.loads(reasoning_effort_tool("high"))
+        assert "not available" in result["error"]
+
+    def test_level_is_normalized_before_dispatch(self):
+        seen = {}
+
+        def _cb(parsed, *, level, persist):
+            seen.update(parsed=parsed, level=level, persist=persist)
+            return {"success": True}
+
+        reasoning_effort_tool("  HIGH  ", callback=_cb)
+        assert seen["level"] == "high"
+        assert seen["parsed"] == {"enabled": True, "effort": "high"}
+        assert seen["persist"] is False
+
+    def test_none_parses_to_disabled(self):
+        seen = {}
+
+        def _cb(parsed, *, level, persist):
+            seen.update(parsed=parsed)
+            return {"success": True}
+
+        reasoning_effort_tool("none", callback=_cb)
+        assert seen["parsed"] == {"enabled": False}
+
+    def test_persist_flag_forwarded(self):
+        seen = {}
+
+        def _cb(parsed, *, level, persist):
+            seen.update(persist=persist)
+            return {"success": True}
+
+        reasoning_effort_tool("low", persist=True, callback=_cb)
+        assert seen["persist"] is True
+
+    def test_dict_result_serialized(self):
+        result = reasoning_effort_tool(
+            "low", callback=lambda parsed, *, level, persist: {"success": True, "level": level}
+        )
+        assert json.loads(result) == {"success": True, "level": "low"}
+
+    def test_string_result_passthrough(self):
+        result = reasoning_effort_tool(
+            "low", callback=lambda parsed, *, level, persist: '{"raw": true}'
+        )
+        assert result == '{"raw": true}'
+
+    def test_callback_exception_becomes_error(self):
+        def _cb(parsed, *, level, persist):
+            raise RuntimeError("boom")
+
+        result = json.loads(reasoning_effort_tool("low", callback=_cb))
+        assert "Failed to set reasoning effort: boom" in result["error"]
+
+    def test_schema_levels_match_parser(self):
+        from hermes_constants import VALID_REASONING_EFFORTS
+
+        schema_levels = REASONING_EFFORT_SCHEMA["parameters"]["properties"]["level"]["enum"]
+        assert schema_levels == ["none", *VALID_REASONING_EFFORTS]
+
+    def test_registered_in_registry(self):
+        # Other tests may reset the global registry; reload the module so its
+        # import-time registry.register(...) runs against the current registry.
+        import importlib
+
+        import tools.reasoning_effort_tool as _mod
+        from tools.registry import registry
+
+        if registry.get_entry("reasoning_effort") is None:
+            importlib.reload(_mod)
+
+        entry = registry.get_entry("reasoning_effort")
+        assert entry is not None
+        assert entry.toolset == "reasoning"

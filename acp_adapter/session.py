@@ -182,7 +182,7 @@ def _apply_effort_to_agent(agent: Any, effort: str) -> None:
     """Mirror a session's reasoning-effort override onto a (fresh) agent.
 
     ``agent.reasoning_config`` is read on every API call, so mutating it here
-    takes effect on the next call (same mechanism as the set_reasoning_effort
+    takes effect on the next call (same mechanism as the reasoning_effort
     tool). Empty/invalid levels are a no-op — the agent keeps its default.
     """
     effort = str(effort or "").strip().lower()

@@ -4792,7 +4792,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Load reasoning effort from config.yaml.
 
         Reads agent.reasoning_effort from config.yaml. Valid: "none",
-        "minimal", "low", "medium", "high", "xhigh". Returns None to use
+        "minimal", "low", "medium", "high", "xhigh", "max", "ultra". Returns None to use
         default (medium).
         """
         from hermes_constants import parse_reasoning_effort
@@ -4865,6 +4865,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._session_reasoning_overrides.pop(session_key, None)
         else:
             self._session_reasoning_overrides[session_key] = dict(reasoning_config)
+
+    def _persist_reasoning_effort_config(self, level: str) -> bool:
+        """Persist agent.reasoning_effort to config.yaml. Returns True on success."""
+        try:
+            from hermes_cli.config import atomic_config_write
+            import yaml
+
+            config_path = _hermes_home / "config.yaml"
+            user_config = {}
+            if config_path.exists():
+                with open(config_path, encoding="utf-8") as f:
+                    user_config = yaml.safe_load(f) or {}
+            agent_cfg = user_config.get("agent")
+            if not isinstance(agent_cfg, dict):
+                agent_cfg = {}
+                user_config["agent"] = agent_cfg
+            agent_cfg["reasoning_effort"] = level
+            atomic_config_write(config_path, user_config)
+            return True
+        except Exception as e:
+            logger.error("Failed to persist reasoning_effort from tool: %s", e)
+            return False
+
+    def _make_reasoning_update_callback(self, session_key: str):
+        """Build the reasoning_update_callback for an agent bound to *session_key*.
+
+        The tool's in-process mutation of ``agent.reasoning_config`` does not
+        survive the cached-agent path — every message re-applies the resolved
+        config (``agent.reasoning_config = reasoning_config``). Storing the new
+        level as a session override keeps ``_resolve_session_reasoning_config``
+        returning it on subsequent messages, mirroring ``/reasoning <level>``.
+        ``persist=True`` mirrors ``/reasoning <level> --global``: write
+        config.yaml and drop the (now redundant) session override.
+        """
+
+        def _callback(level: str, parsed_config: dict, persist: bool = False) -> bool:
+            if persist and self._persist_reasoning_effort_config(level):
+                self._set_session_reasoning_override(session_key, None)
+                self._reasoning_config = dict(parsed_config)
+                return True
+            self._set_session_reasoning_override(session_key, parsed_config)
+            self._reasoning_config = dict(parsed_config)
+            return False
+
+        return _callback
 
     @staticmethod
     def _load_service_tier() -> str | None:
@@ -10611,8 +10656,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 from agent.model_metadata import get_model_context_length_async
 
                 _msg_cwd = os.environ.get("TERMINAL_CWD", os.path.expanduser("~"))
-                _msg_runtime = _resolve_runtime_agent_kwargs()
                 _msg_config_ctx = None
+                _msg_cfg = None
+                _msg_model_cfg = {}
+                _msg_custom_providers = []
                 try:
                     _msg_cfg = _load_gateway_config()
                     _msg_model_cfg = _msg_cfg.get("model", {})
@@ -10620,13 +10667,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _msg_raw_ctx = _msg_model_cfg.get("context_length")
                         if _msg_raw_ctx is not None:
                             _msg_config_ctx = int(_msg_raw_ctx)
+                    try:
+                        from hermes_cli.config import get_compatible_custom_providers
+
+                        _msg_custom_providers = get_compatible_custom_providers(_msg_cfg)
+                    except Exception:
+                        _msg_custom_providers = _msg_cfg.get("custom_providers") or []
                 except Exception:
                     pass
+                # Resolve the session's actual model/provider/base_url the
+                # same way the hygiene compression block does (~11080).
+                # GatewayRunner has no self._model/self._base_url attrs
+                # (that was copy-pasted from HermesCLI, which does carry
+                # self.model/self.base_url), so using them here always raised
+                # AttributeError, silently caught below, meaning this feature
+                # never ran.
+                _msg_model, _msg_runtime = self._resolve_session_agent_runtime(
+                    source=source,
+                    session_key=session_key,
+                    user_config=_msg_cfg,
+                )
+                _msg_base_url = _msg_runtime.get("base_url") or ""
+                # A global model.context_length belongs to the configured
+                # model, not a session /model or channel override. Prefer a
+                # matching per-custom-provider model limit when available.
+                _msg_configured_model = (
+                    _msg_model_cfg.get("default") or _msg_model_cfg.get("model")
+                    if isinstance(_msg_model_cfg, dict)
+                    else _msg_model_cfg
+                )
+                if _msg_model != _msg_configured_model:
+                    _msg_config_ctx = None
+                if _msg_custom_providers and _msg_base_url:
+                    try:
+                        from hermes_cli.config import get_custom_provider_context_length
+
+                        _msg_custom_ctx = get_custom_provider_context_length(
+                            model=_msg_model,
+                            base_url=_msg_base_url,
+                            custom_providers=_msg_custom_providers,
+                        )
+                        if _msg_custom_ctx:
+                            _msg_config_ctx = _msg_custom_ctx
+                    except Exception:
+                        pass
                 _msg_ctx_len = await get_model_context_length_async(
-                    self._model,
-                    base_url=self._base_url or _msg_runtime.get("base_url") or "",
+                    _msg_model,
+                    base_url=_msg_base_url,
                     api_key=_msg_runtime.get("api_key") or "",
                     config_context_length=_msg_config_ctx,
+                    provider=_msg_runtime.get("provider") or "",
+                    custom_providers=_msg_custom_providers,
                 )
                 _ctx_result = await preprocess_context_references_async(
                     message_text,
@@ -10645,9 +10736,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _ctx_result.expanded:
                     message_text = _ctx_result.message
             except Exception as exc:
-                logger.debug("@ context reference expansion failed: %s", exc)
+                logger.warning("@ context reference expansion failed: %s", exc)
+                logger.debug("@ context reference expansion failure detail", exc_info=True)
 
         return message_text
+
+    async def _prepare_profile_scoped_inbound_message_text(
+        self,
+        *,
+        event: MessageEvent,
+        source: SessionSource,
+        history: List[Dict[str, Any]],
+        session_key: Optional[str] = None,
+    ) -> Optional[str]:
+        """Run inbound preprocessing under the routed profile when multiplexed."""
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
+                return await self._prepare_inbound_message_text(
+                    event=event,
+                    source=source,
+                    history=history,
+                    session_key=session_key,
+                )
+        return await self._prepare_inbound_message_text(
+            event=event,
+            source=source,
+            history=history,
+            session_key=session_key,
+        )
 
     def _consume_pending_native_image_paths(self, session_key: str) -> List[str]:
         pending_native = getattr(self, "_pending_native_image_paths_by_session", None)
@@ -11491,7 +11607,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # attachments (documents, audio, etc.) are not sent to the vision
         # tool even when they appear in the same message.
         # -----------------------------------------------------------------
-        message_text = await self._prepare_inbound_message_text(
+        message_text = await self._prepare_profile_scoped_inbound_message_text(
             event=event,
             source=source,
             history=history,
@@ -13313,6 +13429,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             max_iterations = _current_max_iterations()
             reasoning_config = self._resolve_session_reasoning_config(source=source)
             self._reasoning_config = reasoning_config
+            try:
+                _reasoning_session_key = self._session_key_for_source(source)
+            except Exception:
+                _reasoning_session_key = ""
+            reasoning_update_callback = self._make_reasoning_update_callback(_reasoning_session_key)
             self._service_tier = self._load_service_tier()
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
 
@@ -13343,6 +13464,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     enabled_toolsets=enabled_toolsets,
                     disabled_toolsets=disabled_toolsets,
                     reasoning_config=reasoning_config,
+                    reasoning_update_callback=reasoning_update_callback,
                     service_tier=self._service_tier,
                     request_overrides=turn_route.get("request_overrides"),
                     providers_allowed=pr.get("only"),
@@ -18319,6 +18441,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.notice_clear_callback = None
             agent.event_callback = _event_callback_sync
             agent.reasoning_config = reasoning_config
+            # Session-scoped hook for the reasoning_effort tool. Without it,
+            # the tool's mutation of agent.reasoning_config would be undone by
+            # the reset one line above on the very next message; the callback
+            # records the change as a session override so
+            # _resolve_session_reasoning_config keeps returning it.
+            agent.reasoning_update_callback = self._make_reasoning_update_callback(session_key)
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
 
@@ -19839,7 +19967,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_key or "?",
                             exc_info=True,
                         )
-                    next_message = await self._prepare_inbound_message_text(
+                    next_message = await self._prepare_profile_scoped_inbound_message_text(
                         event=pending_event,
                         source=next_source,
                         history=updated_history,

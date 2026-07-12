@@ -294,6 +294,7 @@ def init_agent(
     reasoning_callback: callable = None,
     clarify_callback: callable = None,
     read_terminal_callback: callable = None,
+    reasoning_update_callback: callable = None,
     step_callback: callable = None,
     stream_delta_callback: callable = None,
     interim_assistant_callback: callable = None,
@@ -364,6 +365,9 @@ def init_agent(
         max_tokens (int): Maximum tokens for model responses (optional, uses model default if not set)
         reasoning_config (Dict): OpenRouter reasoning configuration override (e.g. {"effort": "none"} to disable thinking).
             If None, defaults to {"enabled": True, "effort": "medium"} for OpenRouter. Set to disable/customize reasoning.
+        reasoning_update_callback (callable): Callback function(level, parsed_config, persist) -> bool invoked when
+            the reasoning_effort tool changes the level. Provided by the platform layer to scope the change
+            (gateway session override) and/or persist it to config when persist is True. Returns True when persisted.
         prefill_messages (List[Dict]): Messages to prepend to conversation history as prefilled context.
             Useful for injecting a few-shot example or priming the model's response style.
             Example: [{"role": "user", "content": "Hi!"}, {"role": "assistant", "content": "Hello!"}]
@@ -412,13 +416,25 @@ def init_agent(
     agent.skip_context_files = skip_context_files
     agent.load_soul_identity = load_soul_identity
     agent.pass_session_id = pass_session_id
-    agent._credential_pool = credential_pool
     agent.log_prefix_chars = log_prefix_chars
     agent.log_prefix = f"{log_prefix} " if log_prefix else ""
     # Store effective base URL for feature detection (prompt caching, reasoning, etc.)
     agent.base_url = base_url or ""
     provider_name = provider.strip().lower() if isinstance(provider, str) and provider.strip() else None
     agent.provider = provider_name or ""
+    if credential_pool is not None:
+        try:
+            from agent.credential_pool import credential_pool_matches_provider
+
+            if not credential_pool_matches_provider(
+                credential_pool,
+                agent.provider,
+                base_url=agent.base_url,
+            ):
+                credential_pool = None
+        except Exception:
+            credential_pool = None
+    agent._credential_pool = credential_pool
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
     if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}:
@@ -529,6 +545,7 @@ def init_agent(
     agent.reasoning_callback = reasoning_callback
     agent.clarify_callback = clarify_callback
     agent.read_terminal_callback = read_terminal_callback
+    agent.reasoning_update_callback = reasoning_update_callback
     agent.step_callback = step_callback
     agent.stream_delta_callback = stream_delta_callback
     agent.interim_assistant_callback = interim_assistant_callback

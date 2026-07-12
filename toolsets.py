@@ -52,8 +52,6 @@ _HERMES_CORE_TOOLS = [
     "text_to_speech",
     # Planning & memory
     "todo", "memory",
-    # Reasoning effort self-tuning (model raises/lowers its own effort per task)
-    "set_reasoning_effort",
     # NOTE: the desktop Project tools (project_list/create/switch) are
     # deliberately NOT here. They only make sense where a GUI can follow the
     # move, so they live in the `project` toolset and are enabled solely by the
@@ -63,6 +61,8 @@ _HERMES_CORE_TOOLS = [
     "session_search",
     # Clarifying questions
     "clarify",
+    # Runtime reasoning-effort control
+    "reasoning_effort",
     # Code execution + delegation
     "execute_code", "delegate_task",
     # Cronjob management
@@ -208,12 +208,6 @@ TOOLSETS = {
         "includes": []
     },
 
-    "reasoning": {
-        "description": "Let the model tune its own reasoning effort per task (set_reasoning_effort)",
-        "tools": ["set_reasoning_effort"],
-        "includes": []
-    },
-    
     "memory": {
         "description": "Persistent memory across sessions (personal notes + user profile)",
         "tools": ["memory"],
@@ -243,7 +237,13 @@ TOOLSETS = {
         "tools": ["clarify"],
         "includes": []
     },
-    
+
+    "reasoning": {
+        "description": "Adjust runtime reasoning effort for the active session",
+        "tools": ["reasoning_effort"],
+        "includes": []
+    },
+
     "code_execution": {
         "description": "Run Python scripts that call tools programmatically (reduces LLM round trips)",
         "tools": ["execute_code"],
