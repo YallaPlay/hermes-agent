@@ -1172,6 +1172,22 @@ class TestListAndFork:
         assert (s.field_meta or {}).get("hermes", {}).get("archived") is True
 
     @pytest.mark.asyncio
+    async def test_list_sessions_stamps_fork_lineage_meta(self, agent):
+        with patch.object(
+            agent.session_manager, "list_sessions",
+            return_value=[
+                {"session_id": "fork1", "cwd": "/tmp", "title": "Fork",
+                 "updated_at": 2.0, "parent_id": "root1"},
+                {"session_id": "root1", "cwd": "/tmp", "title": "Root",
+                 "updated_at": 1.0, "parent_id": None},
+            ],
+        ):
+            resp = await agent.list_sessions(cwd="/tmp")
+        fork, root = resp.sessions
+        assert (fork.field_meta or {}).get("hermes", {}).get("forkedFrom") == "root1"
+        assert root.field_meta is None
+
+    @pytest.mark.asyncio
     async def test_ext_method_set_owner_delegates_persists_and_emits(self, agent):
         with patch.object(
             agent.session_manager, "set_session_owner", return_value=True

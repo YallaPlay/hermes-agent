@@ -204,6 +204,47 @@ class TestForkSession:
         assert forked is not None
         assert forked.session_id != original.session_id
 
+    def test_fork_session_records_parent_lineage(self, manager):
+        original = manager.create_session()
+        forked = manager.fork_session(original.session_id, cwd="/new")
+        assert forked is not None
+        assert forked.parent_id == original.session_id
+        # Persisted as a _forked_from marker in model_config (NOT
+        # parent_session_id, which the listers treat as subagent lineage).
+        db = manager._get_db()
+        row = db.get_session(forked.session_id)
+        mc = json.loads(row["model_config"])
+        assert mc["_forked_from"] == original.session_id
+        assert row["parent_session_id"] is None
+
+    def test_fork_lineage_surfaces_in_list_sessions(self, manager):
+        original = manager.create_session(cwd="/a")
+        original.history.append({"role": "user", "content": "hello"})
+        forked = manager.fork_session(original.session_id, cwd="/a")
+        listing = {s["session_id"]: s for s in manager.list_sessions()}
+        assert listing[forked.session_id]["parent_id"] == original.session_id
+        assert listing[original.session_id]["parent_id"] is None
+
+    def test_fork_lineage_survives_restart(self, manager):
+        """DB-only forks (post process restart) still report their parent."""
+        original = manager.create_session(cwd="/a")
+        original.history.append({"role": "user", "content": "hello"})
+        manager.save_session(original.session_id)
+        forked = manager.fork_session(original.session_id, cwd="/a")
+        fid = forked.session_id
+        manager.save_session(fid)
+
+        # Drop the fork from memory: list_sessions merges it from the DB row.
+        with manager._lock:
+            del manager._sessions[fid]
+        listing = {s["session_id"]: s for s in manager.list_sessions()}
+        assert listing[fid]["parent_id"] == original.session_id
+
+        # And a restore rehydrates the in-memory lineage too.
+        restored = manager.get_session(fid)
+        assert restored is not None
+        assert restored.parent_id == original.session_id
+
     def test_fork_session_preserves_mode(self, manager):
         original = manager.create_session()
         original.mode = "acceptEdits"

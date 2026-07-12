@@ -1492,7 +1492,14 @@ class HermesACPAgent(acp.Agent):
             updated_at = s.get("updated_at")
             if updated_at is not None and not isinstance(updated_at, str):
                 updated_at = str(updated_at)
-            field_meta = {"hermes": {"archived": True}} if s.get("archived") else None
+            hermes_meta: dict[str, Any] = {}
+            if s.get("archived"):
+                hermes_meta["archived"] = True
+            # Fork lineage: id of the session this one was forked from, so
+            # clients can nest forks under their parent in session lists.
+            if s.get("parent_id"):
+                hermes_meta["forkedFrom"] = s["parent_id"]
+            field_meta = {"hermes": hermes_meta} if hermes_meta else None
             sessions.append(
                 SessionInfo(
                     session_id=s["session_id"],
