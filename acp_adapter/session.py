@@ -104,6 +104,24 @@ def _build_session_title(title: Any, preview: Any, cwd: str | None) -> str:
     return leaf or "New thread"
 
 
+def _forked_from_marker(model_config: Any) -> str | None:
+    """Extract the ``_forked_from`` lineage marker from a model_config blob.
+
+    Accepts either the raw JSON string (as stored in sessions.model_config) or
+    an already-decoded dict. Returns None when absent/unparseable.
+    """
+    meta = model_config
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    if not isinstance(meta, dict):
+        return None
+    parent = str(meta.get("_forked_from") or "").strip()
+    return parent or None
+
+
 def _format_updated_at(value: Any) -> str | None:
     if value is None:
         return None
@@ -230,6 +248,11 @@ class SessionState:
     # on session/new. Persisted to sessions.user_id so the ACP sessions list can
     # filter to a user's own sessions. Soft display key, not an access boundary.
     owner: Optional[str] = None
+    # Session this one was forked from (session/fork lineage). Persisted as a
+    # ``_forked_from`` marker in the model_config JSON — NOT sessions.
+    # parent_session_id, which list_sessions_rich treats as subagent/compression
+    # lineage and would hide the fork from session lists. Display-only.
+    parent_id: Optional[str] = None
     history: List[Dict[str, Any]] = field(default_factory=list)
     cancel_event: Any = None  # threading.Event
     is_running: bool = False
@@ -357,6 +380,9 @@ class SessionManager:
             # to server defaults would surprise the user mid-flow.
             mode=original.mode,
             effort=original.effort,
+            # Record fork lineage so clients can nest the fork under its
+            # parent in session lists.
+            parent_id=session_id,
             history=copy.deepcopy(forked_history),
             cancel_event=threading.Event(),
         )
@@ -437,6 +463,8 @@ class SessionManager:
                             persisted.get("last_active") or persisted.get("started_at") or time.time()
                         ),
                         "archived": False,
+                        "parent_id": s.parent_id
+                        or _forked_from_marker(persisted.get("model_config")),
                     }
                 )
 
@@ -466,6 +494,7 @@ class SessionManager:
                 "title": _build_session_title(row.get("title"), row.get("preview"), session_cwd),
                 "updated_at": _format_updated_at(row.get("last_active") or row.get("started_at")),
                 "archived": bool(row.get("archived")),
+                "parent_id": _forked_from_marker(mc),
             })
 
         results.sort(key=lambda item: _updated_at_sort_key(item.get("updated_at")), reverse=True)
@@ -568,17 +597,26 @@ class SessionManager:
         session_effort = str(getattr(state, "effort", "") or "").strip()
         if session_effort:
             session_meta["effort"] = session_effort
+        # Fork lineage marker. Kept in model_config (like _branched_from) rather
+        # than parent_session_id, which the session listers treat as
+        # subagent/compression lineage and would hide the fork.
+        parent_id = str(getattr(state, "parent_id", "") or "").strip()
+        if parent_id:
+            session_meta["_forked_from"] = parent_id
         cwd_json = json.dumps(session_meta)
 
         try:
             # Ensure the session record exists.
             existing = db.get_session(state.session_id)
             if existing is None:
+                initial_config = {"cwd": state.cwd}
+                if parent_id:
+                    initial_config["_forked_from"] = parent_id
                 db.create_session(
                     session_id=state.session_id,
                     source="acp",
                     model=model_str,
-                    model_config={"cwd": state.cwd},
+                    model_config=initial_config,
                     user_id=getattr(state, "owner", None),
                 )
             else:
@@ -660,6 +698,7 @@ class SessionManager:
         restored_api_mode = None
         restored_mode = ""
         restored_effort = ""
+        restored_parent_id = ""
         mc = row.get("model_config")
         if mc:
             try:
@@ -671,6 +710,7 @@ class SessionManager:
                     restored_api_mode = meta.get("api_mode") or restored_api_mode
                     restored_mode = str(meta.get("mode") or "").strip()
                     restored_effort = str(meta.get("effort") or "").strip()
+                    restored_parent_id = str(meta.get("_forked_from") or "").strip()
             except (json.JSONDecodeError, TypeError):
                 pass
 
@@ -703,6 +743,7 @@ class SessionManager:
             model=model or getattr(agent, "model", "") or "",
             mode=restored_mode,
             effort=restored_effort,
+            parent_id=restored_parent_id or None,
             history=history,
             cancel_event=threading.Event(),
         )
