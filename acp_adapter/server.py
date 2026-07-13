@@ -116,6 +116,62 @@ _TEXT_RESOURCE_MIME_TYPES = {
     "application/sql",
 }
 
+# Cache for the cross-provider model catalog list. Building it hits every
+# authenticated provider's live /models endpoint (Codex OAuth, Copilot,
+# Bedrock, ...), which can take seconds — far too slow to run on every
+# session/new / session/load. Entries: (monotonic_ts, catalogs).
+_PROVIDER_CATALOGS_TTL_SECONDS = 300.0
+_provider_catalogs_cache: tuple[float, list[tuple[str, str, list[tuple[str, str]]]]] | None = None
+
+
+def _authenticated_provider_catalogs(
+    current_provider: str,
+) -> list[tuple[str, str, list[tuple[str, str]]]]:
+    """Return ``(provider_id, label, [(model_id, description), ...])`` per provider.
+
+    Only providers with usable credentials AND at least one addressable model
+    are included. The current provider's catalog is moved to the front so the
+    selector's first entries match the session's own provider. Results are
+    cached for a few minutes because live catalog fetches are slow.
+    """
+    global _provider_catalogs_cache
+    import time as _time
+
+    now = _time.monotonic()
+    if _provider_catalogs_cache and now - _provider_catalogs_cache[0] < _PROVIDER_CATALOGS_TTL_SECONDS:
+        catalogs = _provider_catalogs_cache[1]
+    else:
+        from hermes_cli.models import (
+            curated_models_for_provider,
+            list_available_providers,
+            normalize_provider,
+        )
+
+        catalogs = []
+        seen_providers: set[str] = set()
+        for info in list_available_providers():
+            if not info.get("authenticated"):
+                continue
+            pid = normalize_provider(info.get("id"))
+            if pid in seen_providers:
+                continue
+            seen_providers.add(pid)
+            try:
+                catalog = [
+                    (str(mid or "").strip(), desc)
+                    for mid, desc in curated_models_for_provider(pid)
+                    if str(mid or "").strip()
+                ]
+            except Exception:
+                logger.debug("Could not list models for provider %s", pid, exc_info=True)
+                continue
+            if catalog:
+                catalogs.append((pid, str(info.get("label") or pid), catalog))
+        _provider_catalogs_cache = (now, catalogs)
+
+    # Current provider first, preserving relative order for the rest.
+    return sorted(catalogs, key=lambda entry: 0 if entry[0] == current_provider else 1)
+
 
 def _apply_session_effort(agent: Any, level: str) -> None:
     """Apply a reasoning-effort level to the LIVE agent.
@@ -648,38 +704,45 @@ class HermesACPAgent(acp.Agent):
         return f"{raw_provider}:{raw_model}"
 
     def _build_model_state(self, state: SessionState) -> SessionModelState | None:
-        """Return the ACP model selector payload for editors like Zed."""
+        """Return the ACP model selector payload for editors like Zed.
+
+        Lists models from EVERY authenticated provider (not just the current
+        one) so clients can switch cross-provider — ``set_model`` already
+        resolves ``provider:model`` ids via ``parse_model_input``. The current
+        provider's catalog is listed first; providers with no addressable
+        models are skipped.
+        """
         model = str(state.model or getattr(state.agent, "model", "") or "").strip()
         provider = getattr(state.agent, "provider", None) or detect_provider() or "openrouter"
 
         try:
-            from hermes_cli.models import curated_models_for_provider, normalize_provider, provider_label
+            from hermes_cli.models import normalize_provider, provider_label
 
             normalized_provider = normalize_provider(provider)
-            provider_name = provider_label(normalized_provider)
             available_models: list[ModelInfo] = []
             seen_ids: set[str] = set()
 
-            for model_id, description in curated_models_for_provider(normalized_provider):
-                rendered_model = str(model_id or "").strip()
-                if not rendered_model:
-                    continue
-                choice_id = self._encode_model_choice(normalized_provider, rendered_model)
-                if choice_id in seen_ids:
-                    continue
-                desc_parts = [f"Provider: {provider_name}"]
-                if description:
-                    desc_parts.append(str(description).strip())
-                if rendered_model == model:
-                    desc_parts.append("current")
-                available_models.append(
-                    ModelInfo(
-                        model_id=choice_id,
-                        name=rendered_model,
-                        description=" • ".join(part for part in desc_parts if part),
+            for prov, prov_name, catalog in _authenticated_provider_catalogs(normalized_provider):
+                for model_id, description in catalog:
+                    rendered_model = str(model_id or "").strip()
+                    if not rendered_model:
+                        continue
+                    choice_id = self._encode_model_choice(prov, rendered_model)
+                    if choice_id in seen_ids:
+                        continue
+                    desc_parts = [f"Provider: {prov_name}"]
+                    if description:
+                        desc_parts.append(str(description).strip())
+                    if prov == normalized_provider and rendered_model == model:
+                        desc_parts.append("current")
+                    available_models.append(
+                        ModelInfo(
+                            model_id=choice_id,
+                            name=rendered_model,
+                            description=" • ".join(part for part in desc_parts if part),
+                        )
                     )
-                )
-                seen_ids.add(choice_id)
+                    seen_ids.add(choice_id)
 
             current_model_id = self._encode_model_choice(normalized_provider, model)
             if current_model_id and current_model_id not in seen_ids:
@@ -688,7 +751,7 @@ class HermesACPAgent(acp.Agent):
                     ModelInfo(
                         model_id=current_model_id,
                         name=model,
-                        description=f"Provider: {provider_name} • current",
+                        description=f"Provider: {provider_label(normalized_provider)} • current",
                     ),
                 )
 
