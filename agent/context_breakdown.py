@@ -85,6 +85,21 @@ def _memory_blocks(agent: Any) -> Tuple[str, str]:
     return memory_block, user_block
 
 
+def _injected_memory_blocks(agent: Any) -> Tuple[str, str]:
+    """Per-turn injections appended to the API-side copy of the user message.
+
+    ``build_turn_context`` stashes the external memory provider's prefetch
+    (e.g. Mnemosyne's ``## Mnemosyne Context``) and any ``pre_llm_call``
+    plugin context on the agent. Neither ever enters the stored conversation
+    history — the loop appends them to a *copy* of the user message at
+    request time — so without these the breakdown/report understates what
+    the model actually received.
+    """
+    prefetch = str(getattr(agent, "_last_ext_prefetch_cache", "") or "")
+    plugin_ctx = str(getattr(agent, "_last_plugin_user_context", "") or "")
+    return prefetch.strip(), plugin_ctx.strip()
+
+
 def _strip_blocks(text: str, *blocks: str) -> str:
     out = text
     for block in blocks:
@@ -129,7 +144,12 @@ def _collect_sections(agent: Any, messages: Optional[List[dict]]) -> Dict[str, A
     skills_index = skills_match.group(0) if skills_match else ""
 
     memory_block, user_block = _memory_blocks(agent)
-    memory_text = "\n\n".join(part for part in (memory_block, user_block) if part).strip()
+    injected_prefetch, injected_plugin_ctx = _injected_memory_blocks(agent)
+    memory_text = "\n\n".join(
+        part
+        for part in (memory_block, user_block, injected_prefetch, injected_plugin_ctx)
+        if part
+    ).strip()
 
     system_core = _strip_blocks(stable, skills_index)
     system_tail = _strip_blocks(volatile, memory_block, user_block)
@@ -146,6 +166,8 @@ def _collect_sections(agent: Any, messages: Optional[List[dict]]) -> Dict[str, A
         "skills_index": skills_index,
         "memory_block": memory_block,
         "user_block": user_block,
+        "injected_prefetch": injected_prefetch,
+        "injected_plugin_ctx": injected_plugin_ctx,
         "memory_text": memory_text,
         "builtin_tools": builtin_tools,
         "mcp_tools": mcp_tools,
@@ -183,12 +205,31 @@ def _skills_detail(skills_index: str) -> List[Dict[str, Any]]:
     return [{"label": f"{count} skills indexed", "tokens": None}]
 
 
-def _memory_detail(memory_block: str, user_block: str) -> List[Dict[str, Any]]:
+def _memory_detail(
+    memory_block: str,
+    user_block: str,
+    injected_prefetch: str = "",
+    injected_plugin_ctx: str = "",
+) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     if memory_block:
         rows.append({"label": "Agent memory", "tokens": _chars_to_tokens(memory_block)})
     if user_block:
         rows.append({"label": "User profile", "tokens": _chars_to_tokens(user_block)})
+    if injected_prefetch:
+        rows.append(
+            {
+                "label": "Memory provider prefetch (injected this turn)",
+                "tokens": _chars_to_tokens(injected_prefetch),
+            }
+        )
+    if injected_plugin_ctx:
+        rows.append(
+            {
+                "label": "Plugin context (injected this turn)",
+                "tokens": _chars_to_tokens(injected_plugin_ctx),
+            }
+        )
     return rows
 
 
@@ -273,7 +314,12 @@ def compute_session_context_breakdown(
             "memory",
             "Memory",
             _chars_to_tokens(sections["memory_text"]),
-            _memory_detail(sections["memory_block"], sections["user_block"]),
+            _memory_detail(
+                sections["memory_block"],
+                sections["user_block"],
+                sections["injected_prefetch"],
+                sections["injected_plugin_ctx"],
+            ),
         ),
         (
             "conversation",

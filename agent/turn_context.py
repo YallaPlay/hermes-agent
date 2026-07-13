@@ -564,6 +564,17 @@ def build_turn_context(
         except Exception:
             pass
 
+    # Expose this turn's user-message injections for diagnostics.  The
+    # conversation loop appends these to an API-side *copy* of the user
+    # message (they never enter the stored history), so without this stash
+    # the context breakdown/report cannot show what the model actually
+    # received (see agent/context_breakdown.py).
+    try:
+        agent._last_plugin_user_context = plugin_user_context
+        agent._last_ext_prefetch_cache = ext_prefetch_cache
+    except Exception:
+        pass
+
     return TurnContext(
         user_message=user_message,
         original_user_message=original_user_message,
