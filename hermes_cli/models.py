@@ -1675,17 +1675,39 @@ _KNOWN_PROVIDER_NAMES: set[str] = (
 )
 
 
+def _disabled_providers() -> set[str]:
+    """Providers explicitly disabled in ``config.yaml`` (``disabled_providers``).
+
+    Lets a user hide providers that would otherwise auto-authenticate from
+    ambient system credentials (e.g. copilot piggybacking on ``gh auth token``)
+    from every provider/model picker surface.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        raw = load_config().get("disabled_providers") or []
+        if isinstance(raw, str):
+            raw = [raw]
+        return {normalize_provider(str(p)) for p in raw if str(p).strip()}
+    except Exception:
+        return set()
+
+
 def list_available_providers() -> list[dict[str, str]]:
     """Return info about all providers the user could use with ``provider:model``.
 
     Each dict has ``id``, ``label``, and ``aliases``.
     Checks which providers have valid credentials configured.
+    Providers listed under ``disabled_providers`` in config.yaml are omitted.
 
     Derives the provider list from :data:`CANONICAL_PROVIDERS` (single
     source of truth shared with ``hermes model``, ``/model``, etc.).
     """
     # Derive display order from canonical list + custom
-    provider_order = [p.slug for p in CANONICAL_PROVIDERS] + ["custom"]
+    disabled = _disabled_providers()
+    provider_order = [
+        p.slug for p in CANONICAL_PROVIDERS if normalize_provider(p.slug) not in disabled
+    ] + ([] if "custom" in disabled else ["custom"])
 
     # Build reverse alias map
     aliases_for: dict[str, list[str]] = {}
