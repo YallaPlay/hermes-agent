@@ -217,6 +217,32 @@ class TestForkSession:
         assert mc["_forked_from"] == original.session_id
         assert row["parent_session_id"] is None
 
+    def test_fork_session_inherits_owner(self, manager):
+        """A fork must carry the parent's owner: an untagged fork row is
+        hidden by the strict "My Sessions" owner filter after a reload."""
+        original = manager.create_session(cwd="/a", owner="me@yallaplay.com")
+        forked = manager.fork_session(original.session_id, cwd="/a")
+        assert forked is not None
+        assert forked.owner == "me@yallaplay.com"
+        db = manager._get_db()
+        row = db.get_session(forked.session_id)
+        assert row["user_id"] == "me@yallaplay.com"
+
+    def test_fork_of_restored_session_inherits_owner(self, manager):
+        """Restore drops the in-memory state; the fork must still pick the
+        owner up from the persisted row."""
+        original = manager.create_session(cwd="/a", owner="me@yallaplay.com")
+        original.history.append({"role": "user", "content": "hello"})
+        manager.save_session(original.session_id)
+        with manager._lock:
+            del manager._sessions[original.session_id]
+
+        forked = manager.fork_session(original.session_id, cwd="/a")
+        assert forked is not None
+        assert forked.owner == "me@yallaplay.com"
+        db = manager._get_db()
+        assert db.get_session(forked.session_id)["user_id"] == "me@yallaplay.com"
+
     def test_fork_lineage_surfaces_in_list_sessions(self, manager):
         original = manager.create_session(cwd="/a")
         original.history.append({"role": "user", "content": "hello"})

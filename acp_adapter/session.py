@@ -380,6 +380,10 @@ class SessionManager:
             # to server defaults would surprise the user mid-flow.
             mode=original.mode,
             effort=original.effort,
+            # A fork belongs to whoever owns the parent — without this the
+            # fork row persists untagged and the strict "My Sessions" owner
+            # filter hides it after a reload.
+            owner=original.owner,
             # Record fork lineage so clients can nest the fork under its
             # parent in session lists.
             parent_id=session_id,
@@ -743,6 +747,9 @@ class SessionManager:
             model=model or getattr(agent, "model", "") or "",
             mode=restored_mode,
             effort=restored_effort,
+            # Rehydrate the owner so forks of a restored session inherit it
+            # (and a later _persist doesn't drop it).
+            owner=str(row.get("user_id") or "").strip() or None,
             parent_id=restored_parent_id or None,
             history=history,
             cancel_event=threading.Event(),
