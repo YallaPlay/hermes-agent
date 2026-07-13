@@ -1156,6 +1156,45 @@ class TestListAndFork:
         assert result == {"ok": False, "error": "sessionId required"}
 
     @pytest.mark.asyncio
+    async def test_ext_method_context_report_returns_markdown(self, agent):
+        state = SimpleNamespace(agent=MagicMock(), history=[{"role": "user", "content": "hi"}])
+        with patch.object(
+            agent.session_manager, "get_session", return_value=state
+        ) as mock_get, patch(
+            "agent.context_breakdown.build_session_context_report",
+            return_value="# Context report\n\n## System prompt\n\ntext\n",
+        ) as mock_build:
+            result = await agent.ext_method(
+                "contextReport", {"sessionId": "s1", "category": "system_prompt"}
+            )
+        assert result["ok"] is True
+        assert result["report"].startswith("# Context report")
+        mock_get.assert_called_once_with("s1")
+        mock_build.assert_called_once_with(
+            state.agent, state.history, category="system_prompt"
+        )
+
+    @pytest.mark.asyncio
+    async def test_ext_method_context_report_unknown_category(self, agent):
+        state = SimpleNamespace(agent=MagicMock(), history=[])
+        with patch.object(
+            agent.session_manager, "get_session", return_value=state
+        ), patch(
+            "agent.context_breakdown.build_session_context_report",
+            side_effect=ValueError("unknown context category: 'nope'"),
+        ):
+            result = await agent.ext_method(
+                "contextReport", {"sessionId": "s1", "category": "nope"}
+            )
+        assert result["ok"] is False
+        assert "nope" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_ext_method_context_report_requires_session_id(self, agent):
+        result = await agent.ext_method("contextReport", {})
+        assert result == {"ok": False, "error": "sessionId required"}
+
+    @pytest.mark.asyncio
     async def test_list_sessions_archived_only_forwards_and_stamps_meta(self, agent):
         with patch.object(
             agent.session_manager, "list_sessions",

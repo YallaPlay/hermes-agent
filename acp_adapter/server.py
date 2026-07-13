@@ -1440,6 +1440,28 @@ class HermesACPAgent(acp.Agent):
                 logger.debug("contextBreakdown failed", exc_info=True)
                 return {"ok": False, "error": str(exc)}
             return {"ok": True, "breakdown": breakdown}
+        if method == "contextReport":
+            # Read-only markdown render of the actual composed context — the
+            # full text behind a breakdown category (or all of them). Backs the
+            # client popover's click-to-view / export-as-markdown actions.
+            session_id = params.get("sessionId")
+            if not session_id:
+                return {"ok": False, "error": "sessionId required"}
+            state = self.session_manager.get_session(session_id)
+            if state is None:
+                return {"ok": False, "error": "session not loaded"}
+            from agent.context_breakdown import build_session_context_report
+
+            try:
+                report = build_session_context_report(
+                    state.agent, state.history, category=params.get("category")
+                )
+            except ValueError as exc:
+                return {"ok": False, "error": str(exc)}
+            except Exception as exc:  # engine failure must not kill the RPC
+                logger.debug("contextReport failed", exc_info=True)
+                return {"ok": False, "error": str(exc)}
+            return {"ok": True, "report": report}
         raise RequestError.method_not_found(f"_{method}")
 
     async def list_sessions(
