@@ -1525,6 +1525,56 @@ class HermesACPAgent(acp.Agent):
                 logger.debug("contextReport failed", exc_info=True)
                 return {"ok": False, "error": str(exc)}
             return {"ok": True, "report": report}
+        if method == "accountUsage":
+            # Read-only provider account limits (e.g. Codex session/weekly
+            # rate-limit windows, Anthropic OAuth usage windows) for the
+            # client's usage popover. Wraps the same fetch the gateway /usage
+            # command uses. Account-level, not per-session — the sessionId only
+            # picks which agent's provider credentials to use. The fetch is a
+            # blocking httpx call, so run it off the event loop.
+            session_id = params.get("sessionId")
+            if not session_id:
+                return {"ok": False, "error": "sessionId required"}
+            state = self.session_manager.get_session(session_id)
+            if state is None:
+                return {"ok": False, "error": "session not loaded"}
+            from agent.account_usage import fetch_account_usage
+
+            provider = getattr(state.agent, "provider", None)
+            if not provider:
+                return {"ok": True, "usage": None}
+            try:
+                snapshot = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    lambda: fetch_account_usage(
+                        provider,
+                        base_url=getattr(state.agent, "base_url", None),
+                        api_key=getattr(state.agent, "api_key", None),
+                    ),
+                )
+            except Exception as exc:  # fetch failure must not kill the RPC
+                logger.debug("accountUsage fetch failed", exc_info=True)
+                return {"ok": False, "error": str(exc)}
+            if snapshot is None or not snapshot.available:
+                return {"ok": True, "usage": None}
+            return {
+                "ok": True,
+                "usage": {
+                    "provider": snapshot.provider,
+                    "plan": snapshot.plan,
+                    "fetchedAt": snapshot.fetched_at.isoformat(),
+                    "windows": [
+                        {
+                            "label": w.label,
+                            "usedPercent": w.used_percent,
+                            "resetAt": w.reset_at.isoformat() if w.reset_at else None,
+                            "detail": w.detail,
+                        }
+                        for w in snapshot.windows
+                    ],
+                    "details": list(snapshot.details),
+                },
+            }
         raise RequestError.method_not_found(f"_{method}")
 
     async def list_sessions(

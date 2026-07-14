@@ -1195,6 +1195,81 @@ class TestListAndFork:
         assert result == {"ok": False, "error": "sessionId required"}
 
     @pytest.mark.asyncio
+    async def test_ext_method_account_usage_returns_windows(self, agent):
+        from datetime import datetime, timezone
+
+        from agent.account_usage import AccountUsageSnapshot, AccountUsageWindow
+
+        reset = datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc)
+        snapshot = AccountUsageSnapshot(
+            provider="openai-codex",
+            source="usage_api",
+            fetched_at=datetime(2026, 7, 14, 8, 0, tzinfo=timezone.utc),
+            plan="Pro",
+            windows=(
+                AccountUsageWindow(label="Session", used_percent=37.0, reset_at=reset),
+                AccountUsageWindow(label="Weekly", used_percent=62.5, reset_at=None),
+            ),
+            details=("Credits balance: $12.00",),
+        )
+        state = SimpleNamespace(agent=SimpleNamespace(provider="openai-codex", base_url=None, api_key=None))
+        with patch.object(
+            agent.session_manager, "get_session", return_value=state
+        ), patch(
+            "agent.account_usage.fetch_account_usage", return_value=snapshot
+        ) as mock_fetch:
+            result = await agent.ext_method("accountUsage", {"sessionId": "s1"})
+        assert result["ok"] is True
+        usage = result["usage"]
+        assert usage["provider"] == "openai-codex"
+        assert usage["plan"] == "Pro"
+        assert usage["windows"][0] == {
+            "label": "Session",
+            "usedPercent": 37.0,
+            "resetAt": reset.isoformat(),
+            "detail": None,
+        }
+        assert usage["windows"][1]["resetAt"] is None
+        assert usage["details"] == ["Credits balance: $12.00"]
+        args, kwargs = mock_fetch.call_args
+        assert args == ("openai-codex",)
+
+    @pytest.mark.asyncio
+    async def test_ext_method_account_usage_none_snapshot_returns_null(self, agent):
+        state = SimpleNamespace(agent=SimpleNamespace(provider="bedrock", base_url=None, api_key=None))
+        with patch.object(
+            agent.session_manager, "get_session", return_value=state
+        ), patch(
+            "agent.account_usage.fetch_account_usage", return_value=None
+        ):
+            result = await agent.ext_method("accountUsage", {"sessionId": "s1"})
+        assert result == {"ok": True, "usage": None}
+
+    @pytest.mark.asyncio
+    async def test_ext_method_account_usage_no_provider_skips_fetch(self, agent):
+        state = SimpleNamespace(agent=SimpleNamespace(provider=None, base_url=None, api_key=None))
+        with patch.object(
+            agent.session_manager, "get_session", return_value=state
+        ), patch(
+            "agent.account_usage.fetch_account_usage"
+        ) as mock_fetch:
+            result = await agent.ext_method("accountUsage", {"sessionId": "s1"})
+        assert result == {"ok": True, "usage": None}
+        mock_fetch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ext_method_account_usage_unknown_session(self, agent):
+        with patch.object(agent.session_manager, "get_session", return_value=None):
+            result = await agent.ext_method("accountUsage", {"sessionId": "nope"})
+        assert result["ok"] is False
+        assert "not loaded" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_ext_method_account_usage_requires_session_id(self, agent):
+        result = await agent.ext_method("accountUsage", {})
+        assert result == {"ok": False, "error": "sessionId required"}
+
+    @pytest.mark.asyncio
     async def test_list_sessions_archived_only_forwards_and_stamps_meta(self, agent):
         with patch.object(
             agent.session_manager, "list_sessions",
