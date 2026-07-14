@@ -375,10 +375,19 @@ class SessionManager:
             original.history if keep_history is None else original.history[:keep_history]
         )
         new_id = str(uuid.uuid4())
+        # Carry the parent's provider routing into the fork. Without this the
+        # fork agent resolves the config-default provider while keeping the
+        # parent's model name — e.g. an openai-codex/gpt-5.6-sol parent forks
+        # into bedrock/gpt-5.6-sol and every turn 400s with "The provided
+        # model identifier is invalid".
+        parent_agent = original.agent
         agent = self._make_agent(
             session_id=new_id,
             cwd=cwd,
             model=original.model or None,
+            requested_provider=getattr(parent_agent, "provider", None),
+            base_url=getattr(parent_agent, "base_url", None),
+            api_mode=getattr(parent_agent, "api_mode", None),
         )
         state = SessionState(
             session_id=new_id,
@@ -623,14 +632,16 @@ class SessionManager:
             # Ensure the session record exists.
             existing = db.get_session(state.session_id)
             if existing is None:
-                initial_config = {"cwd": state.cwd}
-                if parent_id:
-                    initial_config["_forked_from"] = parent_id
+                # Persist the FULL metadata blob (provider/base_url/api_mode/
+                # mode/effort/_forked_from), not just cwd — a fork or fresh
+                # session that isn't prompted again before a process restart
+                # would otherwise restore with no provider routing and fall
+                # back to the config default, mismatching its model.
                 db.create_session(
                     session_id=state.session_id,
                     source="acp",
                     model=model_str,
-                    model_config=initial_config,
+                    model_config=session_meta,
                     user_id=getattr(state, "owner", None),
                 )
             else:

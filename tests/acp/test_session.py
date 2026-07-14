@@ -278,6 +278,56 @@ class TestForkSession:
         assert forked is not None
         assert forked.mode == "acceptEdits"
 
+    def test_fork_session_carries_parent_provider_routing(self, manager):
+        """The fork agent must be built with the parent's provider/base_url/
+        api_mode — not the config default. Regression: an openai-codex/
+        gpt-5.6-sol parent forked into bedrock/gpt-5.6-sol and every turn
+        400'd with "The provided model identifier is invalid"."""
+        original = manager.create_session(cwd="/a")
+        original.agent.provider = "openai-codex"
+        original.agent.base_url = "https://chatgpt.com/backend-api/codex"
+        original.agent.api_mode = "codex_responses"
+
+        captured = {}
+        real_factory = manager._agent_factory
+
+        def spying_make_agent(**kwargs):
+            captured.update(kwargs)
+            return real_factory()
+
+        with patch.object(manager, "_make_agent", side_effect=spying_make_agent):
+            forked = manager.fork_session(original.session_id, cwd="/a")
+
+        assert forked is not None
+        assert captured["requested_provider"] == "openai-codex"
+        assert captured["base_url"] == "https://chatgpt.com/backend-api/codex"
+        assert captured["api_mode"] == "codex_responses"
+
+    def test_fork_persist_writes_provider_routing_to_db(self, manager):
+        """A fork that is never prompted again must still restore with its
+        provider routing after a process restart: the create branch of
+        _persist has to write the full metadata blob, not just cwd."""
+
+        def _routed_agent():
+            a = _mock_agent()
+            a.provider = "openai-codex"
+            a.base_url = "https://chatgpt.com/backend-api/codex"
+            a.api_mode = "codex_responses"
+            return a
+
+        manager._agent_factory = _routed_agent
+        original = manager.create_session(cwd="/a")
+
+        forked = manager.fork_session(original.session_id, cwd="/a")
+        assert forked is not None
+        # fork_session persists once at creation; simulate "no further turns".
+        db = manager._get_db()
+        mc = json.loads(db.get_session(forked.session_id)["model_config"])
+        assert mc["provider"] == "openai-codex"
+        assert mc["base_url"] == "https://chatgpt.com/backend-api/codex"
+        assert mc["api_mode"] == "codex_responses"
+        assert mc["_forked_from"] == original.session_id
+
     def test_fork_session_default_mode_stays_empty(self, manager):
         original = manager.create_session()
         forked = manager.fork_session(original.session_id, cwd="/new")
