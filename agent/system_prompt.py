@@ -219,7 +219,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # Tool-aware behavioral guidance: only inject when the tools are loaded
     tool_guidance = []
-    if "memory" in agent.valid_tool_names:
+    # The memory toolset may stay loaded solely to expose external-provider
+    # tools even when the built-in MEMORY.md/USER.md stores are disabled.
+    # In that case the provider's own block below is authoritative and the
+    # legacy built-in guidance is both redundant and misleading.
+    _builtin_memory_active = bool(
+        getattr(agent, "_memory_enabled", False)
+        or getattr(agent, "_user_profile_enabled", False)
+    )
+    if "memory" in agent.valid_tool_names and _builtin_memory_active:
         tool_guidance.append(MEMORY_GUIDANCE)
     if "session_search" in agent.valid_tool_names:
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)

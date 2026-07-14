@@ -1258,8 +1258,27 @@ class TestBuildSystemPrompt:
     def test_memory_guidance_when_memory_tool_loaded(self, agent_with_memory_tool):
         from agent.prompt_builder import MEMORY_GUIDANCE
 
+        agent_with_memory_tool._memory_enabled = True
         prompt = agent_with_memory_tool._build_system_prompt()
         assert MEMORY_GUIDANCE in prompt
+
+    def test_no_legacy_memory_guidance_when_builtin_memory_is_disabled(
+        self, agent_with_memory_tool
+    ):
+        from agent.prompt_builder import MEMORY_GUIDANCE
+
+        assert agent_with_memory_tool._memory_enabled is False
+        assert agent_with_memory_tool._user_profile_enabled is False
+        provider_guidance = "# External Memory\nUse the provider tools."
+        agent_with_memory_tool._memory_manager = MagicMock()
+        agent_with_memory_tool._memory_manager.build_system_prompt.return_value = (
+            provider_guidance
+        )
+
+        prompt = agent_with_memory_tool._build_system_prompt()
+
+        assert MEMORY_GUIDANCE not in prompt
+        assert provider_guidance in prompt
 
     def test_no_memory_guidance_without_tool(self, agent):
         from agent.prompt_builder import MEMORY_GUIDANCE
