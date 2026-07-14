@@ -938,12 +938,22 @@ class SessionManager:
             if not isinstance(cfg, dict) or cfg.get("enabled", True) is not False
         ]
 
+        # Honor agent.disabled_toolsets from config.yaml on the ACP surface,
+        # matching the CLI (cli.py reads the same key). Without this, a
+        # globally suppressed toolset (e.g. "browser") still loads in editor
+        # sessions because only enabled_toolsets is passed to the agent.
+        agent_cfg = config.get("agent") or {}
+        disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
+        if disabled_toolsets is not None:
+            disabled_toolsets = [str(t) for t in disabled_toolsets if t]
+
         kwargs = {
             "platform": "acp",
             "enabled_toolsets": _expand_acp_enabled_toolsets(
                 None,  # resolves platform_toolsets.acp or hermes-acp default
                 mcp_server_names=configured_mcp_servers,
             ),
+            "disabled_toolsets": disabled_toolsets,
             "quiet_mode": True,
             "session_id": session_id,
             "session_db": self._get_db(),
