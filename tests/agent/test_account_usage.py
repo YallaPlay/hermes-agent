@@ -235,3 +235,94 @@ def test_codex_usage_treats_wham_used_percent_as_used_not_remaining(monkeypatch)
     assert "14% used" in rendered
     assert "15% used" not in rendered
     assert "86% used" not in rendered
+
+
+def _fetch_with_payload(monkeypatch, payload):
+    calls = []
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeClient(calls, payload),
+    )
+    return account_usage.fetch_account_usage(
+        "openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="live-agent-token",
+    )
+
+
+def test_codex_usage_labels_windows_by_actual_duration(monkeypatch):
+    """Window slots are not fixed per plan: prolite's PRIMARY window is the
+    weekly limit (secondary null), while Plus/Pro's primary is the 5h session.
+    Labels must come from limit_window_seconds, not the slot position."""
+    payload = {
+        "plan_type": "prolite",
+        "rate_limit": {
+            "primary_window": {
+                "used_percent": 4,
+                "limit_window_seconds": 604800,  # 7 days — weekly, despite being primary
+                "reset_at": 1784637936,
+            },
+            "secondary_window": None,
+        },
+        "credits": {"has_credits": False},
+    }
+    snapshot = _fetch_with_payload(monkeypatch, payload)
+    assert snapshot is not None
+    assert [w.label for w in snapshot.windows] == ["Weekly"]
+
+
+def test_codex_usage_labels_5h_session_window_by_duration(monkeypatch):
+    payload = {
+        "plan_type": "plus",
+        "rate_limit": {
+            "primary_window": {
+                "used_percent": 21,
+                "limit_window_seconds": 18000,  # 5 hours
+                "reset_at": 1779846359,
+            },
+            "secondary_window": {
+                "used_percent": 4,
+                "limit_window_seconds": 604800,
+                "reset_at": 1780230796,
+            },
+        },
+        "credits": {"has_credits": False},
+    }
+    snapshot = _fetch_with_payload(monkeypatch, payload)
+    assert snapshot is not None
+    assert [w.label for w in snapshot.windows] == ["5h", "Weekly"]
+
+
+def test_codex_usage_includes_additional_rate_limits(monkeypatch):
+    """Per-model/feature limits (additional_rate_limits) surface as extra
+    windows prefixed with their limit_name."""
+    payload = {
+        "plan_type": "prolite",
+        "rate_limit": {
+            "primary_window": {
+                "used_percent": 4,
+                "limit_window_seconds": 604800,
+                "reset_at": 1784637936,
+            },
+            "secondary_window": None,
+        },
+        "additional_rate_limits": [
+            {
+                "limit_name": "GPT-5.3-Codex-Spark",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 0,
+                        "limit_window_seconds": 604800,
+                        "reset_at": 1784646789,
+                    },
+                    "secondary_window": None,
+                },
+            }
+        ],
+        "credits": {"has_credits": False},
+    }
+    snapshot = _fetch_with_payload(monkeypatch, payload)
+    assert snapshot is not None
+    assert [w.label for w in snapshot.windows] == ["Weekly", "GPT-5.3-Codex-Spark · Weekly"]
+    assert snapshot.windows[1].used_percent == 0

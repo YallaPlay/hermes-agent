@@ -494,6 +494,43 @@ def _resolve_codex_usage_credentials(
     return entry.runtime_api_key, str(entry.runtime_base_url or base_url or "").strip(), None
 
 
+def _codex_window_label(window: dict, fallback: str) -> str:
+    """Human label derived from the window's actual duration.
+
+    The API does not fix window meanings per slot: on Plus/Pro the primary
+    window is the 5h session and the secondary is weekly, but on plans with a
+    single limit (e.g. prolite) the primary IS the weekly window and secondary
+    is null. Hardcoding "Session"/"Weekly" per slot mislabels those plans.
+    """
+    seconds = window.get("limit_window_seconds")
+    if not isinstance(seconds, (int, float)) or seconds <= 0:
+        return fallback
+    hours = float(seconds) / 3600
+    if hours >= 168:
+        weeks = hours / 168
+        return "Weekly" if weeks < 1.5 else f"{round(weeks)}-week"
+    if hours >= 24:
+        return f"{round(hours / 24)}-day"
+    return f"{round(hours)}h"
+
+
+def _codex_windows(rate_limit: dict) -> list[AccountUsageWindow]:
+    windows: list[AccountUsageWindow] = []
+    for key, fallback in (("primary_window", "Session"), ("secondary_window", "Weekly")):
+        window = rate_limit.get(key) or {}
+        used = window.get("used_percent")
+        if used is None:
+            continue
+        windows.append(
+            AccountUsageWindow(
+                label=_codex_window_label(window, fallback),
+                used_percent=float(used),
+                reset_at=_parse_dt(window.get("reset_at")),
+            )
+        )
+    return windows
+
+
 def _fetch_codex_account_usage(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
@@ -510,20 +547,21 @@ def _fetch_codex_account_usage(
         response = client.get(_resolve_codex_usage_url(resolved_base_url), headers=headers)
         response.raise_for_status()
     payload = response.json() or {}
-    rate_limit = payload.get("rate_limit") or {}
-    windows: list[AccountUsageWindow] = []
-    for key, label in (("primary_window", "Session"), ("secondary_window", "Weekly")):
-        window = rate_limit.get(key) or {}
-        used = window.get("used_percent")
-        if used is None:
+    windows = _codex_windows(payload.get("rate_limit") or {})
+    # Per-model/feature limits (e.g. a separate weekly window for a specific
+    # model) ride alongside the account-wide ones, prefixed with their name.
+    for extra in payload.get("additional_rate_limits") or []:
+        if not isinstance(extra, dict):
             continue
-        windows.append(
-            AccountUsageWindow(
-                label=label,
-                used_percent=float(used),
-                reset_at=_parse_dt(window.get("reset_at")),
+        name = str(extra.get("limit_name") or "").strip() or "Additional"
+        for w in _codex_windows(extra.get("rate_limit") or {}):
+            windows.append(
+                AccountUsageWindow(
+                    label=f"{name} · {w.label}",
+                    used_percent=w.used_percent,
+                    reset_at=w.reset_at,
+                )
             )
-        )
     details: list[str] = []
     credits = payload.get("credits") or {}
     if credits.get("has_credits"):
