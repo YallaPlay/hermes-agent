@@ -186,7 +186,11 @@ def is_deferrable_tool_name(name: str) -> bool:
         return False
 
 
-def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def classify_tools(
+    tool_defs: List[Dict[str, Any]],
+    *,
+    additional_deferrable_names: Optional[frozenset[str]] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Split a tool-defs list into (visible, deferrable).
 
     ``visible`` retains every tool that must stay in the model-facing array:
@@ -202,7 +206,11 @@ def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
             # Should never happen — bridge tools are added after classification —
             # but be defensive.
             continue
-        if is_deferrable_tool_name(name):
+        if is_deferrable_tool_name(name) or (
+            additional_deferrable_names is not None
+            and name in additional_deferrable_names
+            and name not in _core_tool_names()
+        ):
             deferrable.append(td)
         else:
             visible.append(td)
@@ -524,6 +532,7 @@ class AssemblyResult:
     deferred_count: int = 0
     deferred_tokens: int = 0
     threshold_tokens: int = 0
+    catalog: Tuple[CatalogEntry, ...] = ()
 
 
 def assemble_tool_defs(
@@ -531,6 +540,7 @@ def assemble_tool_defs(
     *,
     context_length: Optional[int] = None,
     config: Optional[ToolSearchConfig] = None,
+    additional_deferrable_names: Optional[frozenset[str]] = None,
 ) -> AssemblyResult:
     """Return the tool-defs list the model should actually see.
 
@@ -551,7 +561,10 @@ def assemble_tool_defs(
     incoming = [td for td in tool_defs
                 if (td.get("function") or {}).get("name") not in BRIDGE_TOOL_NAMES]
 
-    visible, deferrable = classify_tools(incoming)
+    visible, deferrable = classify_tools(
+        incoming,
+        additional_deferrable_names=additional_deferrable_names,
+    )
     if not deferrable:
         return AssemblyResult(tool_defs=incoming, activated=False)
 
@@ -565,6 +578,7 @@ def assemble_tool_defs(
             threshold_tokens=int((context_length or 0) * (config.threshold_pct / 100.0)),
         )
 
+    catalog = tuple(build_catalog(deferrable))
     bridge = bridge_tool_schemas(len(deferrable))
     result = visible + bridge
     threshold_tokens = int((context_length or 0) * (config.threshold_pct / 100.0))
@@ -580,6 +594,7 @@ def assemble_tool_defs(
         deferred_count=len(deferrable),
         deferred_tokens=deferrable_tokens,
         threshold_tokens=threshold_tokens,
+        catalog=catalog,
     )
 
 
@@ -605,7 +620,8 @@ def _format_search_hit(entry: CatalogEntry) -> Dict[str, Any]:
 def dispatch_tool_search(args: Dict[str, Any],
                          *,
                          current_tool_defs: List[Dict[str, Any]],
-                         config: Optional[ToolSearchConfig] = None) -> str:
+                         config: Optional[ToolSearchConfig] = None,
+                         catalog: Optional[Iterable[CatalogEntry]] = None) -> str:
     """Execute the ``tool_search`` bridge tool. Returns a JSON string."""
     if config is None:
         config = load_config()
@@ -619,23 +635,39 @@ def dispatch_tool_search(args: Dict[str, Any],
     else:
         limit = max(1, min(config.max_search_limit, _safe_int(raw_limit, config.search_default_limit)))
 
-    _, deferrable = classify_tools(current_tool_defs)
-    catalog = build_catalog(deferrable)
-    hits = search_catalog(catalog, query, limit=limit)
+    if catalog is None:
+        _, deferrable = classify_tools(current_tool_defs)
+        resolved_catalog = build_catalog(deferrable)
+    else:
+        resolved_catalog = list(catalog)
+    hits = search_catalog(resolved_catalog, query, limit=limit)
     return json.dumps({
         "query": query,
-        "total_available": len(catalog),
+        "total_available": len(resolved_catalog),
         "matches": [_format_search_hit(h) for h in hits],
     }, ensure_ascii=False)
 
 
 def dispatch_tool_describe(args: Dict[str, Any],
                            *,
-                           current_tool_defs: List[Dict[str, Any]]) -> str:
+                           current_tool_defs: List[Dict[str, Any]],
+                           catalog: Optional[Iterable[CatalogEntry]] = None) -> str:
     """Execute the ``tool_describe`` bridge tool. Returns a JSON string."""
     name = str(args.get("name") or "").strip()
     if not name:
         return json.dumps({"error": "name is required"}, ensure_ascii=False)
+    if catalog is not None:
+        for entry in catalog:
+            if entry.name == name:
+                fn = entry.schema.get("function") or {}
+                return json.dumps({
+                    "name": name,
+                    "description": fn.get("description", ""),
+                    "parameters": fn.get("parameters", {}),
+                }, ensure_ascii=False)
+        return json.dumps({
+            "error": f"'{name}' is not currently available. Re-run tool_search to refresh.",
+        }, ensure_ascii=False)
     if not is_deferrable_tool_name(name):
         return json.dumps({
             "error": (

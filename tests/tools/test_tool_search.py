@@ -304,6 +304,40 @@ class TestBridgeDispatch:
         )
         assert "error" in json.loads(result)
 
+    def test_dynamic_catalog_is_searchable_and_describable(self):
+        from tools.tool_search import (
+            ToolSearchConfig,
+            assemble_tool_defs,
+            dispatch_tool_describe,
+            dispatch_tool_search,
+        )
+
+        dynamic = _td(
+            "provider_stats",
+            "Show memory provider statistics",
+            {"detail": {"type": "boolean"}},
+        )
+        assembly = assemble_tool_defs(
+            [dynamic],
+            config=ToolSearchConfig.from_raw({"enabled": "on"}),
+            additional_deferrable_names=frozenset({"provider_stats"}),
+        )
+
+        search = json.loads(dispatch_tool_search(
+            {"query": "memory statistics"},
+            current_tool_defs=[],
+            catalog=assembly.catalog,
+        ))
+        assert [match["name"] for match in search["matches"]] == ["provider_stats"]
+
+        described = json.loads(dispatch_tool_describe(
+            {"name": "provider_stats"},
+            current_tool_defs=[],
+            catalog=assembly.catalog,
+        ))
+        assert described["name"] == "provider_stats"
+        assert "detail" in described["parameters"]["properties"]
+
     def test_resolve_underlying_call_parses_object_args(self):
         from tools.tool_search import resolve_underlying_call
         name, args, err = resolve_underlying_call({
