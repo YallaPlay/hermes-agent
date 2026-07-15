@@ -1553,6 +1553,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     skip_tool_request_middleware=True,
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                    # Thread the finalized session catalog so bridge dispatch
+                    # (tool_search/tool_describe/tool_call) sees provider-injected
+                    # tools (mnemosyne_*, lcm_*), not a registry-only rebuild.
+                    # Mirrors invoke_tool (agent_runtime_helpers) — see 157a6049a0.
+                    tool_search_catalog=getattr(agent, "_tool_search_catalog", None),
                     tool_request_middleware_trace=list(middleware_trace),
                 )
                 _spinner_result = function_result
@@ -1595,6 +1600,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     skip_tool_request_middleware=True,
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                    # Thread the finalized session catalog so bridge dispatch
+                    # (tool_search/tool_describe/tool_call) sees provider-injected
+                    # tools (mnemosyne_*, lcm_*), not a registry-only rebuild.
+                    # Mirrors invoke_tool (agent_runtime_helpers) — see 157a6049a0.
+                    tool_search_catalog=getattr(agent, "_tool_search_catalog", None),
                     tool_request_middleware_trace=list(middleware_trace),
                 )
             except KeyboardInterrupt:
