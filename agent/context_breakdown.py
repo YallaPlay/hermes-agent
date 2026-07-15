@@ -353,11 +353,42 @@ def compute_session_context_breakdown(
             for category_id, label, tokens, detail in categories
             if tokens > 0
         ],
+        "cache": _session_cache_stats(agent),
         "context_max": context_max,
         "context_percent": context_percent,
         "context_used": context_used,
         "estimated_total": estimated_total,
         "model": getattr(agent, "model", "") or "",
+    }
+
+
+def _session_cache_stats(agent: Any) -> Optional[Dict[str, Any]]:
+    """Session-cumulative prompt-cache stats from the live agent's counters.
+
+    Hit rate = cache_read / (uncached input + cache_read + cache_write) over
+    every API call this session has made so far. ``None`` when the session has
+    no prompt traffic yet (or the provider never reports cache usage), so UIs
+    can hide the row instead of showing a meaningless 0%.
+    """
+
+    def _int(name: str) -> int:
+        try:
+            return max(0, int(getattr(agent, name, 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    read = _int("session_cache_read_tokens")
+    write = _int("session_cache_write_tokens")
+    uncached = _int("session_input_tokens")
+    total_prompt = uncached + read + write
+    if total_prompt <= 0:
+        return None
+    return {
+        "read_tokens": read,
+        "write_tokens": write,
+        "uncached_input_tokens": uncached,
+        "hit_percent": round(read / total_prompt * 100, 1),
+        "api_calls": _int("session_api_calls"),
     }
 
 

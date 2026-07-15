@@ -63,6 +63,40 @@ def test_breakdown_uses_measured_context_when_available():
     assert data["context_percent"] == 21
 
 
+def test_breakdown_reports_session_cache_stats():
+    agent, parts = _make_agent()
+    agent.session_input_tokens = 1_000
+    agent.session_cache_read_tokens = 8_500
+    agent.session_cache_write_tokens = 500
+    agent.session_api_calls = 7
+
+    with patch("agent.system_prompt.build_system_prompt_parts", return_value=parts):
+        data = compute_session_context_breakdown(agent, [])
+
+    assert data["cache"] == {
+        "read_tokens": 8_500,
+        "write_tokens": 500,
+        "uncached_input_tokens": 1_000,
+        "hit_percent": 85.0,
+        "api_calls": 7,
+    }
+
+
+def test_breakdown_cache_stats_none_without_traffic():
+    # No prompt traffic yet -> None so UIs hide the row instead of rendering
+    # a meaningless 0%.
+    agent, parts = _make_agent()
+    agent.session_input_tokens = 0
+    agent.session_cache_read_tokens = 0
+    agent.session_cache_write_tokens = 0
+    agent.session_api_calls = 0
+
+    with patch("agent.system_prompt.build_system_prompt_parts", return_value=parts):
+        data = compute_session_context_breakdown(agent, [])
+
+    assert data["cache"] is None
+
+
 def test_breakdown_categories_carry_detail_rows():
     context = (
         "# Project Context\n\nThe following project context files have been loaded"
