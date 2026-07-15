@@ -2073,9 +2073,13 @@ class TestPrompt:
             for call in mock_conn.session_update.await_args_list
         ]
         info_updates = [u for u in updates if isinstance(u, SessionInfoUpdate)]
-        assert len(info_updates) == 1
-        assert info_updates[0].session_update == "session_info_update"
-        assert info_updates[0].title == "Fix Zed titles"
+        # Turn start/end status signals (_meta.hermes.isRunning) also ride
+        # SessionInfoUpdate but carry no title; the auto-title assertion is
+        # about the single TITLED update.
+        titled_updates = [u for u in info_updates if u.title is not None]
+        assert len(titled_updates) == 1
+        assert titled_updates[0].session_update == "session_info_update"
+        assert titled_updates[0].title == "Fix Zed titles"
 
     @pytest.mark.asyncio
     async def test_prompt_populates_usage_from_top_level_run_conversation_fields(self, agent):

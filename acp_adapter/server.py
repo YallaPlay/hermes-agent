@@ -864,6 +864,66 @@ class HermesACPAgent(acp.Agent):
             )
             return None
 
+    @staticmethod
+    def _merge_hermes_meta(
+        base: Optional[dict], extra: Optional[dict]
+    ) -> Optional[dict]:
+        """Merge extra keys into a ``_meta.hermes`` payload without clobbering.
+
+        ``base`` is an existing ``{"hermes": {...}}`` meta dict (or ``None``),
+        e.g. the provenance meta; ``extra`` is a flat dict of additional keys
+        for the ``hermes`` namespace. Returns ``None`` when there is nothing
+        to send.
+        """
+        if not extra:
+            return base
+        merged = dict(base or {})
+        hermes = dict(merged.get("hermes") or {})
+        hermes.update(extra)
+        merged["hermes"] = hermes
+        return merged
+
+    def _turn_status_meta(self, state: SessionState) -> dict:
+        """Snapshot the session's live turn state for ``_meta.hermes``.
+
+        A session's turn can be owned by a prompt() call from an earlier
+        client interaction while a NEW client attaches via session/load or
+        session/resume. Without this, the attaching client renders an idle
+        "ready to prompt" composer over a running turn and a second prompt
+        starts a concurrent writer on the same transcript (the 2026-07-15
+        incident). Read under ``runtime_lock`` for a consistent pair.
+        """
+        with state.runtime_lock:
+            if not state.is_running:
+                return {}
+            return {
+                "isRunning": True,
+                "currentPromptText": state.current_prompt_text,
+            }
+
+    async def _send_turn_status_update(self, state: SessionState, running: bool) -> None:
+        """Notify the client that this session's turn started or ended.
+
+        Rides ``session_info_update`` with ``_meta.hermes.isRunning`` so a
+        panel that did NOT start the turn (it attached mid-turn via
+        session/load) can flip its composer between running/steer and idle
+        states. Clients that don't know the meta ignore a title-less info
+        update. Best-effort: failures must never affect the turn.
+        """
+        if not self._conn:
+            return
+        update = SessionInfoUpdate(
+            session_update="session_info_update",
+            updated_at=datetime.now(timezone.utc).isoformat(),
+            field_meta={"hermes": {"isRunning": bool(running)}},
+        )
+        try:
+            await self._conn.session_update(session_id=state.session_id, update=update)
+        except Exception:
+            logger.debug(
+                "Could not send ACP turn status update for %s", state.session_id, exc_info=True
+            )
+
     async def _send_session_info_update(
         self,
         session_id: str,
@@ -1326,8 +1386,14 @@ class HermesACPAgent(acp.Agent):
             models=self._build_model_state(state),
             modes=self._session_modes(state),
             config_options=self._session_config_options(state),
-            field_meta=self._provenance_meta(
-                session_id, getattr(state.agent, "session_id", session_id)
+            field_meta=self._merge_hermes_meta(
+                self._provenance_meta(
+                    session_id, getattr(state.agent, "session_id", session_id)
+                ),
+                # Surface a running turn (owned by an earlier prompt() call)
+                # so an attaching client shows running/steer state instead of
+                # an idle composer — see _turn_status_meta.
+                self._turn_status_meta(state),
             ),
         )
 
@@ -1362,8 +1428,12 @@ class HermesACPAgent(acp.Agent):
             models=self._build_model_state(state),
             modes=self._session_modes(state),
             config_options=self._session_config_options(state),
-            field_meta=self._provenance_meta(
-                state.session_id, getattr(state.agent, "session_id", state.session_id)
+            field_meta=self._merge_hermes_meta(
+                self._provenance_meta(
+                    state.session_id, getattr(state.agent, "session_id", state.session_id)
+                ),
+                # Same running-turn surfacing as session/load above.
+                self._turn_status_meta(state),
             ),
         )
 
@@ -1654,6 +1724,64 @@ class HermesACPAgent(acp.Agent):
 
     # ---- Prompt (core) ------------------------------------------------------
 
+    async def _run_spawned_first_turn(self, session_id: str, prompt_text: str) -> None:
+        """Run a freshly spawned session's first turn as a background task.
+
+        Echoes the prompt as a user-message update first (mirrors the queued-
+        prompt drain in ``prompt``) so a client that subscribes early sees the
+        opening message, then runs the normal prompt path — streaming, turn
+        status, auto-title and persistence all behave exactly like a typed
+        turn. Exceptions are logged, never raised: the spawning session's
+        tool call already returned.
+        """
+        try:
+            if self._conn:
+                await self._conn.session_update(
+                    session_id, acp.update_user_message_text(prompt_text)
+                )
+            await self.prompt(
+                prompt=[TextContentBlock(type="text", text=prompt_text)],
+                session_id=session_id,
+            )
+        except Exception:
+            logger.exception("Spawned ACP session %s first turn failed", session_id)
+
+    def _make_spawn_session_requester(
+        self, loop: asyncio.AbstractEventLoop, parent_state: SessionState
+    ):
+        """Build the sync requester backing the ``acp_spawn_session`` tool.
+
+        Runs on the executor thread of the *parent* session's turn. Creates
+        the new session synchronously (SessionManager is thread-safe), then
+        schedules its first turn as a background task on the server's event
+        loop and returns the real session id immediately — the parent turn
+        never blocks on the child. The child inherits the parent's owner (and
+        cwd unless overridden) so per-user session lists show it.
+        """
+
+        def _requester(prompt_text: str, cwd: str | None) -> str:
+            from agent.async_utils import safe_schedule_threadsafe
+
+            spawn_cwd = cwd or parent_state.cwd
+            new_state = self.session_manager.create_session(
+                cwd=spawn_cwd, owner=parent_state.owner
+            )
+            future = safe_schedule_threadsafe(
+                self._run_spawned_first_turn(new_state.session_id, prompt_text),
+                loop,
+                logger=logger,
+                log_message="acp_spawn_session: failed to schedule first turn",
+            )
+            if future is None:
+                # The session exists but its turn couldn't start; surface the
+                # failure to the calling agent rather than returning a dead id.
+                raise RuntimeError(
+                    "could not schedule the spawned session's first turn"
+                )
+            return new_state.session_id
+
+        return _requester
+
     async def prompt(
         self,
         prompt: list[
@@ -1745,6 +1873,12 @@ class HermesACPAgent(acp.Agent):
             state.is_running = True
             state.current_prompt_text = user_text or "[Image attachment]"
 
+        # Tell any attached client the turn is live. The panel that issued
+        # this prompt() already knows; a panel that merely loaded the session
+        # (or one watching a spawned session's first turn) needs the signal
+        # to flip its composer into running/steer state.
+        await self._send_turn_status_update(state, running=True)
+
         # First-turn identity: when the session carries an authenticated owner
         # (e.g. the Cloudflare Access email stamped via _meta.hermes.owner at
         # session/new), surface it to the agent ONCE — on the first turn, when
@@ -1824,6 +1958,19 @@ class HermesACPAgent(acp.Agent):
         agent.step_callback = step_cb
         agent.stream_delta_callback = stream_delta_cb
 
+        # Advertise the in-process session-spawn tool on this agent's tool
+        # surface (ACP sessions only — the schema is injected here, never in
+        # the global registry, so CLI/gateway/cron agents never see it).
+        # Idempotent per agent. The matching dispatch requester is bound as a
+        # ContextVar inside _run_agent below, mirroring edit_approval.
+        try:
+            from acp_adapter.spawn import inject_spawn_session_tool
+
+            inject_spawn_session_tool(agent)
+        except Exception:
+            logger.debug("Could not inject acp_spawn_session tool", exc_info=True)
+        spawn_session_requester = self._make_spawn_session_requester(loop, state)
+
         # Approval callback is per-thread (thread-local, GHSA-qg5c-hvr5-hjgr).
         # Set it INSIDE _run_agent so the TLS write happens in the executor
         # thread — setting it here would write to the event-loop thread's TLS,
@@ -1840,10 +1987,11 @@ class HermesACPAgent(acp.Agent):
         previous_approval_cb = None
         interactive_token = None
         edit_approval_token = None
+        spawn_session_token = None
         previous_session_id = None
 
         def _run_agent() -> dict:
-            nonlocal previous_approval_cb, interactive_token, edit_approval_token, previous_session_id
+            nonlocal previous_approval_cb, interactive_token, edit_approval_token, spawn_session_token, previous_session_id
             # Bind HERMES_SESSION_KEY for this session so per-session caches
             # (e.g. the interactive sudo password cache in tools.terminal_tool)
             # scope to the ACP session rather than leaking across sessions
@@ -1889,6 +2037,12 @@ class HermesACPAgent(acp.Agent):
                     edit_approval_token = set_edit_approval_requester(edit_approval_requester)
                 except Exception:
                     logger.debug("Could not set ACP edit approval requester", exc_info=True)
+            try:
+                from acp_adapter.spawn import set_spawn_session_requester
+
+                spawn_session_token = set_spawn_session_requester(spawn_session_requester)
+            except Exception:
+                logger.debug("Could not set ACP spawn session requester", exc_info=True)
             # Signal to tools.approval that we have an interactive callback
             # and the non-interactive auto-approve path must not fire. Uses a
             # contextvar (not os.environ) so concurrent executor workers don't
@@ -1934,6 +2088,13 @@ class HermesACPAgent(acp.Agent):
                         reset_edit_approval_requester(edit_approval_token)
                     except Exception:
                         logger.debug("Could not restore ACP edit approval requester", exc_info=True)
+                if spawn_session_token is not None:
+                    try:
+                        from acp_adapter.spawn import reset_spawn_session_requester
+
+                        reset_spawn_session_requester(spawn_session_token)
+                    except Exception:
+                        logger.debug("Could not restore ACP spawn session requester", exc_info=True)
                 if session_tokens is not None and clear_session_vars is not None:
                     try:
                         clear_session_vars(session_tokens)
@@ -1957,6 +2118,7 @@ class HermesACPAgent(acp.Agent):
             with state.runtime_lock:
                 state.is_running = False
                 state.current_prompt_text = ""
+            await self._send_turn_status_update(state, running=False)
             return PromptResponse(stop_reason="end_turn")
 
         # Absolute index of this turn's user message in the post-turn history,
@@ -2064,6 +2226,10 @@ class HermesACPAgent(acp.Agent):
             with state.runtime_lock:
                 state.is_running = False
                 state.current_prompt_text = ""
+            # Flip attached-but-not-owner panels back to idle (see the
+            # matching running=True update above). Inside the finally so a
+            # tail exception can't strand a client in steer mode.
+            await self._send_turn_status_update(state, running=False)
 
         while True:
             with state.runtime_lock:

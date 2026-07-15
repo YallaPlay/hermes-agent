@@ -1246,6 +1246,21 @@ def handle_function_call(
             if function_name in {"write_file", "patch"}:
                 return json.dumps({"error": "Edit approval denied: approval guard failed"}, ensure_ascii=False)
 
+        # ACP in-process session spawn (acp_spawn_session). Like edit
+        # approval, the requester is a ContextVar bound only during an ACP
+        # turn — every other runtime gets a graceful "ACP only" error and the
+        # tool is never registry-dispatched (it isn't in the registry).
+        try:
+            from acp_adapter.spawn import maybe_dispatch_spawn_session
+
+            spawn_result = maybe_dispatch_spawn_session(function_name, function_args)
+            if spawn_result is not None:
+                return spawn_result
+        except Exception as _spawn_err:
+            logger.debug("ACP spawn_session dispatch error: %s", _spawn_err)
+            if function_name == "acp_spawn_session":
+                return json.dumps({"error": f"acp_spawn_session failed: {_spawn_err}"}, ensure_ascii=False)
+
         # Notify the read-loop tracker when a non-read/search tool runs,
         # so the *consecutive* counter resets (reads after other work are fine).
         if function_name not in _READ_SEARCH_TOOLS:
