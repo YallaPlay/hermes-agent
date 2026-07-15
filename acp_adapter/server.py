@@ -1504,8 +1504,14 @@ class HermesACPAgent(acp.Agent):
         """Handle Hermes ACP extension methods (client sends `_<method>`)."""
         if method == "setArchived":
             session_id = params.get("sessionId")
-            archived = bool(params.get("archived"))
-            ok = self.session_manager.set_session_archived(session_id, archived) if session_id else False
+            archived = params.get("archived")
+            if (
+                not isinstance(session_id, str)
+                or not session_id.strip()
+                or not isinstance(archived, bool)
+            ):
+                raise RequestError.invalid_params({"method": "_setArchived"})
+            ok = self.session_manager.set_session_archived(session_id, archived)
             return {"ok": bool(ok)}
         if method == "setOwner":
             # Stamp (or clear, with an empty string) a session's owner
@@ -1661,9 +1667,14 @@ class HermesACPAgent(acp.Agent):
         Server-side page size is capped at ``_LIST_SESSIONS_PAGE_SIZE``; when more
         results remain, ``next_cursor`` is set to the last returned ``session_id``.
         """
-        hermes = kwargs.get("hermes") or {}
-        archived_only = bool(hermes.get("archivedOnly"))
-        include_archived = bool(hermes.get("includeArchived"))
+        hermes = kwargs.get("hermes", {})
+        if not isinstance(hermes, dict) or any(
+            key in hermes and not isinstance(hermes[key], bool)
+            for key in ("archivedOnly", "includeArchived")
+        ):
+            raise RequestError.invalid_params({"field": "_meta.hermes"})
+        archived_only = hermes.get("archivedOnly", False)
+        include_archived = hermes.get("includeArchived", False)
         # Per-user filter: when ownerOnly is set, restrict to the caller's own
         # sessions (plus untagged legacy rows). owner carries the authenticated
         # identity (Cloudflare Access email) the client resolved. Soft display
