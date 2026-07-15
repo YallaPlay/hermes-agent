@@ -1634,6 +1634,10 @@ class HermesACPAgent(acp.Agent):
             # clients can nest forks under their parent in session lists.
             if s.get("parent_id"):
                 hermes_meta["forkedFrom"] = s["parent_id"]
+            # Slack-bot sessions (first user message carries the Slack runtime
+            # envelope) so clients can badge them, e.g. a Slack icon prefix.
+            if s.get("slack"):
+                hermes_meta["slack"] = True
             field_meta = {"hermes": hermes_meta} if hermes_meta else None
             sessions.append(
                 SessionInfo(

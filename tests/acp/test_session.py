@@ -903,6 +903,33 @@ class TestPersistence:
         listing = manager.list_sessions(cwd="/named")
         assert listing[0]["title"].startswith("Investigate broken ACP history")
 
+    def test_list_sessions_flags_slack_sessions_in_memory(self, manager):
+        """A session whose first user message carries the Slack runtime envelope
+        is flagged slack=True so clients can badge it (Slack icon prefix)."""
+        slack = manager.create_session(cwd="/slack")
+        slack.history.append(
+            {"role": "user", "content": "[Slack runtime context]\nYou're talking to U123"}
+        )
+        plain = manager.create_session(cwd="/plain")
+        plain.history.append({"role": "user", "content": "ordinary prompt"})
+
+        by_id = {s["session_id"]: s for s in manager.list_sessions()}
+        assert by_id[slack.session_id]["slack"] is True
+        assert by_id[plain.session_id]["slack"] is False
+
+    def test_list_sessions_flags_slack_sessions_db_only(self, manager):
+        state = manager.create_session(cwd="/slack-db")
+        state.history.append(
+            {"role": "user", "content": "[Slack runtime context]\nrequester: someone"}
+        )
+        manager.save_session(state.session_id)
+        sid = state.session_id
+        with manager._lock:
+            del manager._sessions[sid]
+
+        by_id = {s["session_id"]: s for s in manager.list_sessions()}
+        assert by_id[sid]["slack"] is True
+
     def test_list_sessions_sorted_by_most_recent_activity(self, manager):
         older = manager.create_session(cwd="/ordered")
         older.history.append({"role": "user", "content": "older"})

@@ -82,6 +82,18 @@ def _preview_text(content: Any, limit: int = 60) -> str:
     return text[:limit] + ("..." if len(text) > limit else "")
 
 
+# Slack-bot turns are wrapped in a runtime envelope whose first user message
+# starts with this marker (see the Slack runner's build_hermes_slack_prompt).
+# Since the Slack bot switched to the ACP provider its sessions persist as
+# source='acp', so this content prefix is the only reliable Slack tell.
+_SLACK_CONTEXT_PREFIX = "[Slack runtime context]"
+
+
+def _is_slack_preview(preview: Any) -> bool:
+    """True when a session's first-user-message preview marks a Slack session."""
+    return str(preview or "").lstrip().startswith(_SLACK_CONTEXT_PREFIX)
+
+
 def _build_session_title(title: Any, preview: Any, cwd: str | None) -> str:
     explicit = str(title or "").strip()
     if explicit:
@@ -488,6 +500,7 @@ class SessionManager:
                         "archived": False,
                         "parent_id": s.parent_id
                         or _forked_from_marker(persisted.get("model_config")),
+                        "slack": _is_slack_preview(preview or persisted.get("preview")),
                     }
                 )
 
@@ -518,6 +531,7 @@ class SessionManager:
                 "updated_at": _format_updated_at(row.get("last_active") or row.get("started_at")),
                 "archived": bool(row.get("archived")),
                 "parent_id": _forked_from_marker(mc),
+                "slack": _is_slack_preview(row.get("preview")),
             })
 
         results.sort(key=lambda item: _updated_at_sort_key(item.get("updated_at")), reverse=True)
