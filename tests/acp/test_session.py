@@ -930,6 +930,38 @@ class TestPersistence:
         by_id = {s["session_id"]: s for s in manager.list_sessions()}
         assert by_id[sid]["slack"] is True
 
+    def test_list_sessions_fork_of_slack_session_not_flagged_in_memory(self, manager):
+        """Forking a Slack session yields a first-class ACP session — the fork
+        copies the Slack envelope into its history but must NOT carry the
+        Slack badge (it is no longer a Slack session)."""
+        original = manager.create_session(cwd="/slack")
+        original.history.append(
+            {"role": "user", "content": "[Slack runtime context]\nYou're talking to U123"}
+        )
+        forked = manager.fork_session(original.session_id, cwd="/slack")
+
+        by_id = {s["session_id"]: s for s in manager.list_sessions()}
+        assert by_id[original.session_id]["slack"] is True
+        assert by_id[forked.session_id]["slack"] is False
+        assert by_id[forked.session_id]["parent_id"] == original.session_id
+
+    def test_list_sessions_fork_of_slack_session_not_flagged_db_only(self, manager):
+        original = manager.create_session(cwd="/slack")
+        original.history.append(
+            {"role": "user", "content": "[Slack runtime context]\nrequester: someone"}
+        )
+        forked = manager.fork_session(original.session_id, cwd="/slack")
+        manager.save_session(original.session_id)
+        manager.save_session(forked.session_id)
+        fork_id = forked.session_id
+        with manager._lock:
+            del manager._sessions[original.session_id]
+            del manager._sessions[fork_id]
+
+        by_id = {s["session_id"]: s for s in manager.list_sessions()}
+        assert by_id[original.session_id]["slack"] is True
+        assert by_id[fork_id]["slack"] is False
+
     def test_list_sessions_sorted_by_most_recent_activity(self, manager):
         older = manager.create_session(cwd="/ordered")
         older.history.append({"role": "user", "content": "older"})

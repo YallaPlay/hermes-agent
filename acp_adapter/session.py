@@ -486,6 +486,7 @@ class SessionManager:
                     ),
                     persisted.get("preview") or "",
                 )
+                parent_id = s.parent_id or _forked_from_marker(persisted.get("model_config"))
                 results.append(
                     {
                         "session_id": s.session_id,
@@ -498,9 +499,11 @@ class SessionManager:
                             persisted.get("last_active") or persisted.get("started_at") or time.time()
                         ),
                         "archived": False,
-                        "parent_id": s.parent_id
-                        or _forked_from_marker(persisted.get("model_config")),
-                        "slack": _is_slack_preview(preview or persisted.get("preview")),
+                        "parent_id": parent_id,
+                        # A fork of a Slack session is an ACP/VS Code session in
+                        # its own right — don't inherit the Slack badge.
+                        "slack": not parent_id
+                        and _is_slack_preview(preview or persisted.get("preview")),
                     }
                 )
 
@@ -521,6 +524,7 @@ class SessionManager:
                     pass
             if normalized_cwd and _normalize_cwd_for_compare(session_cwd) != normalized_cwd:
                 continue
+            parent_id = _forked_from_marker(mc)
             results.append({
                 "session_id": sid,
                 "cwd": session_cwd,
@@ -530,8 +534,9 @@ class SessionManager:
                 "title": _build_session_title(row.get("title"), row.get("preview"), session_cwd),
                 "updated_at": _format_updated_at(row.get("last_active") or row.get("started_at")),
                 "archived": bool(row.get("archived")),
-                "parent_id": _forked_from_marker(mc),
-                "slack": _is_slack_preview(row.get("preview")),
+                "parent_id": parent_id,
+                # Forks of Slack sessions are not Slack sessions — no badge.
+                "slack": not parent_id and _is_slack_preview(row.get("preview")),
             })
 
         results.sort(key=lambda item: _updated_at_sort_key(item.get("updated_at")), reverse=True)
