@@ -82,6 +82,10 @@ from acp_adapter.session import (
     _expand_acp_enabled_toolsets,
 )
 from acp_adapter.tools import build_tool_complete, build_tool_start
+from agent.context_compressor import (
+    COMPRESSED_SUMMARY_METADATA_KEY,
+    ContextCompressor,
+)
 from tools.approval import (
     reset_hermes_interactive_context,
     set_hermes_interactive_context,
@@ -1163,10 +1167,48 @@ class HermesACPAgent(acp.Agent):
         return ""
 
     @staticmethod
+    def _history_summary_meta(message: dict[str, Any], text: str) -> dict[str, Any] | None:
+        """Build the ``_meta`` payload for a replayed compaction summary.
+
+        Compaction summaries are persisted as ordinary history messages —
+        standalone handoffs under ``role="user"`` OR ``role="assistant"``
+        (the compressor picks whichever role keeps alternation valid), and
+        merge-into-tail messages where the summary is appended after the
+        first preserved tail message's real content. Without a wire flag,
+        ACP frontends render all of these as ordinary turns.
+
+        Two distinct keys under ``_meta.hermes`` (ACP's extensibility
+        channel), so clients cannot accidentally hide real content:
+
+        * ``compactionSummary: true`` — the entire chunk is the handoff
+          summary. Safe to restyle or collapse wholesale.
+        * ``containsCompactionSummary: true`` — a merged-tail message: real
+          preserved turn content followed by the summary. Clients may style
+          it, but collapsing the whole chunk would hide the preserved
+          content, hence the separate key.
+
+        Detection honors the in-process ``_compressed_summary`` flag and
+        falls back to content classification, so it also works for a
+        DB-reloaded session that lost the in-memory flag.
+        """
+        kind = ContextCompressor.classify_summary_content(text)
+        if kind is None and message.get(COMPRESSED_SUMMARY_METADATA_KEY):
+            # Flagged in-process but content didn't classify (e.g. future
+            # prefix drift): treat as a standalone summary — the flag is only
+            # ever set on summary-bearing messages.
+            kind = "standalone"
+        if kind == "standalone":
+            return {"hermes": {"compactionSummary": True}}
+        if kind == "merged":
+            return {"hermes": {"containsCompactionSummary": True}}
+        return None
+
+    @staticmethod
     def _history_message_update(
         *,
         role: str,
         text: str,
+        field_meta: dict[str, Any] | None = None,
     ) -> UserMessageChunk | AgentMessageChunk | None:
         """Build an ACP history replay update for a user/assistant message."""
         block = TextContentBlock(type="text", text=text)
@@ -1174,11 +1216,13 @@ class HermesACPAgent(acp.Agent):
             return UserMessageChunk(
                 session_update="user_message_chunk",
                 content=block,
+                field_meta=field_meta,
             )
         if role == "assistant":
             return AgentMessageChunk(
                 session_update="agent_message_chunk",
                 content=block,
+                field_meta=field_meta,
             )
         return None
 
@@ -1260,7 +1304,11 @@ class HermesACPAgent(acp.Agent):
             if role == "user":
                 text = self._history_message_text(message)
                 if text:
-                    update = self._history_message_update(role=role, text=text)
+                    update = self._history_message_update(
+                        role=role,
+                        text=text,
+                        field_meta=self._history_summary_meta(message, text),
+                    )
                     if update is not None and not await _send(
                         update, {"hermes": {"historyIndex": index}}
                     ):
@@ -1274,7 +1322,11 @@ class HermesACPAgent(acp.Agent):
 
                 text = self._history_message_text(message)
                 if text:
-                    update = self._history_message_update(role=role, text=text)
+                    update = self._history_message_update(
+                        role=role,
+                        text=text,
+                        field_meta=self._history_summary_meta(message, text),
+                    )
                     if update is not None and not await _send(update):
                         return
 
