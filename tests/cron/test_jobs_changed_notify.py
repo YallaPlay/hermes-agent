@@ -12,6 +12,16 @@ import pytest
 @pytest.fixture
 def temp_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # cron.jobs binds CRON_DIR/JOBS_FILE/OUTPUT_DIR at import time, so setting
+    # HERMES_HOME alone is not enough — rebind the cached constants too, or the
+    # test jobs land in the developer's real ~/.hermes/cron/jobs.json
+    # (upstream PR #63162).
+    import cron.jobs as jobs_mod
+    cron_dir = tmp_path / "cron"
+    monkeypatch.setattr(jobs_mod, "CRON_DIR", cron_dir)
+    monkeypatch.setattr(jobs_mod, "JOBS_FILE", cron_dir / "jobs.json")
+    monkeypatch.setattr(jobs_mod, "OUTPUT_DIR", cron_dir / "output")
+    jobs_mod.ensure_dirs()
     yield tmp_path
 
 
