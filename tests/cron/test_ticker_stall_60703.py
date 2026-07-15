@@ -45,6 +45,23 @@ except ImportError:  # pragma: no cover - non-POSIX
 pytestmark = pytest.mark.skipif(fcntl is None, reason="flock semantics are POSIX-only")
 
 
+@pytest.fixture(autouse=True)
+def _isolated_cron_store(tmp_path, monkeypatch):
+    """Pin cron.jobs path constants to a per-test tempdir.
+
+    ``cron.jobs`` binds CRON_DIR/JOBS_FILE/OUTPUT_DIR at import time, and this
+    module imports it at collection — BEFORE the autouse HERMES_HOME redirect
+    in tests/conftest.py takes effect. Without this fixture, ``create_job()``
+    writes the fixture jobs ("claim job"/"oneshot"/"paused job") into the REAL
+    ``~/.hermes/cron/jobs.json`` of whoever runs the suite.
+    """
+    cron_dir = tmp_path / "cron"
+    monkeypatch.setattr(jobs_mod, "CRON_DIR", cron_dir)
+    monkeypatch.setattr(jobs_mod, "JOBS_FILE", cron_dir / "jobs.json")
+    monkeypatch.setattr(jobs_mod, "OUTPUT_DIR", cron_dir / "output")
+    jobs_mod.ensure_dirs()
+
+
 def _hold_jobs_flock(path: Path, release: threading.Event, held: threading.Event):
     """Hold an exclusive flock on *path* from a separate fd until released.
 
