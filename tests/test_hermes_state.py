@@ -3971,6 +3971,27 @@ class TestListSessionsRich:
         # No messages, so last_active falls back to started_at
         assert sessions[0]["last_active"] == sessions[0]["started_at"]
 
+    def test_last_user_active_ignores_assistant_and_tool_messages(self, db):
+        import time
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "Hello")
+        sessions = db.list_sessions_rich()
+        user_ts = sessions[0]["last_user_active"]
+        assert user_ts is not None
+        time.sleep(0.01)
+        db.append_message("s1", "assistant", "Hi there!")
+        db.append_message("s1", "tool", "tool output")
+        sessions = db.list_sessions_rich()
+        # last_user_active stays pinned to the user message; last_active moves.
+        assert sessions[0]["last_user_active"] == user_ts
+        assert sessions[0]["last_active"] > user_ts
+
+    def test_last_user_active_none_without_user_messages(self, db):
+        db.create_session("s1", "cli")
+        db.append_message("s1", "system", "System prompt")
+        sessions = db.list_sessions_rich()
+        assert sessions[0]["last_user_active"] is None
+
     def test_order_by_last_active_surfaces_recently_touched_older_session_first(self, db):
         t0 = 1709500000.0
         db.create_session("old", "cli")

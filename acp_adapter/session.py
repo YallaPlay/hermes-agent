@@ -525,8 +525,16 @@ class SessionManager:
                         "history_len": history_len,
                         "user_id": s.owner or persisted.get("user_id") or "",
                         "title": _build_session_title(persisted.get("title"), preview, s.cwd),
+                        # Order by the LAST USER MESSAGE, not any message: an
+                        # agent that keeps streaming/tool-calling after the user
+                        # moved on shouldn't keep hoisting its row. Fall back to
+                        # last_active/started_at for sessions without a
+                        # persisted user message yet.
                         "updated_at": _format_updated_at(
-                            persisted.get("last_active") or persisted.get("started_at") or time.time()
+                            persisted.get("last_user_active")
+                            or persisted.get("last_active")
+                            or persisted.get("started_at")
+                            or time.time()
                         ),
                         "archived": False,
                         "parent_id": parent_id,
@@ -562,7 +570,10 @@ class SessionManager:
                 "history_len": message_count,
                 "user_id": row.get("user_id") or "",
                 "title": _build_session_title(row.get("title"), row.get("preview"), session_cwd),
-                "updated_at": _format_updated_at(row.get("last_active") or row.get("started_at")),
+                # Last user message wins for recency (see the in-memory branch).
+                "updated_at": _format_updated_at(
+                    row.get("last_user_active") or row.get("last_active") or row.get("started_at")
+                ),
                 "archived": bool(row.get("archived")),
                 "parent_id": parent_id,
                 # Forks of Slack sessions are not Slack sessions — no badge.
