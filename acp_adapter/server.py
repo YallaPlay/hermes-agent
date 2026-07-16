@@ -1826,12 +1826,23 @@ class HermesACPAgent(acp.Agent):
             from agent.async_utils import safe_schedule_threadsafe
 
             spawn_cwd = cwd or parent_state.cwd
-            new_state = self.session_manager.create_session(
-                cwd=spawn_cwd, owner=parent_state.owner
-            )
             # Mirror the fork path (SessionManager.fork_session): carry the
-            # parent's edit-approval mode and reasoning-effort override, then
-            # re-persist so both survive an agent restart.
+            # parent's FULL model route — model + provider + base_url +
+            # api_mode — so the child runs the same model as the session
+            # that spawned it instead of silently resolving the config
+            # default (a bedrock/fable child of an openai-codex/gpt parent).
+            parent_agent = parent_state.agent
+            new_state = self.session_manager.create_session(
+                cwd=spawn_cwd,
+                owner=parent_state.owner,
+                model=parent_state.model or None,
+                requested_provider=getattr(parent_agent, "provider", None),
+                base_url=getattr(parent_agent, "base_url", None),
+                api_mode=getattr(parent_agent, "api_mode", None),
+            )
+            # Also carry the parent's edit-approval mode and reasoning-effort
+            # override, then re-persist so the whole tuple survives an agent
+            # restart.
             new_state.mode = parent_state.mode
             new_state.effort = parent_state.effort
             _apply_effort_to_agent(new_state.agent, parent_state.effort)

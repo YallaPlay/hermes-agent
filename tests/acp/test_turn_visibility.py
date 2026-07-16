@@ -13,7 +13,7 @@ Covers the two-layer fix for the 2026-07-15 concurrent-writers incident:
 
 import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -376,6 +376,72 @@ class TestServerSpawnRequester:
         child = agent.session_manager.get_session(new_id)
         assert (child.mode or "") == ""
         assert (child.effort or "") == ""
+
+    @pytest.mark.asyncio
+    async def test_requester_carries_parent_model_and_provider_routing(self, agent):
+        """The child agent must be built with the parent's FULL route —
+        model + provider + base_url + api_mode — not the config default.
+        Regression: a gpt-5.6-sol/openai-codex parent spawned a child that
+        silently ran the profile default (claude-fable-5/bedrock) because
+        the requester passed only cwd/owner to create_session (2026-07-16,
+        child session 3eea1d89)."""
+        parent_resp = await agent.new_session(cwd="/tmp")
+        parent_state = agent.session_manager.get_session(parent_resp.session_id)
+        parent_state.model = "gpt-5.6-sol"
+        parent_state.agent.provider = "openai-codex"
+        parent_state.agent.base_url = "https://chatgpt.com/backend-api/codex"
+        parent_state.agent.api_mode = "codex_responses"
+        agent._run_spawned_first_turn = AsyncMock()
+
+        manager = agent.session_manager
+        captured = {}
+        real_factory = manager._agent_factory
+
+        def spying_make_agent(**kwargs):
+            captured.update(kwargs)
+            return real_factory()
+
+        loop = asyncio.get_running_loop()
+        requester = agent._make_spawn_session_requester(loop, parent_state)
+        with patch.object(manager, "_make_agent", side_effect=spying_make_agent):
+            new_id = await loop.run_in_executor(None, requester, "carry on", None)
+
+        assert new_id
+        assert captured["model"] == "gpt-5.6-sol"
+        assert captured["requested_provider"] == "openai-codex"
+        assert captured["base_url"] == "https://chatgpt.com/backend-api/codex"
+        assert captured["api_mode"] == "codex_responses"
+
+    @pytest.mark.asyncio
+    async def test_requester_persists_provider_routing_to_db(self, agent):
+        """A spawned child must restore with its provider routing after a
+        process restart even if its first turn never persists again — the
+        creation-time _persist has to write the full route."""
+
+        def _routed_agent():
+            a = MagicMock(name="MockAIAgent")
+            a.model = "gpt-5.6-sol"
+            a.provider = "openai-codex"
+            a.base_url = "https://chatgpt.com/backend-api/codex"
+            a.api_mode = "codex_responses"
+            return a
+
+        manager = agent.session_manager
+        manager._agent_factory = _routed_agent
+        parent_resp = await agent.new_session(cwd="/tmp")
+        parent_state = agent.session_manager.get_session(parent_resp.session_id)
+        agent._run_spawned_first_turn = AsyncMock()
+
+        loop = asyncio.get_running_loop()
+        requester = agent._make_spawn_session_requester(loop, parent_state)
+        new_id = await loop.run_in_executor(None, requester, "carry on", None)
+
+        row = manager._get_db().get_session(new_id)
+        assert row["model"] == "gpt-5.6-sol"
+        mc = json.loads(row["model_config"])
+        assert mc["provider"] == "openai-codex"
+        assert mc["base_url"] == "https://chatgpt.com/backend-api/codex"
+        assert mc["api_mode"] == "codex_responses"
 
     @pytest.mark.asyncio
     async def test_spawned_first_turn_echoes_prompt_and_runs(self, agent):

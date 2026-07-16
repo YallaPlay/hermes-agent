@@ -308,7 +308,15 @@ class SessionManager:
 
     # ---- public API ---------------------------------------------------------
 
-    def create_session(self, cwd: str = ".", owner: str | None = None) -> SessionState:
+    def create_session(
+        self,
+        cwd: str = ".",
+        owner: str | None = None,
+        model: str | None = None,
+        requested_provider: str | None = None,
+        base_url: str | None = None,
+        api_mode: str | None = None,
+    ) -> SessionState:
         """Create a new session with a unique ID and a fresh AIAgent.
 
         ``owner`` (an authenticated user identifier, e.g. the Cloudflare Access
@@ -316,12 +324,25 @@ class SessionManager:
         ``sessions.user_id`` so the ACP sessions list can show a user only
         their own sessions. It is a soft per-user display key, not an access
         boundary.
+
+        ``model``/``requested_provider``/``base_url``/``api_mode`` let a
+        caller pin the new agent's full route instead of the config default.
+        A model name is meaningless without its routing, so callers carrying
+        a model over from an existing session must pass the whole tuple —
+        same invariant as ``fork_session``.
         """
         import threading
 
         cwd = _translate_acp_cwd(cwd)
         session_id = str(uuid.uuid4())
-        agent = self._make_agent(session_id=session_id, cwd=cwd)
+        agent = self._make_agent(
+            session_id=session_id,
+            cwd=cwd,
+            model=model,
+            requested_provider=requested_provider,
+            base_url=base_url,
+            api_mode=api_mode,
+        )
         state = SessionState(
             session_id=session_id,
             agent=agent,
