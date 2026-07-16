@@ -1729,7 +1729,15 @@ def list_available_providers() -> list[dict[str, str]]:
                 custom_base_url = _get_custom_base_url() or ""
                 has_creds = bool(custom_base_url.strip())
             elif pid == "openrouter":
-                has_creds = has_usable_secret(os.getenv("OPENROUTER_API_KEY", ""))
+                # Check the Hermes-managed .env too, not just the process env:
+                # a key added to ~/.hermes/.env (or the profile .env) after the
+                # process started must still light up provider pickers (e.g. the
+                # ACP model selector) without a restart.
+                from hermes_cli.config import get_env_value_prefer_dotenv
+
+                has_creds = has_usable_secret(
+                    get_env_value_prefer_dotenv("OPENROUTER_API_KEY") or ""
+                )
             else:
                 status = get_auth_status(pid)
                 has_creds = bool(status.get("logged_in") or status.get("configured"))
