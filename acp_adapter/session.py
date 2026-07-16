@@ -462,6 +462,15 @@ class SessionManager:
             for s in self._sessions.values():
                 history_len = len(s.history)
                 if history_len <= 0:
+                    # In-memory history is only assigned when a turn FINISHES,
+                    # so a spawned/queued session mid-first-turn sits here with
+                    # an empty list even though the agent has already flushed
+                    # real messages to the DB incrementally. Un-claim the id so
+                    # the persisted merge below can surface the DB row (it
+                    # still hides truly-empty sessions via message_count <= 0);
+                    # otherwise the session is invisible in session/list for
+                    # the entire duration of its first turn.
+                    seen_ids.discard(s.session_id)
                     continue
                 if archived_only:
                     continue
