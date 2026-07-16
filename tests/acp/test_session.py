@@ -870,6 +870,40 @@ class TestPersistence:
         ids = {s["session_id"] for s in listing}
         assert sid in ids
 
+    def test_list_sessions_surfaces_in_memory_session_mid_first_turn(self, manager):
+        """A session that is IN MEMORY with an empty history but already has
+        persisted messages must surface via its DB row.
+
+        In-memory ``state.history`` is only assigned when a turn finishes,
+        while the agent flushes messages to the DB incrementally during the
+        turn. A spawned session (acp_spawn_session) spends its whole first
+        turn in that state; before the fix the empty-history skip also left
+        the id claimed in ``seen_ids``, so the DB merge skipped it too and
+        the session was invisible in session/list until its first turn ended
+        (2026-07-15 incident: spawned handoff session missing from the
+        VS Code sidebar despite a healthy DB row).
+        """
+        state = manager.create_session(cwd="/spawned")
+        sid = state.session_id
+        assert state.history == []  # mid-turn: nothing assigned yet
+
+        # Simulate the agent's incremental mid-turn flush: messages exist in
+        # the DB even though state.history is still empty.
+        db = manager._get_db()
+        db.append_message(sid, role="user", content="continue the handoff")
+        db.append_message(sid, role="assistant", content="on it")
+
+        listing = manager.list_sessions()
+        ids = {s["session_id"] for s in listing}
+        assert sid in ids
+
+        # Truly-empty sessions (no history AND no persisted messages) must
+        # stay hidden — the message_count guard still applies.
+        empty = manager.create_session(cwd="/empty-still-hidden")
+        listing = manager.list_sessions()
+        ids = {s["session_id"] for s in listing}
+        assert empty.session_id not in ids
+
     def test_list_sessions_filters_by_cwd(self, manager):
         keep = manager.create_session(cwd="/keep")
         drop = manager.create_session(cwd="/drop")

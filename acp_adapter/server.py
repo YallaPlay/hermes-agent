@@ -1808,7 +1808,12 @@ class HermesACPAgent(acp.Agent):
         schedules its first turn as a background task on the server's event
         loop and returns the real session id immediately — the parent turn
         never blocks on the child. The child inherits the parent's owner (and
-        cwd unless overridden) so per-user session lists show it.
+        cwd unless overridden) so per-user session lists show it, plus the
+        parent's edit-approval mode and reasoning effort: a spawned session
+        runs its first turn headless (no panel attached), so under the
+        default "ask" policy every edit-approval request would be silently
+        auto-denied by the client — inheriting the parent's mode makes the
+        child at least as capable as the session that spawned it.
         """
 
         def _requester(prompt_text: str, cwd: str | None) -> str:
@@ -1818,6 +1823,13 @@ class HermesACPAgent(acp.Agent):
             new_state = self.session_manager.create_session(
                 cwd=spawn_cwd, owner=parent_state.owner
             )
+            # Mirror the fork path (SessionManager.fork_session): carry the
+            # parent's edit-approval mode and reasoning-effort override, then
+            # re-persist so both survive an agent restart.
+            new_state.mode = parent_state.mode
+            new_state.effort = parent_state.effort
+            _apply_effort_to_agent(new_state.agent, parent_state.effort)
+            self.session_manager.save_session(new_state.session_id)
             future = safe_schedule_threadsafe(
                 self._run_spawned_first_turn(new_state.session_id, prompt_text),
                 loop,

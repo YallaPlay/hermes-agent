@@ -336,6 +336,48 @@ class TestServerSpawnRequester:
         assert child.cwd == str(tmp_path)
 
     @pytest.mark.asyncio
+    async def test_requester_inherits_parent_mode_and_effort(self, agent):
+        """The spawned child must carry the parent's edit-approval mode and
+        reasoning effort (mirrors fork_session). A spawned session runs its
+        first turn headless — no panel attached — so under the default "ask"
+        policy every edit approval is auto-denied by the client and the child
+        cannot edit files at all (2026-07-15 incident: handoff child's patches
+        all bounced with "Edit approval denied by ACP client").
+        """
+        parent_resp = await agent.new_session(cwd="/tmp")
+        parent_state = agent.session_manager.get_session(parent_resp.session_id)
+        parent_state.mode = "dont_ask"
+        parent_state.effort = "high"
+        agent._run_spawned_first_turn = AsyncMock()
+
+        loop = asyncio.get_running_loop()
+        requester = agent._make_spawn_session_requester(loop, parent_state)
+        new_id = await loop.run_in_executor(None, requester, "carry on", None)
+
+        child = agent.session_manager.get_session(new_id)
+        assert child.mode == "dont_ask"
+        assert child.effort == "high"
+        # The edit-approval policy derived for the child matches the parent's.
+        child_policy, _ = agent._edit_approval_policy_for_state(child)
+        parent_policy, _ = agent._edit_approval_policy_for_state(parent_state)
+        assert child_policy == parent_policy == "session"
+
+    @pytest.mark.asyncio
+    async def test_requester_default_mode_parent_spawns_default_child(self, agent):
+        """No inherited surprise: a default-mode parent spawns a default child."""
+        parent_resp = await agent.new_session(cwd="/tmp")
+        parent_state = agent.session_manager.get_session(parent_resp.session_id)
+        agent._run_spawned_first_turn = AsyncMock()
+
+        loop = asyncio.get_running_loop()
+        requester = agent._make_spawn_session_requester(loop, parent_state)
+        new_id = await loop.run_in_executor(None, requester, "carry on", None)
+
+        child = agent.session_manager.get_session(new_id)
+        assert (child.mode or "") == ""
+        assert (child.effort or "") == ""
+
+    @pytest.mark.asyncio
     async def test_spawned_first_turn_echoes_prompt_and_runs(self, agent):
         new_resp = await agent.new_session(cwd=".")
         state = agent.session_manager.get_session(new_resp.session_id)
