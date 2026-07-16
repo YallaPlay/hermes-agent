@@ -1760,6 +1760,12 @@ class HermesACPAgent(acp.Agent):
             # envelope) so clients can badge them, e.g. a Slack icon prefix.
             if s.get("slack"):
                 hermes_meta["slack"] = True
+            # Session owner (sessions.user_id — the Cloudflare Access email
+            # stamped on session/new) so clients can badge rows per user, e.g.
+            # owner initials in an "All sessions" list. Soft display key only.
+            owner_id = str(s.get("user_id") or "").strip()
+            if owner_id:
+                hermes_meta["owner"] = owner_id
             field_meta = {"hermes": hermes_meta} if hermes_meta else None
             sessions.append(
                 SessionInfo(

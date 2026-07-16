@@ -1422,6 +1422,22 @@ class TestListAndFork:
         assert root.field_meta is None
 
     @pytest.mark.asyncio
+    async def test_list_sessions_stamps_owner_meta(self, agent):
+        with patch.object(
+            agent.session_manager, "list_sessions",
+            return_value=[
+                {"session_id": "s1", "cwd": "/tmp", "title": "Mine",
+                 "updated_at": 2.0, "user_id": "israel@yallaplay.com"},
+                {"session_id": "s2", "cwd": "/tmp", "title": "Untagged",
+                 "updated_at": 1.0, "user_id": ""},
+            ],
+        ):
+            resp = await agent.list_sessions(cwd="/tmp")
+        owned, untagged = resp.sessions
+        assert (owned.field_meta or {}).get("hermes", {}).get("owner") == "israel@yallaplay.com"
+        assert untagged.field_meta is None
+
+    @pytest.mark.asyncio
     async def test_ext_method_set_owner_delegates_persists_and_emits(self, agent):
         with patch.object(
             agent.session_manager, "set_session_owner", return_value=True
