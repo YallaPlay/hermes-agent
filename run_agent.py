@@ -1860,6 +1860,17 @@ class AIAgent:
                 role = msg.get("role", "unknown")
                 content = msg.get("content")
                 _row_timestamp = msg.get("timestamp")
+                if _row_timestamp is None:
+                    # Stamp send time now (the DB default would be the same
+                    # time.time() inside append_message) and backfill the LIVE
+                    # dict too: in-memory history is what ACP session/load
+                    # replays for a still-running process, and without the key
+                    # every replayed chunk loses its send time until a restart
+                    # restores from the DB. Restored messages already carry
+                    # "timestamp" (get_messages_as_conversation), so live dicts
+                    # gaining it keeps both shapes identical.
+                    _row_timestamp = time.time()
+                    msg["timestamp"] = _row_timestamp
                 # Apply the persist override to THIS row's written values only
                 # (never to the live dict). Match the original guard: text-only
                 # content is replaced; multimodal (list) content is left intact

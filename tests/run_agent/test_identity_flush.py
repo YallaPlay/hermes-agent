@@ -231,3 +231,40 @@ class TestIdentityFlush:
                 assert new_assistant.get("_db_persisted") is True
             finally:
                 db.close()
+
+    def test_flush_backfills_timestamp_on_live_dicts(self):
+        """A flush stamps the send time onto the in-memory message dicts.
+
+        ACP session/load replays the LIVE in-memory history for a running
+        process; without the key every replayed chunk loses its send time
+        (the DB row got one from append_message, but the dict did not), so
+        clients rendered all messages with a single client-side "now".
+        The stamped dict value must also equal the persisted row's value.
+        """
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "t.db")
+            try:
+                agent = _make_agent(db)
+                user = {"role": "user", "content": "q"}
+                assistant = {"role": "assistant", "content": "a"}
+                # A message that already carries a stamp (e.g. restored from
+                # DB) must keep it, not be re-stamped.
+                pre_stamped = {"role": "user", "content": "old", "timestamp": 1234567890.0}
+
+                agent._flush_messages_to_session_db([pre_stamped, user, assistant], [])
+
+                assert isinstance(user.get("timestamp"), float)
+                assert isinstance(assistant.get("timestamp"), float)
+                assert pre_stamped["timestamp"] == 1234567890.0
+
+                rows = {
+                    row["content"]: row["timestamp"]
+                    for row in db.get_messages(SESSION_ID)
+                }
+                assert rows["q"] == user["timestamp"]
+                assert rows["a"] == assistant["timestamp"]
+                assert rows["old"] == 1234567890.0
+            finally:
+                db.close()
