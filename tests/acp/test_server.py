@@ -1229,6 +1229,43 @@ class TestSessionOps:
         assert user_calls[1].kwargs["hermes"] == {"historyIndex": 2}
 
     @pytest.mark.asyncio
+    async def test_running_turn_replay_uses_db_at_equal_length(self, agent):
+        """Equal lengths: the DB is still the faithful mid-turn transcript
+        (the gate is >=, not >) — replay the DB rows, without index meta."""
+        state, mock_conn = await self._running_replay_state(
+            agent,
+            history=[
+                {"role": "user", "content": "kick off the long job"},
+                {"role": "assistant", "content": "stale memory snapshot"},
+            ],
+        )
+        state.is_running = True
+        agent.session_manager.live_transcript_history = MagicMock(
+            return_value=[
+                {"role": "user", "content": "kick off the long job"},
+                {"role": "assistant", "content": "fresh db snapshot"},
+            ]
+        )
+
+        await agent._replay_session_history(state)
+
+        agent.session_manager.live_transcript_history.assert_called_once_with(
+            state.session_id
+        )
+        agent_calls = [
+            call for call in mock_conn.session_update.await_args_list
+            if getattr(call.kwargs.get("update"), "session_update", None)
+            == "agent_message_chunk"
+        ]
+        assert [c.kwargs["update"].content.text for c in agent_calls] == [
+            "fresh db snapshot"
+        ]
+        assert all(
+            "hermes" not in call.kwargs
+            for call in mock_conn.session_update.await_args_list
+        )
+
+    @pytest.mark.asyncio
     async def test_idle_session_replay_unchanged(self, agent):
         """No turn running: memory source with index meta, and the DB is not
         consulted at all — even if it happens to hold more rows."""
@@ -2770,6 +2807,84 @@ class TestSlashCommands:
         state = self._make_state(mock_manager)
         result = agent._handle_slash_command("/nonexistent", state)
         assert result is None
+
+    def _owned_persistence_state(self, tmp_path):
+        """Real SessionDB + manager whose agent OWNS persistence.
+
+        Mimics a live ACP session: run_agent has already flushed the turn's
+        rows itself (agent._session_db is the manager's db and
+        _session_db_created=True), so save_session deliberately skips
+        replace_messages — the slash command itself must reconcile the DB.
+        """
+        db = SessionDB(tmp_path / "state.db")
+
+        def factory():
+            return SimpleNamespace(
+                model="test-model",
+                _session_db=db,
+                _session_db_created=True,
+            )
+
+        manager = SessionManager(agent_factory=factory, db=db)
+        acp_agent = HermesACPAgent(session_manager=manager)
+        state = manager.create_session(cwd="/work")
+
+        # The agent's own flusher already persisted the live transcript.
+        db.append_message(session_id=state.session_id, role="user", content="one")
+        db.append_message(session_id=state.session_id, role="assistant", content="two")
+        state.history = [
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "two"},
+        ]
+        return acp_agent, state, db
+
+    def test_cmd_compact_reconciles_persisted_history(self, tmp_path):
+        """/compact must mirror the in-memory rewrite into the message store:
+        active rows become the compacted set, pre-compact rows are archived
+        (not deleted) — otherwise mid-turn replay and post-restart restore
+        resurrect the uncompacted transcript without the summary."""
+        acp_agent, state, db = self._owned_persistence_state(tmp_path)
+        state.agent.compression_enabled = True
+        state.agent._cached_system_prompt = "system"
+        state.agent.tools = None
+        state.agent._compress_context = MagicMock(
+            return_value=([{"role": "user", "content": "compacted summary"}], "sys")
+        )
+
+        result = acp_agent._handle_slash_command("/compact", state)
+
+        assert "Context compressed" in result
+        # Active DB rows must now equal the compacted in-memory history.
+        active = [
+            m["content"] for m in db.get_messages_as_conversation(state.session_id)
+        ]
+        assert active == ["compacted summary"]
+        # Pre-compact rows survive as archived (soft-archive, not delete).
+        all_rows = [
+            m["content"]
+            for m in db.get_messages(state.session_id, include_inactive=True)
+        ]
+        assert "one" in all_rows
+        assert "two" in all_rows
+
+    def test_cmd_reset_reconciles_persisted_history(self, tmp_path):
+        """/reset must empty the ACTIVE row set in the message store, keeping
+        the old rows archived — otherwise the DB stays longer than memory and
+        every subsequent mid-turn replay resurrects the cleared transcript."""
+        acp_agent, state, db = self._owned_persistence_state(tmp_path)
+
+        result = acp_agent._handle_slash_command("/reset", state)
+
+        assert "cleared" in result.lower()
+        assert state.history == []
+        assert db.get_messages_as_conversation(state.session_id) == []
+        # Old rows are archived, not destroyed.
+        all_rows = [
+            m["content"]
+            for m in db.get_messages(state.session_id, include_inactive=True)
+        ]
+        assert "one" in all_rows
+        assert "two" in all_rows
 
     @pytest.mark.asyncio
     async def test_slash_command_intercepted_in_prompt(self, agent, mock_manager):

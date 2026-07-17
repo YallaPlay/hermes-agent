@@ -2685,8 +2685,34 @@ class HermesACPAgent(acp.Agent):
 
     def _cmd_reset(self, args: str, state: SessionState) -> str:
         state.history.clear()
+        self._reconcile_persisted_history(state, [])
         self.session_manager.save_session(state.session_id)
         return "Conversation history cleared."
+
+    def _reconcile_persisted_history(
+        self, state: SessionState, messages: list[dict[str, Any]]
+    ) -> None:
+        """Mirror an in-memory history rewrite (compact/reset) into the message store.
+
+        save_session deliberately skips replace_messages when the agent owns
+        persistence, so a slash-command history rewrite would otherwise leave
+        the DB carrying the old rows as the live set — and the mid-turn DB
+        replay (and post-restart restore) would resurrect them. Soft-archive
+        the old rows and install the new list atomically; best-effort.
+        """
+        db = self.session_manager._get_db()
+        if db is None:
+            return
+        sid = getattr(state.agent, "session_id", None)
+        head_id = sid if isinstance(sid, str) and sid else state.session_id
+        try:
+            db.archive_and_compact(head_id, messages)
+        except Exception:
+            logger.warning(
+                "Failed to reconcile persisted history for ACP session %s",
+                state.session_id,
+                exc_info=True,
+            )
 
     def _cmd_compact(self, args: str, state: SessionState) -> str:
         if not state.history:
@@ -2724,6 +2750,7 @@ class HermesACPAgent(acp.Agent):
                 agent._session_db = original_session_db
 
             state.history = compressed
+            self._reconcile_persisted_history(state, compressed)
             self.session_manager.save_session(state.session_id)
 
             new_count = len(state.history)
