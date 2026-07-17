@@ -387,10 +387,12 @@ class SessionManager:
             return None
         with self._lock:
             state = self._sessions.get(session_id)
-        head_id = session_id
-        if state is not None:
-            head_id = str(getattr(state.agent, "session_id", "") or "") or session_id
         try:
+            head_id = session_id
+            if state is not None:
+                sid = getattr(state.agent, "session_id", None)
+                if isinstance(sid, str) and sid:
+                    head_id = sid
             return db.get_messages_as_conversation(head_id)
         except Exception:
             logger.warning(

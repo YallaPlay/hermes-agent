@@ -1338,3 +1338,69 @@ class TestLiveTranscriptHistory:
         monkeypatch.setattr(manager, "_get_db", lambda: None)
 
         assert manager.live_transcript_history("whatever") is None
+
+    def test_live_transcript_history_swallows_raising_agent_session_id(self, manager):
+        """A raising agent.session_id property must not escape (contract: no exception escapes)."""
+
+        class ExplodingAgent:
+            @property
+            def session_id(self):
+                raise RuntimeError("proxy blew up resolving session_id")
+
+        state = manager.create_session()
+        state.agent = ExplodingAgent()
+
+        assert manager.live_transcript_history(state.session_id) is None
+
+    def test_live_transcript_history_ignores_non_string_agent_session_id(self, manager):
+        """A truthy non-string agent.session_id must not be stringified into a bogus head."""
+        state = manager.create_session()
+        state.agent.session_id = object()  # truthy, not a str
+        sid = state.session_id
+        db = manager._get_db()
+        db.create_session(session_id=sid, source="acp")
+        db.append_message(session_id=sid, role="user", content="under acp id")
+
+        messages = manager.live_transcript_history(sid)
+
+        assert [m["content"] for m in messages] == ["under acp id"]
+
+    def test_live_transcript_history_orders_by_insertion_not_timestamp(self, manager):
+        """Rows with descending explicit timestamps must still come back in insertion order."""
+        import time as _time
+
+        db = manager._get_db()
+        sid = "acp-live-transcript-order"
+        db.create_session(session_id=sid, source="acp")
+        now = _time.time()
+        db.append_message(
+            session_id=sid, role="user", content="first", timestamp=now + 100
+        )
+        db.append_message(
+            session_id=sid,
+            role="assistant",
+            content=None,
+            tool_calls=[
+                {
+                    "id": "call_ord",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                }
+            ],
+            timestamp=now,
+        )
+        db.append_message(
+            session_id=sid,
+            role="tool",
+            content="done",
+            tool_call_id="call_ord",
+            tool_name="terminal",
+            timestamp=now - 100,
+        )
+
+        messages = manager.live_transcript_history(sid)
+
+        assert [m["role"] for m in messages] == ["user", "assistant", "tool"]
+        assert messages[0]["content"] == "first"
+        assert messages[1]["tool_calls"][0]["id"] == "call_ord"
+        assert messages[2]["content"] == "done"
