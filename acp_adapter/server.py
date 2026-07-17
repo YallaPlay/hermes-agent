@@ -1306,7 +1306,30 @@ class HermesACPAgent(acp.Agent):
         notifications. Merely restoring server-side state makes Hermes
         remember context, but leaves the editor looking like a clean thread.
         """
-        if not self._conn or not state.history:
+        if not self._conn:
+            return
+
+        with state.runtime_lock:
+            turn_running = state.is_running
+
+        source: list[dict[str, Any]] = state.history
+        stamp_fork_indices = True
+        if turn_running:
+            transcript = self.session_manager.live_transcript_history(state.session_id)
+            if transcript is not None and len(transcript) >= len(state.history):
+                # Mid-turn: state.history only extends at turn END, but
+                # run_agent flushes messages to the DB continuously — the DB
+                # is the faithful transcript. Its rows have no stable fork
+                # coordinates (compaction may rewrite them before the turn
+                # finalizes), so omit historyIndex — clients degrade to a
+                # full-copy fork, and the running turn hides its fork button
+                # anyway. A None/shorter transcript means the store is
+                # unavailable or resolved the wrong lineage: fail open to
+                # the in-memory history below.
+                source = transcript
+                stamp_fork_indices = False
+
+        if not source:
             return
 
         active_tool_calls: dict[str, tuple[str, dict[str, Any]]] = {}
@@ -1334,7 +1357,7 @@ class HermesACPAgent(acp.Agent):
                 )
                 return False
 
-        for index, message in enumerate(state.history):
+        for index, message in enumerate(source):
             role = str(message.get("role") or "")
 
             if role == "user":
@@ -1345,9 +1368,12 @@ class HermesACPAgent(acp.Agent):
                         text=text,
                         field_meta=self._history_chunk_meta(message, text),
                     )
-                    if update is not None and not await _send(
-                        update, {"hermes": {"historyIndex": index}}
-                    ):
+                    meta = (
+                        {"hermes": {"historyIndex": index}}
+                        if stamp_fork_indices
+                        else None
+                    )
+                    if update is not None and not await _send(update, meta):
                         return
                 continue
 

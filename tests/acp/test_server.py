@@ -1060,6 +1060,202 @@ class TestSessionOps:
         resume_resp = await agent.resume_session(cwd="/tmp", session_id="nonexistent")
         assert isinstance(resume_resp, ResumeSessionResponse)
 
+    # ---- mid-turn replay source selection ---------------------------------
+    #
+    # While a turn is RUNNING, state.history only extends at turn end but the
+    # SQLite store is flushed continuously — so replay must read the persisted
+    # transcript (via SessionManager.live_transcript_history) instead of the
+    # stale in-memory list, and must fail open to state.history whenever the
+    # DB path is unavailable or suspiciously short.
+
+    async def _running_replay_state(self, agent, history=None):
+        """Create a session, wire a fresh mock conn, and return its state."""
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        new_resp = await agent.new_session(cwd="/tmp")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        state.history = history if history is not None else [
+            {"role": "user", "content": "kick off the long job"},
+        ]
+        mock_conn.session_update.reset_mock()
+        return state, mock_conn
+
+    @staticmethod
+    def _db_transcript():
+        """Kickoff + in-flight assistant tool call + tool result rows."""
+        return [
+            {"role": "user", "content": "kick off the long job"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_live_1",
+                        "type": "function",
+                        "function": {
+                            "name": "search_files",
+                            "arguments": '{"pattern":"midturn","path":"."}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_live_1",
+                "content": '{"total_count":1,"matches":[{"path":"a.py","line":1,"content":"midturn"}]}',
+            },
+        ]
+
+    @pytest.mark.asyncio
+    async def test_load_session_running_turn_replays_db_transcript(self, agent):
+        """Running turn: replay reads the persisted transcript, not the stale
+        in-memory history — proven by the tool-call updates only the DB has."""
+        state, mock_conn = await self._running_replay_state(agent)
+        state.is_running = True
+        agent.session_manager.live_transcript_history = MagicMock(
+            return_value=self._db_transcript()
+        )
+
+        await agent._replay_session_history(state)
+
+        tool_updates = [
+            call.kwargs["update"]
+            for call in mock_conn.session_update.await_args_list
+            if getattr(call.kwargs.get("update"), "session_update", None)
+            in {"tool_call", "tool_call_update"}
+        ]
+        assert len(tool_updates) == 2
+        assert isinstance(tool_updates[0], ToolCallStart)
+        assert tool_updates[0].tool_call_id == "call_live_1"
+        assert isinstance(tool_updates[1], ToolCallProgress)
+        assert tool_updates[1].tool_call_id == "call_live_1"
+        agent.session_manager.live_transcript_history.assert_called_once_with(
+            state.session_id
+        )
+
+    @pytest.mark.asyncio
+    async def test_running_turn_replay_omits_history_index_meta(self, agent):
+        """DB rows have no stable fork coordinates (compaction may rewrite
+        them before the turn finalizes), so DB-sourced replay must not stamp
+        _meta.hermes.historyIndex on any chunk."""
+        state, mock_conn = await self._running_replay_state(agent)
+        state.is_running = True
+        agent.session_manager.live_transcript_history = MagicMock(
+            return_value=self._db_transcript()
+        )
+
+        await agent._replay_session_history(state)
+
+        calls = mock_conn.session_update.await_args_list
+        assert calls  # replay emitted something
+        assert all("hermes" not in call.kwargs for call in calls)
+
+    @pytest.mark.asyncio
+    async def test_running_turn_replay_with_empty_memory_history(self, agent):
+        """A running first turn: state.history is still empty but the DB
+        already holds rows — replay must emit from the DB transcript."""
+        state, mock_conn = await self._running_replay_state(agent, history=[])
+        state.is_running = True
+        agent.session_manager.live_transcript_history = MagicMock(
+            return_value=self._db_transcript()
+        )
+
+        await agent._replay_session_history(state)
+
+        user_calls = [
+            call for call in mock_conn.session_update.await_args_list
+            if getattr(call.kwargs.get("update"), "session_update", None)
+            == "user_message_chunk"
+        ]
+        assert len(user_calls) == 1
+        assert user_calls[0].kwargs["update"].content.text == "kick off the long job"
+
+    @pytest.mark.asyncio
+    async def test_running_turn_replay_falls_back_when_db_unavailable(self, agent):
+        """live_transcript_history returning None → fail open to the memory
+        path, unchanged: replay state.history WITH historyIndex meta."""
+        state, mock_conn = await self._running_replay_state(agent)
+        state.is_running = True
+        agent.session_manager.live_transcript_history = MagicMock(return_value=None)
+
+        await agent._replay_session_history(state)
+
+        agent.session_manager.live_transcript_history.assert_called_once_with(
+            state.session_id
+        )
+        user_calls = [
+            call for call in mock_conn.session_update.await_args_list
+            if getattr(call.kwargs.get("update"), "session_update", None)
+            == "user_message_chunk"
+        ]
+        assert len(user_calls) == 1
+        assert user_calls[0].kwargs["update"].content.text == "kick off the long job"
+        assert user_calls[0].kwargs["hermes"] == {"historyIndex": 0}
+
+    @pytest.mark.asyncio
+    async def test_running_turn_replay_falls_back_when_db_shorter(self, agent):
+        """A transcript shorter than state.history means the DB head resolved
+        to the wrong lineage — distrust it and replay memory with meta."""
+        state, mock_conn = await self._running_replay_state(
+            agent,
+            history=[
+                {"role": "user", "content": "first question"},
+                {"role": "assistant", "content": "first answer"},
+                {"role": "user", "content": "second question"},
+            ],
+        )
+        state.is_running = True
+        agent.session_manager.live_transcript_history = MagicMock(
+            return_value=[{"role": "user", "content": "first question"}]
+        )
+
+        await agent._replay_session_history(state)
+
+        agent.session_manager.live_transcript_history.assert_called_once_with(
+            state.session_id
+        )
+        user_calls = [
+            call for call in mock_conn.session_update.await_args_list
+            if getattr(call.kwargs.get("update"), "session_update", None)
+            == "user_message_chunk"
+        ]
+        assert [c.kwargs["update"].content.text for c in user_calls] == [
+            "first question",
+            "second question",
+        ]
+        assert user_calls[0].kwargs["hermes"] == {"historyIndex": 0}
+        assert user_calls[1].kwargs["hermes"] == {"historyIndex": 2}
+
+    @pytest.mark.asyncio
+    async def test_idle_session_replay_unchanged(self, agent):
+        """No turn running: memory source with index meta, and the DB is not
+        consulted at all — even if it happens to hold more rows."""
+        state, mock_conn = await self._running_replay_state(
+            agent,
+            history=[
+                {"role": "user", "content": "first question"},
+                {"role": "assistant", "content": "first answer"},
+            ],
+        )
+        state.is_running = False
+        agent.session_manager.live_transcript_history = MagicMock(
+            return_value=self._db_transcript()
+        )
+
+        await agent._replay_session_history(state)
+
+        agent.session_manager.live_transcript_history.assert_not_called()
+        user_calls = [
+            call for call in mock_conn.session_update.await_args_list
+            if getattr(call.kwargs.get("update"), "session_update", None)
+            == "user_message_chunk"
+        ]
+        assert len(user_calls) == 1
+        assert user_calls[0].kwargs["update"].content.text == "first question"
+        assert user_calls[0].kwargs["hermes"] == {"historyIndex": 0}
+
 
 # ---------------------------------------------------------------------------
 # list / fork
