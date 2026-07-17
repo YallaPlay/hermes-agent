@@ -1204,6 +1204,42 @@ class HermesACPAgent(acp.Agent):
         return None
 
     @staticmethod
+    def _history_timestamp_iso(message: dict[str, Any]) -> str | None:
+        """Return the persisted message timestamp as an ISO-8601 UTC string.
+
+        ``get_messages_as_conversation`` surfaces the ``messages.timestamp``
+        column (a ``time.time()`` epoch float) as ``message["timestamp"]``
+        when the row has one. Returns ``None`` for messages without a
+        usable timestamp (in-memory history entries the DB hasn't stamped,
+        or corrupt values) so callers can omit the meta key entirely.
+        """
+        raw = message.get("timestamp")
+        if not isinstance(raw, (int, float)) or isinstance(raw, bool) or raw <= 0:
+            return None
+        try:
+            return datetime.fromtimestamp(float(raw), tz=timezone.utc).isoformat()
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    @classmethod
+    def _history_chunk_meta(
+        cls, message: dict[str, Any], text: str
+    ) -> dict[str, Any] | None:
+        """Combine the compaction-summary flags and the message timestamp
+        into one chunk-level ``_meta.hermes`` payload for history replay.
+
+        Returns ``None`` when neither applies, keeping unflagged,
+        untimestamped chunks meta-free (the shape existing clients expect).
+        """
+        meta = cls._history_summary_meta(message, text)
+        timestamp = cls._history_timestamp_iso(message)
+        if timestamp:
+            if meta is None:
+                meta = {"hermes": {}}
+            meta["hermes"]["timestamp"] = timestamp
+        return meta
+
+    @staticmethod
     def _history_message_update(
         *,
         role: str,
@@ -1307,7 +1343,7 @@ class HermesACPAgent(acp.Agent):
                     update = self._history_message_update(
                         role=role,
                         text=text,
-                        field_meta=self._history_summary_meta(message, text),
+                        field_meta=self._history_chunk_meta(message, text),
                     )
                     if update is not None and not await _send(
                         update, {"hermes": {"historyIndex": index}}
@@ -1325,7 +1361,7 @@ class HermesACPAgent(acp.Agent):
                     update = self._history_message_update(
                         role=role,
                         text=text,
-                        field_meta=self._history_summary_meta(message, text),
+                        field_meta=self._history_chunk_meta(message, text),
                     )
                     if update is not None and not await _send(update):
                         return

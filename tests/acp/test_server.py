@@ -635,6 +635,61 @@ class TestSessionOps:
         }
 
     @pytest.mark.asyncio
+    async def test_load_session_stamps_timestamp_on_replayed_chunks(self, agent):
+        """Replayed user/assistant chunks carry _meta.hermes.timestamp (ISO
+        UTC) when the persisted message has one, so clients can show when
+        each message was sent. Messages without a timestamp stay meta-free,
+        and the flag composes with the compaction-summary meta."""
+        from agent.context_compressor import SUMMARY_PREFIX
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        summary_text = SUMMARY_PREFIX + "\n\n## Active Task\nDo the thing."
+        new_resp = await agent.new_session(cwd="/tmp")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        state.history = [
+            {"role": "user", "content": "first question", "timestamp": 1783000000.5},
+            {"role": "assistant", "content": "first answer", "timestamp": 1783000042.0},
+            {"role": "user", "content": "no stamp here"},
+            {"role": "user", "content": summary_text, "timestamp": 1783000100.0},
+        ]
+
+        mock_conn.session_update.reset_mock()
+        await agent.load_session(cwd="/tmp", session_id=new_resp.session_id)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        user_chunks = [
+            call.kwargs["update"]
+            for call in mock_conn.session_update.await_args_list
+            if isinstance(call.kwargs.get("update"), UserMessageChunk)
+        ]
+        agent_chunks = [
+            call.kwargs["update"]
+            for call in mock_conn.session_update.await_args_list
+            if isinstance(call.kwargs.get("update"), AgentMessageChunk)
+        ]
+        assert len(user_chunks) == 3
+        assert user_chunks[0].field_meta == {
+            "hermes": {"timestamp": "2026-07-02T13:46:40.500000+00:00"}
+        }
+        # No persisted timestamp → no meta at all (existing client shape).
+        assert user_chunks[1].field_meta is None
+        # Timestamp composes with the compaction-summary flag.
+        assert user_chunks[2].field_meta == {
+            "hermes": {
+                "compactionSummary": True,
+                "timestamp": "2026-07-02T13:48:20+00:00",
+            }
+        }
+        assert len(agent_chunks) == 1
+        assert agent_chunks[0].field_meta == {
+            "hermes": {"timestamp": "2026-07-02T13:47:22+00:00"}
+        }
+
+    @pytest.mark.asyncio
     async def test_load_session_replays_native_plan_for_persisted_todo_tool(self, agent):
         """Persisted todo tool results should rebuild Zed's native plan panel."""
         mock_conn = MagicMock(spec=acp.Client)
