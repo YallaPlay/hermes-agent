@@ -371,6 +371,35 @@ class SessionManager:
         # Attempt to restore from database.
         return self._restore(session_id)
 
+    def live_transcript_history(
+        self, session_id: str
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Best-effort transcript of a session from the persisted message store.
+
+        Used by ACP history replay while a turn is RUNNING: the in-memory
+        ``state.history`` only extends at turn end, but ``run_agent`` flushes
+        messages to the DB continuously, so the DB is the faithful mid-turn
+        transcript. Returns None when the store is unavailable or the query
+        fails; the caller falls back to ``state.history``.
+        """
+        db = self._get_db()
+        if db is None:
+            return None
+        with self._lock:
+            state = self._sessions.get(session_id)
+        head_id = session_id
+        if state is not None:
+            head_id = str(getattr(state.agent, "session_id", "") or "") or session_id
+        try:
+            return db.get_messages_as_conversation(head_id)
+        except Exception:
+            logger.warning(
+                "Failed to load live transcript for ACP session %s",
+                session_id,
+                exc_info=True,
+            )
+            return None
+
     def remove_session(self, session_id: str) -> bool:
         """Remove a session from memory and database. Returns True if it existed."""
         with self._lock:

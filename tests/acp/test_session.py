@@ -1276,3 +1276,65 @@ def test_set_session_archived_delegates_to_db():
     mgr, db = _mgr_with_db([], archived_ok=True)
     assert mgr.set_session_archived("s1", True) is True
     db.set_session_archived.assert_called_once_with("s1", True)
+
+
+class TestLiveTranscriptHistory:
+    def test_live_transcript_history_returns_db_conversation(self, manager):
+        db = manager._get_db()
+        sid = "acp-live-transcript-1"
+        db.create_session(session_id=sid, source="acp")
+        db.append_message(session_id=sid, role="user", content="hello")
+        db.append_message(
+            session_id=sid,
+            role="assistant",
+            content=None,
+            tool_calls=[
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                }
+            ],
+        )
+        db.append_message(
+            session_id=sid,
+            role="tool",
+            content="ok",
+            tool_call_id="call_1",
+            tool_name="terminal",
+        )
+
+        messages = manager.live_transcript_history(sid)
+
+        assert [m["role"] for m in messages] == ["user", "assistant", "tool"]
+        assert messages[0]["content"] == "hello"
+        assert messages[1]["tool_calls"][0]["id"] == "call_1"
+        assert messages[2]["tool_call_id"] == "call_1"
+        assert messages[2]["content"] == "ok"
+
+    def test_live_transcript_history_resolves_agent_head(self, manager):
+        state = manager.create_session()
+        agent_id = "agent-head-rotated"
+        state.agent.session_id = agent_id
+        db = manager._get_db()
+        db.create_session(session_id=agent_id, source="cli")
+        db.append_message(session_id=agent_id, role="user", content="mid-turn flush")
+
+        messages = manager.live_transcript_history(state.session_id)
+
+        assert [m["content"] for m in messages] == ["mid-turn flush"]
+
+    def test_live_transcript_history_returns_none_on_db_failure(self, manager, monkeypatch):
+        db = manager._get_db()
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("db exploded")
+
+        monkeypatch.setattr(db, "get_messages_as_conversation", boom)
+
+        assert manager.live_transcript_history("whatever") is None
+
+    def test_live_transcript_history_returns_none_without_db(self, manager, monkeypatch):
+        monkeypatch.setattr(manager, "_get_db", lambda: None)
+
+        assert manager.live_transcript_history("whatever") is None
