@@ -4139,6 +4139,48 @@ class SessionDB:
         return self._execute_write(_do)
 
 
+    def get_compaction_marker_messages(self, session_id: str) -> List[Dict[str, Any]]:
+        """Message rows that look like compaction-summary handoffs, any active state.
+
+        Cheap SQL prefilter on the known summary prefixes/delimiter; callers
+        should confirm with ``ContextCompressor.classify_summary_content`` (the
+        LIKE patterns are deliberately broad). Includes archived (``active=0``)
+        rows because in-place compaction archives each boundary's summary at
+        the NEXT boundary — the archived markers ARE the compaction history.
+        Returns lightweight dicts (no tool_calls decode) ordered by insertion.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, role, content, timestamp, active, compacted "
+                "FROM messages WHERE session_id = ? AND ("
+                "CAST(content AS TEXT) LIKE '[CONTEXT COMPACTION%' "
+                "OR CAST(content AS TEXT) LIKE '[CONTEXT SUMMARY]:%' "
+                "OR CAST(content AS TEXT) LIKE "
+                "'%[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]%'"
+                ") ORDER BY id",
+                (session_id,),
+            ).fetchall()
+        result = []
+        for row in rows:
+            msg = dict(row)
+            msg["content"] = self._decode_content(msg.get("content"))
+            result.append(msg)
+        return result
+
+    def get_compacted_message_ids(self, session_id: str) -> List[int]:
+        """Ids of soft-archived compaction rows (``compacted=1``), ascending.
+
+        Used to bucket archived turns between compaction boundaries — id-only,
+        so it stays cheap even on sessions with thousands of archived rows.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM messages WHERE session_id = ? AND compacted = 1 "
+                "ORDER BY id",
+                (session_id,),
+            ).fetchall()
+        return [row[0] for row in rows]
+
     def get_messages(
         self,
         session_id: str,

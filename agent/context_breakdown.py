@@ -354,6 +354,7 @@ def compute_session_context_breakdown(
             if tokens > 0
         ],
         "cache": _session_cache_stats(agent),
+        "compaction": _compaction_stats(agent),
         "context_max": context_max,
         "context_percent": context_percent,
         "context_used": context_used,
@@ -390,6 +391,114 @@ def _session_cache_stats(agent: Any) -> Optional[Dict[str, Any]]:
         "hit_percent": round(read / total_prompt * 100, 1),
         "api_calls": _int("session_api_calls"),
     }
+
+
+def _compaction_stats(agent: Any) -> Optional[Dict[str, Any]]:
+    """Compaction history + failure state for the live session.
+
+    Events are derived from persisted state (no new columns): each compaction
+    leaves a summary-handoff message in ``state.db`` (in-place mode archives
+    it at the next boundary; the newest one is still active), classified via
+    ``ContextCompressor.classify_summary_content``. Per-event fields:
+
+    - ``timestamp``: epoch seconds the summary row was persisted.
+    - ``summary_tokens``: rough chars/4 estimate of the summary handoff size.
+    - ``messages_before``: archived rows between the previous boundary and
+      this one — the turn count the compaction summarized away. ``None``
+      when the transcript carries no archived rows (e.g. rotation-mode
+      lineage where the parent session holds them).
+
+    Returns ``None`` when the session has never compacted AND no failure
+    cooldown is active, so UIs hide the row entirely. ``count`` prefers the
+    live compressor's ``compression_count`` (correct within this process
+    lifetime) over the derived event list (correct across restarts) by
+    taking the max — a DB-reloaded session has count>0 but a fresh
+    in-process counter.
+    """
+    events: List[Dict[str, Any]] = []
+    failure: Optional[Dict[str, Any]] = None
+    session_id = getattr(agent, "session_id", None)
+    db = getattr(agent, "_session_db", None)
+
+    if db is not None and session_id:
+        try:
+            from agent.context_compressor import ContextCompressor
+
+            markers = db.get_compaction_marker_messages(session_id)
+            boundaries = []
+            seen_content: set = set()
+            for msg in markers:
+                kind = ContextCompressor.classify_summary_content(msg.get("content"))
+                if kind is None:
+                    continue
+                # In-place compaction carries the previous summary forward into
+                # each new compacted set, re-inserting an identical row at every
+                # subsequent boundary. Those copies are the SAME logical
+                # compaction — keep only the earliest occurrence per content.
+                content_key = str(msg.get("content") or "").strip()
+                if content_key in seen_content:
+                    continue
+                seen_content.add(content_key)
+                boundaries.append(msg)
+            compacted_ids = db.get_compacted_message_ids(session_id)
+            # One archive_and_compact write can insert MULTIPLE summary rows
+            # (e.g. a standalone handoff plus an assistant-role echo) with
+            # near-identical timestamps. Group boundaries written within the
+            # same second into ONE logical compaction event.
+            groups: List[List[Dict[str, Any]]] = []
+            for msg in sorted(boundaries, key=lambda m: float(m.get("timestamp") or 0)):
+                ts = float(msg.get("timestamp") or 0)
+                if groups and ts - float(groups[-1][-1].get("timestamp") or 0) < 1.0:
+                    groups[-1].append(msg)
+                else:
+                    groups.append([msg])
+            prev_boundary_id = 0
+            for group in groups:
+                group_max_id = max(int(m.get("id") or 0) for m in group)
+                archived_between = sum(
+                    1
+                    for mid in compacted_ids
+                    if prev_boundary_id < mid < group_max_id
+                    and not any(int(m.get("id") or 0) == mid for m in group)
+                )
+                lead = group[0]
+                events.append(
+                    {
+                        "timestamp": float(lead.get("timestamp") or 0) or None,
+                        "summary_tokens": max(
+                            _chars_to_tokens(str(m.get("content") or ""))
+                            for m in group
+                        ),
+                        "messages_before": archived_between if compacted_ids else None,
+                    }
+                )
+                prev_boundary_id = group_max_id
+        except Exception:
+            events = []
+        try:
+            failure = db.get_compression_failure_cooldown(session_id)
+            if not isinstance(failure, dict):
+                failure = None
+        except Exception:
+            failure = None
+
+    comp = getattr(agent, "context_compressor", None)
+    try:
+        live_count = max(0, int(getattr(comp, "compression_count", 0) or 0))
+    except (TypeError, ValueError):
+        live_count = 0
+    count = max(live_count, len(events))
+
+    if count <= 0 and failure is None:
+        return None
+    result: Dict[str, Any] = {"count": count, "events": events}
+    if failure:
+        result["failure"] = {
+            "error": failure.get("error"),
+            "cooldown_until": failure.get("cooldown_until"),
+            "remaining_seconds": round(failure.get("remaining_seconds") or 0),
+        }
+    return result
 
 
 # ---------------------------------------------------------------------------
