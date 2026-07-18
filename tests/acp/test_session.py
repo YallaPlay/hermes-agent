@@ -984,6 +984,53 @@ class TestPersistence:
         ids = {s["session_id"] for s in listing}
         assert "child-empty" not in ids
 
+    def test_get_session_restores_subagent_child_from_db(self, manager):
+        """Loading a delegate child's session id restores its DB transcript.
+        Children write incrementally, so a mid-run load must surface the
+        flushed messages even though the child was never an ACP session."""
+        parent = manager.create_session(cwd="/work")
+        db = manager._get_db()
+        db.create_session(
+            "child-load-1", source="subagent",
+            parent_session_id=parent.session_id, model="test-model",
+            model_config={"_delegate_from": parent.session_id},
+        )
+        db.append_message("child-load-1", role="user", content="child goal")
+        db.append_message("child-load-1", role="assistant", content="progress so far")
+
+        state = manager.get_session("child-load-1")
+        assert state is not None
+        assert state.subagent is True
+        assert [m["content"] for m in state.history] == [
+            "child goal", "progress so far",
+        ]
+
+    def test_persist_is_noop_for_subagent_sessions(self, manager):
+        """ACP must never take write ownership of a delegate child's row:
+        persisting would clobber model_config (losing the _delegate_from
+        marker that keeps subagent rows out of general session lists) and
+        rewrite the transcript the child owns."""
+        parent = manager.create_session(cwd="/work")
+        db = manager._get_db()
+        db.create_session(
+            "child-persist-1", source="subagent",
+            parent_session_id=parent.session_id,
+            model_config={"_delegate_from": parent.session_id},
+        )
+        db.append_message("child-persist-1", role="user", content="child goal")
+
+        state = manager.get_session("child-persist-1")
+        assert state is not None
+        manager.save_session("child-persist-1")
+
+        row = db.get_session("child-persist-1")
+        meta = json.loads(row["model_config"])
+        assert meta.get("_delegate_from") == parent.session_id
+        assert row["source"] == "subagent"
+        # Transcript untouched.
+        messages = db.get_messages_as_conversation("child-persist-1")
+        assert [m["content"] for m in messages] == ["child goal"]
+
     def test_list_sessions_matches_windows_and_wsl_paths(self, manager):
         state = manager.create_session(cwd="/mnt/e/Projects/AI/browser-link-3")
         state.history.append({"role": "user", "content": "same project from WSL"})

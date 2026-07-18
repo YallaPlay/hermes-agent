@@ -275,6 +275,10 @@ class SessionState:
     # parent_session_id, which list_sessions_rich treats as subagent/compression
     # lineage and would hide the fork from session lists. Display-only.
     parent_id: Optional[str] = None
+    # True for delegate-child (source="subagent") sessions restored for
+    # observation. These are read-only from ACP's side: the delegate child
+    # owns the row and transcript, so _persist must never write them.
+    subagent: bool = False
     history: List[Dict[str, Any]] = field(default_factory=list)
     cancel_event: Any = None  # threading.Event
     is_running: bool = False
@@ -740,6 +744,11 @@ class SessionManager:
         Creates the session record if it doesn't exist, then replaces all
         stored messages with the current in-memory history.
         """
+        # Delegate children are observation-only: the child agent owns the
+        # row and flushes its own transcript. Persisting here would rewrite
+        # model_config (dropping the _delegate_from marker) and the messages.
+        if getattr(state, "subagent", False):
+            return
         db = self._get_db()
         if db is None:
             return
@@ -857,9 +866,15 @@ class SessionManager:
         if row is None:
             return None
 
-        # Only restore ACP sessions.
-        if row.get("source") != "acp":
+        # Restore ACP sessions, plus delegate children (source="subagent")
+        # for read-only observation — their transcript is flushed
+        # incrementally by the child agent, so a DB restore shows a live
+        # child's progress too. Anything else (cli/gateway/cron) stays
+        # non-loadable through ACP.
+        source = row.get("source")
+        if source not in ("acp", "subagent"):
             return None
+        is_subagent = source == "subagent"
 
         # Extract cwd from model_config.
         cwd = "."
@@ -916,7 +931,14 @@ class SessionManager:
             # Rehydrate the owner so forks of a restored session inherit it
             # (and a later _persist doesn't drop it).
             owner=str(row.get("user_id") or "").strip() or None,
-            parent_id=restored_parent_id or None,
+            # Delegate children link to their parent via the DB column (not
+            # the _forked_from marker forks use).
+            parent_id=(
+                (str(row.get("parent_session_id") or "").strip() or None)
+                if is_subagent
+                else (restored_parent_id or None)
+            ),
+            subagent=is_subagent,
             history=history,
             cancel_event=threading.Event(),
         )

@@ -918,6 +918,30 @@ class HermesACPAgent(acp.Agent):
                 "currentPromptText": state.current_prompt_text,
             }
 
+    def _subagent_load_meta(self, state: SessionState) -> dict:
+        """``_meta.hermes`` extras for loading a delegate child session.
+
+        Children are observation-only (isSubagent marks the composer
+        read-only client-side). A RUNNING child lives in the delegate tool's
+        active registry, not in ``SessionManager._sessions`` — so its
+        ``state.is_running`` is always False and liveness must come from
+        ``list_active_subagents()``.
+        """
+        if not getattr(state, "subagent", False):
+            return {}
+        meta: dict[str, Any] = {"isSubagent": True}
+        try:
+            from tools.delegate_tool import list_active_subagents
+
+            if any(
+                str(rec.get("child_session_id") or "") == state.session_id
+                for rec in list_active_subagents()
+            ):
+                meta["isRunning"] = True
+        except Exception:
+            logger.debug("Could not check live subagent registry", exc_info=True)
+        return meta
+
     async def _send_turn_status_update(self, state: SessionState, running: bool) -> None:
         """Notify the client that this session's turn started or ended.
 
@@ -1519,8 +1543,12 @@ class HermesACPAgent(acp.Agent):
                 ),
                 # Surface a running turn (owned by an earlier prompt() call)
                 # so an attaching client shows running/steer state instead of
-                # an idle composer — see _turn_status_meta.
-                self._turn_status_meta(state),
+                # an idle composer — see _turn_status_meta. Delegate children
+                # additionally carry isSubagent (read-only marker) and derive
+                # isRunning from the live subagent registry: a running child
+                # is never in SessionManager._sessions, so state.is_running
+                # can't know about it.
+                {**self._turn_status_meta(state), **self._subagent_load_meta(state)},
             ),
         )
 

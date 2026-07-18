@@ -408,6 +408,77 @@ class TestSessionOps:
         assert resp is None
 
     @pytest.mark.asyncio
+    async def test_load_session_replays_subagent_child_transcript(self, agent):
+        """Loading a delegate child's id streams its DB transcript and marks
+        the session read-only running/idle from the live subagent registry."""
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        new_resp = await agent.new_session(cwd="/tmp")
+        db = agent.session_manager._get_db()
+        db.create_session(
+            "child-replay-1", source="subagent",
+            parent_session_id=new_resp.session_id,
+        )
+        db.append_message("child-replay-1", role="user", content="child goal text")
+        db.append_message("child-replay-1", role="assistant", content="child progress")
+
+        resp = await agent.load_session(cwd="/tmp", session_id="child-replay-1")
+
+        assert resp is not None
+        # Transcript replayed on the child id.
+        replayed = [
+            call.kwargs.get("update") if "update" in call.kwargs else call.args[1]
+            for call in mock_conn.session_update.await_args_list
+            if (call.kwargs.get("session_id") or (call.args[0] if call.args else None))
+            == "child-replay-1"
+        ]
+        texts = [
+            u.content.text for u in replayed
+            if getattr(u, "session_update", None) in
+            ("user_message_chunk", "agent_message_chunk")
+        ]
+        assert any("child goal text" in t for t in texts)
+        assert any("child progress" in t for t in texts)
+        # Marked as a subagent session (read-only marker for clients); not
+        # running (no live registry entry for it).
+        hermes_meta = (resp.field_meta or {}).get("hermes", {})
+        assert hermes_meta.get("isSubagent") is True
+        assert not hermes_meta.get("isRunning")
+
+    @pytest.mark.asyncio
+    async def test_load_session_marks_running_subagent_child(self, agent):
+        """A child with a live entry in the subagent registry loads with
+        isRunning:true so the client shows the busy indicator."""
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        new_resp = await agent.new_session(cwd="/tmp")
+        db = agent.session_manager._get_db()
+        db.create_session(
+            "child-running-1", source="subagent",
+            parent_session_id=new_resp.session_id,
+        )
+        db.append_message("child-running-1", role="user", content="running child goal")
+
+        with patch(
+            "tools.delegate_tool.list_active_subagents",
+            return_value=[{
+                "subagent_id": "sub-x",
+                "child_session_id": "child-running-1",
+                "status": "running",
+            }],
+        ):
+            resp = await agent.load_session(cwd="/tmp", session_id="child-running-1")
+
+        assert resp is not None
+        hermes_meta = (resp.field_meta or {}).get("hermes", {})
+        assert hermes_meta.get("isSubagent") is True
+        assert hermes_meta.get("isRunning") is True
+
+    @pytest.mark.asyncio
     async def test_load_session_replays_persisted_history_to_client(self, agent):
         mock_conn = MagicMock(spec=acp.Client)
         mock_conn.session_update = AsyncMock()

@@ -1887,6 +1887,13 @@ def _run_single_child(
                 "parent_id": _parent_sid if isinstance(_parent_sid, str) else None,
                 "depth": _tui_depth,
                 "goal": goal,
+                # The child's own stored session id — lets session surfaces
+                # (ACP session/load) check whether a child id is live.
+                "child_session_id": (
+                    getattr(child, "session_id", None)
+                    if isinstance(getattr(child, "session_id", None), str)
+                    else None
+                ),
                 "model": (
                     getattr(child, "model", None)
                     if isinstance(getattr(child, "model", None), str)

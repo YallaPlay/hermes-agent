@@ -690,6 +690,42 @@ class TestDelegateObservability(unittest.TestCase):
             self.assertIn("result_bytes", entry["tool_trace"][0])
             self.assertEqual(entry["tool_trace"][0]["status"], "ok")
 
+    def test_registry_carries_child_session_id(self):
+        """Active-subagent records expose the child's session id so ACP
+        session/load can report a live child as running."""
+        from tools.delegate_tool import list_active_subagents
+
+        parent = _make_mock_parent(depth=0)
+
+        captured = {}
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_id = "child-sess-registry"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+
+            def _run(**kwargs):
+                # Snapshot the registry mid-run, while the child is active.
+                captured["records"] = list_active_subagents()
+                return {
+                    "final_response": "done",
+                    "completed": True,
+                    "interrupted": False,
+                    "api_calls": 1,
+                    "messages": [{"role": "assistant", "content": "done"}],
+                }
+
+            mock_child.run_conversation.side_effect = _run
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="Registry sid test", parent_agent=parent)
+
+        records = captured.get("records") or []
+        assert records, "expected an active subagent record mid-run"
+        assert records[0].get("child_session_id") == "child-sess-registry"
+
     def test_tool_trace_handles_list_content_blocks(self):
         """Tool-result content blocks should not crash observability metadata."""
         parent = _make_mock_parent(depth=0)
