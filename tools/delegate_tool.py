@@ -936,6 +936,15 @@ def _build_child_progress_callback(
             return
 
         if event == DelegateEvent.TASK_TOOL_COMPLETED:
+            # Relay so per-child transcript surfaces (ACP child sessions) can
+            # close the tool call; CLI/TUI/gateway handlers ignore unknown
+            # event types, so this is inert everywhere else.
+            _relay(
+                "subagent.tool_completed",
+                tool_name,
+                preview,
+                result=kwargs.get("result"),
+            )
             return
 
         if event == DelegateEvent.TASK_PROGRESS:

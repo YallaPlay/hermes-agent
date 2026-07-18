@@ -2378,6 +2378,29 @@ class TestDelegateEventEnum(unittest.TestCase):
         cb("tool.completed", tool_name="terminal")
         parent._delegate_spinner.print_above.assert_not_called()
 
+    def test_progress_callback_tool_completed_relays_to_parent(self):
+        """tool.completed relays as subagent.tool_completed with identity
+        kwargs and the result, so per-child transcript surfaces (ACP child
+        sessions) can close the tool call instead of spinning forever."""
+        parent = _make_mock_parent()
+        parent._delegate_spinner = None
+        parent.tool_progress_callback = MagicMock()
+
+        session_ref = {"session_id": "child-sess-1"}
+        cb = _build_child_progress_callback(
+            0, "test goal", parent, task_count=1,
+            subagent_id="sub-1", session_ref=session_ref,
+        )
+        cb("tool.completed", tool_name="terminal", preview="ls", result="file listing")
+
+        parent.tool_progress_callback.assert_called_once()
+        call = parent.tool_progress_callback.call_args
+        self.assertEqual(call.args[0], "subagent.tool_completed")
+        self.assertEqual(call.args[1], "terminal")
+        self.assertEqual(call.kwargs.get("result"), "file listing")
+        self.assertEqual(call.kwargs.get("subagent_id"), "sub-1")
+        self.assertEqual(call.kwargs.get("child_session_id"), "child-sess-1")
+
     def test_progress_callback_ignores_unknown_events(self):
         """Unknown event types are silently ignored."""
         parent = _make_mock_parent()
