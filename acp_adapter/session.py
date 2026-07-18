@@ -612,6 +612,60 @@ class SessionManager:
             })
 
         results.sort(key=lambda item: _updated_at_sort_key(item.get("updated_at")), reverse=True)
+
+        # Surface delegate children (source="subagent") of visible ACP
+        # sessions so clients can nest live/completed subagent transcripts
+        # under their parent. Children of non-ACP parents (CLI/cron
+        # delegations) are excluded — their parents aren't in this list, so
+        # the rows would render as orphans. include_children=True is required
+        # to defeat list_sessions_rich's default child/delegate filtering.
+        if db is not None and not archived_only:
+            acp_ids = {item["session_id"] for item in results}
+            try:
+                subagent_rows = db.list_sessions_rich(
+                    source="subagent",
+                    limit=1000,
+                    include_children=True,
+                    include_archived=include_archived,
+                    min_message_count=1,
+                )
+            except Exception:
+                subagent_rows = []
+                logger.debug("Failed to load subagent sessions from DB", exc_info=True)
+            children = []
+            for row in subagent_rows:
+                parent_sid = str(row.get("parent_session_id") or "")
+                if parent_sid not in acp_ids:
+                    continue
+                sid = str(row["id"])
+                if sid in acp_ids:
+                    continue
+                children.append({
+                    "session_id": sid,
+                    # Children run in their own terminal-session dirs; they
+                    # inherit list visibility via the parent, not their own
+                    # cwd, so no cwd filter applies here.
+                    "cwd": row.get("cwd") or ".",
+                    "model": row.get("model") or "",
+                    "history_len": int(row.get("message_count") or 0),
+                    "user_id": row.get("user_id") or "",
+                    "title": _build_session_title(
+                        row.get("title"), row.get("preview"), row.get("cwd") or "."
+                    ),
+                    "updated_at": _format_updated_at(
+                        row.get("last_active") or row.get("started_at")
+                    ),
+                    "archived": bool(row.get("archived")),
+                    "parent_id": parent_sid,
+                    "subagent": True,
+                    "slack": False,
+                })
+            if children:
+                results.extend(children)
+                results.sort(
+                    key=lambda item: _updated_at_sort_key(item.get("updated_at")),
+                    reverse=True,
+                )
         return results
 
     def update_cwd(self, session_id: str, cwd: str) -> Optional[SessionState]:

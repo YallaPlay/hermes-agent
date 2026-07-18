@@ -915,6 +915,75 @@ class TestPersistence:
         assert keep.session_id in ids
         assert drop.session_id not in ids
 
+    def test_list_sessions_includes_subagent_children_of_acp_parents(self, manager):
+        """Delegate children (source='subagent', parent_session_id set) of a
+        visible ACP session are listed with parent linkage; subagents of
+        non-ACP parents (CLI/cron delegations) stay hidden."""
+        parent = manager.create_session(cwd="/work")
+        parent.history.append({"role": "user", "content": "delegate something"})
+        manager.save_session(parent.session_id)
+
+        db = manager._get_db()
+        # Child of the visible ACP parent.
+        db.create_session(
+            "child-sub-1", source="subagent",
+            parent_session_id=parent.session_id,
+            model="test-model",
+        )
+        db.append_message("child-sub-1", role="user", content="child goal here")
+        db.append_message("child-sub-1", role="assistant", content="working")
+        # Orphan subagent: parent is not an ACP session.
+        db.create_session("cli-parent", source="cli")
+        db.append_message("cli-parent", role="user", content="cli work")
+        db.create_session(
+            "orphan-sub", source="subagent", parent_session_id="cli-parent",
+        )
+        db.append_message("orphan-sub", role="user", content="orphan goal")
+
+        listing = manager.list_sessions()
+        by_id = {s["session_id"]: s for s in listing}
+
+        assert "child-sub-1" in by_id
+        child = by_id["child-sub-1"]
+        assert child["parent_id"] == parent.session_id
+        assert child.get("subagent") is True
+        assert "orphan-sub" not in by_id
+        assert "cli-parent" not in by_id
+
+    def test_list_sessions_subagent_children_respect_archived_only(self, manager):
+        """archived_only listings don't surface live subagent children."""
+        parent = manager.create_session(cwd="/work")
+        parent.history.append({"role": "user", "content": "delegate"})
+        manager.save_session(parent.session_id)
+
+        db = manager._get_db()
+        db.create_session(
+            "child-sub-2", source="subagent",
+            parent_session_id=parent.session_id,
+        )
+        db.append_message("child-sub-2", role="user", content="child goal")
+
+        listing = manager.list_sessions(archived_only=True)
+        ids = {s["session_id"] for s in listing}
+        assert "child-sub-2" not in ids
+
+    def test_list_sessions_hides_empty_subagent_children(self, manager):
+        """A subagent row with no flushed messages yet stays hidden (same
+        message_count guard as ordinary DB-only rows)."""
+        parent = manager.create_session(cwd="/work")
+        parent.history.append({"role": "user", "content": "delegate"})
+        manager.save_session(parent.session_id)
+
+        db = manager._get_db()
+        db.create_session(
+            "child-empty", source="subagent",
+            parent_session_id=parent.session_id,
+        )
+
+        listing = manager.list_sessions()
+        ids = {s["session_id"] for s in listing}
+        assert "child-empty" not in ids
+
     def test_list_sessions_matches_windows_and_wsl_paths(self, manager):
         state = manager.create_session(cwd="/mnt/e/Projects/AI/browser-link-3")
         state.history.append({"role": "user", "content": "same project from WSL"})

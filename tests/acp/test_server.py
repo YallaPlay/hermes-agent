@@ -1776,6 +1776,26 @@ class TestListAndFork:
         assert root.field_meta is None
 
     @pytest.mark.asyncio
+    async def test_list_sessions_stamps_subagent_meta(self, agent):
+        """Delegate children carry isSubagent + parent linkage so clients can
+        nest them and render the read-only composer."""
+        with patch.object(
+            agent.session_manager, "list_sessions",
+            return_value=[
+                {"session_id": "child1", "cwd": "/tmp", "title": "Child goal",
+                 "updated_at": 2.0, "parent_id": "parent1", "subagent": True},
+                {"session_id": "parent1", "cwd": "/tmp", "title": "Parent",
+                 "updated_at": 1.0, "parent_id": None},
+            ],
+        ):
+            resp = await agent.list_sessions(cwd="/tmp")
+        child, parent = resp.sessions
+        child_meta = (child.field_meta or {}).get("hermes", {})
+        assert child_meta.get("isSubagent") is True
+        assert child_meta.get("forkedFrom") == "parent1"
+        assert parent.field_meta is None
+
+    @pytest.mark.asyncio
     async def test_list_sessions_stamps_owner_meta(self, agent):
         with patch.object(
             agent.session_manager, "list_sessions",
