@@ -16,6 +16,7 @@ from acp_adapter.events import (
     _send_update,
     make_message_cb,
     make_step_cb,
+    make_subagent_update_router,
     make_thinking_cb,
     make_tool_progress_cb,
 )
@@ -467,6 +468,190 @@ class TestMessageCallback:
             cb("")
 
         mock_rcts.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Subagent update router
+# ---------------------------------------------------------------------------
+
+
+class TestSubagentUpdateRouter:
+    def _make_router(self, mock_conn, loop):
+        return make_subagent_update_router(mock_conn, loop)
+
+    def test_full_lifecycle_routes_updates_to_child_session(self, mock_conn, event_loop_fixture):
+        """start → tool → tool_completed → complete emit updates on the CHILD id."""
+        router = self._make_router(mock_conn, event_loop_fixture)
+
+        with patch("acp_adapter.events._send_update") as mock_send:
+            router("subagent.start", None, "summarize README",
+                   child_session_id="child-1", goal="summarize README")
+            router("subagent.tool", "terminal", "$ ls", {"command": "ls"},
+                   child_session_id="child-1")
+            router("subagent.tool_completed", "terminal", None,
+                   child_session_id="child-1", result="ok")
+            router("subagent.complete", None, "done", child_session_id="child-1")
+
+        session_ids = [call.args[1] for call in mock_send.call_args_list]
+        assert set(session_ids) == {"child-1"}
+        updates = [call.args[3] for call in mock_send.call_args_list]
+        kinds = [getattr(u, "session_update", None) for u in updates]
+        assert kinds == [
+            "session_info_update",  # start → isRunning true
+            "tool_call",            # tool start
+            "tool_call_update",     # tool complete
+            "session_info_update",  # complete → isRunning false
+        ]
+        start_info = updates[0]
+        assert start_info.field_meta["hermes"]["isRunning"] is True
+        assert start_info.field_meta["hermes"]["currentPromptText"] == "summarize README"
+        end_info = updates[-1]
+        assert end_info.field_meta["hermes"]["isRunning"] is False
+
+    def test_fifo_for_duplicate_tool_names(self, mock_conn, event_loop_fixture):
+        """Two same-name tools complete in FIFO order against the right ids."""
+        router = self._make_router(mock_conn, event_loop_fixture)
+
+        with patch("acp_adapter.events._send_update") as mock_send, \
+             patch("acp_adapter.events.build_tool_complete") as mock_btc:
+            router("subagent.tool", "terminal", "$ ls", {"command": "ls"},
+                   child_session_id="child-1")
+            router("subagent.tool", "terminal", "$ pwd", {"command": "pwd"},
+                   child_session_id="child-1")
+            starts = [
+                call.args[3] for call in mock_send.call_args_list
+                if getattr(call.args[3], "session_update", None) == "tool_call"
+            ]
+            first_id = starts[0].tool_call_id
+            second_id = starts[1].tool_call_id
+
+            router("subagent.tool_completed", "terminal", None,
+                   child_session_id="child-1", result="one")
+            router("subagent.tool_completed", "terminal", None,
+                   child_session_id="child-1", result="two")
+
+        completed_ids = [call.args[0] for call in mock_btc.call_args_list]
+        assert completed_ids == [first_id, second_id]
+        assert mock_btc.call_args_list[0].kwargs["result"] == "one"
+        assert mock_btc.call_args_list[1].kwargs["result"] == "two"
+
+    def test_events_without_child_session_id_dropped(self, mock_conn, event_loop_fixture):
+        router = self._make_router(mock_conn, event_loop_fixture)
+
+        with patch("acp_adapter.events._send_update") as mock_send:
+            router("subagent.start", None, "goal text")
+            router("subagent.tool", "terminal", "$ ls", {"command": "ls"})
+
+        mock_send.assert_not_called()
+
+    def test_thinking_and_text_mapping(self, mock_conn, event_loop_fixture):
+        router = self._make_router(mock_conn, event_loop_fixture)
+
+        with patch("acp_adapter.events._send_update") as mock_send:
+            router("subagent.thinking", None, "pondering...", child_session_id="child-1")
+            router("subagent.text", None, "answer chunk", child_session_id="child-1")
+
+        updates = [call.args[3] for call in mock_send.call_args_list]
+        kinds = [getattr(u, "session_update", None) for u in updates]
+        # First routed event lazily synthesizes the isRunning:true info update.
+        assert kinds == [
+            "session_info_update",
+            "agent_thought_chunk",
+            "agent_message_chunk",
+        ]
+        assert updates[1].content.text == "pondering..."
+        assert updates[2].content.text == "answer chunk"
+
+    def test_progress_events_dropped(self, mock_conn, event_loop_fixture):
+        router = self._make_router(mock_conn, event_loop_fixture)
+
+        with patch("acp_adapter.events._send_update") as mock_send:
+            router("subagent.start", None, "goal", child_session_id="child-1")
+            mock_send.reset_mock()
+            router("subagent.progress", None, "🔀 terminal, file", child_session_id="child-1")
+
+        mock_send.assert_not_called()
+
+    def test_complete_flushes_dangling_tool_ids(self, mock_conn, event_loop_fixture):
+        """subagent.complete closes tool calls that never got a completion."""
+        router = self._make_router(mock_conn, event_loop_fixture)
+
+        with patch("acp_adapter.events._send_update") as mock_send:
+            router("subagent.tool", "terminal", "$ sleep", {"command": "sleep"},
+                   child_session_id="child-1")
+            router("subagent.complete", None, "done", child_session_id="child-1")
+
+        updates = [call.args[3] for call in mock_send.call_args_list]
+        kinds = [getattr(u, "session_update", None) for u in updates]
+        # lazy isRunning:true, tool start, flushed completion, isRunning:false
+        assert kinds == [
+            "session_info_update",
+            "tool_call",
+            "tool_call_update",
+            "session_info_update",
+        ]
+
+    def test_lazy_running_synthesis_when_start_missed(self, mock_conn, event_loop_fixture):
+        """The first routed event synthesizes isRunning:true when start raced
+        the session_ref fill and was dropped."""
+        router = self._make_router(mock_conn, event_loop_fixture)
+
+        with patch("acp_adapter.events._send_update") as mock_send:
+            router("subagent.tool", "terminal", "$ ls", {"command": "ls"},
+                   child_session_id="child-1")
+
+        updates = [call.args[3] for call in mock_send.call_args_list]
+        kinds = [getattr(u, "session_update", None) for u in updates]
+        assert kinds == ["session_info_update", "tool_call"]
+        assert updates[0].field_meta["hermes"]["isRunning"] is True
+
+    def test_independent_state_per_child(self, mock_conn, event_loop_fixture):
+        """FIFO queues are keyed by child id — batch children don't cross-pop."""
+        router = self._make_router(mock_conn, event_loop_fixture)
+
+        with patch("acp_adapter.events._send_update") as mock_send, \
+             patch("acp_adapter.events.build_tool_complete") as mock_btc:
+            router("subagent.tool", "terminal", "$ a", {"command": "a"},
+                   child_session_id="child-1")
+            router("subagent.tool", "terminal", "$ b", {"command": "b"},
+                   child_session_id="child-2")
+            starts = {
+                call.args[1]: call.args[3].tool_call_id
+                for call in mock_send.call_args_list
+                if getattr(call.args[3], "session_update", None) == "tool_call"
+            }
+            router("subagent.tool_completed", "terminal", None,
+                   child_session_id="child-2", result="b-done")
+
+        assert mock_btc.call_count == 1
+        assert mock_btc.call_args.args[0] == starts["child-2"]
+
+    def test_tool_progress_cb_hands_off_subagent_events(self, mock_conn, event_loop_fixture):
+        """make_tool_progress_cb routes subagent.* events with child_session_id
+        to the router instead of dropping them."""
+        router_calls = []
+
+        def fake_router(event_type, name=None, preview=None, args=None, **kwargs):
+            router_calls.append((event_type, kwargs.get("child_session_id")))
+
+        cb = make_tool_progress_cb(
+            mock_conn, "parent-1", event_loop_fixture, {}, {},
+            subagent_router=fake_router,
+        )
+
+        with patch("acp_adapter.events._send_update") as mock_send:
+            cb("subagent.start", None, "goal", None, child_session_id="child-1")
+            cb("subagent.tool", "terminal", "$ ls", {"command": "ls"},
+               child_session_id="child-1")
+            # No child id yet (pre session_ref fill) — dropped, not routed.
+            cb("subagent.start", None, "goal", None)
+
+        assert router_calls == [
+            ("subagent.start", "child-1"),
+            ("subagent.tool", "child-1"),
+        ]
+        # Nothing emitted on the PARENT session for subagent.* events.
+        mock_send.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

@@ -108,6 +108,131 @@ def _send_update(
 
 
 # ------------------------------------------------------------------
+# Subagent update router
+# ------------------------------------------------------------------
+
+def make_subagent_update_router(
+    conn: acp.Client,
+    loop: asyncio.AbstractEventLoop,
+) -> Callable:
+    """Route relayed ``subagent.*`` delegate events to their CHILD session.
+
+    Delegated children persist as real sessions and every relayed event
+    carries ``child_session_id``; re-emitting them as ACP ``session/update``
+    frames addressed to that id gives clients a live per-child transcript.
+    Per-child FIFO tool-id state mirrors the parent's ``tool_call_ids``
+    discipline. Events without a ``child_session_id`` (possible only for the
+    very first ``subagent.start``, which can race the session_ref fill) are
+    dropped; the first routed event per child lazily synthesizes the
+    ``isRunning: true`` info update so the miss is invisible.
+
+    Call ``router.finalize()`` at parent turn end to close dangling tool
+    calls and flip ``isRunning`` off for children that never completed
+    (crash/interrupt paths).
+    """
+    from acp.schema import SessionInfoUpdate
+
+    tool_ids: Dict[str, Dict[str, Deque[str]]] = {}
+    running: Dict[str, bool] = {}
+
+    def _send_running(child_id: str, is_running: bool, prompt_text: str | None = None) -> None:
+        hermes_meta: Dict[str, Any] = {"isRunning": is_running}
+        if prompt_text:
+            hermes_meta["currentPromptText"] = prompt_text
+        update = SessionInfoUpdate(
+            session_update="session_info_update",
+            field_meta={"hermes": hermes_meta},
+        )
+        _send_update(conn, child_id, loop, update)
+        running[child_id] = is_running
+
+    def _flush_dangling(child_id: str) -> None:
+        for name, queue in tool_ids.get(child_id, {}).items():
+            while queue:
+                tc_id = queue.popleft()
+                _send_update(
+                    conn, child_id, loop, build_tool_complete(tc_id, name)
+                )
+        tool_ids.pop(child_id, None)
+
+    def _router(event_type: str, name: str = None, preview: str = None, args: Any = None, **kwargs) -> None:
+        child_id = kwargs.get("child_session_id")
+        if not child_id:
+            return
+        child_id = str(child_id)
+
+        if event_type == "subagent.progress":
+            # Batched summary — redundant once per-tool frames stream.
+            return
+
+        if not running.get(child_id) and event_type != "subagent.complete":
+            _send_running(
+                child_id, True, str(kwargs.get("goal") or preview or "") or None
+            )
+            if event_type == "subagent.start":
+                return
+
+        if event_type == "subagent.start":
+            return
+
+        if event_type == "subagent.tool":
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except (json.JSONDecodeError, TypeError):
+                    args = {"raw": args}
+            if not isinstance(args, dict):
+                args = {}
+            tc_id = make_tool_call_id()
+            queues = tool_ids.setdefault(child_id, {})
+            queues.setdefault(name or "", deque()).append(tc_id)
+            _send_update(conn, child_id, loop, build_tool_start(tc_id, name, args))
+            return
+
+        if event_type == "subagent.tool_completed":
+            queue = tool_ids.get(child_id, {}).get(name or "")
+            if not queue:
+                return
+            tc_id = queue.popleft()
+            result = kwargs.get("result")
+            _send_update(
+                conn,
+                child_id,
+                loop,
+                build_tool_complete(
+                    tc_id, name, result=str(result) if result is not None else None
+                ),
+            )
+            return
+
+        if event_type == "subagent.thinking":
+            if preview:
+                _send_update(conn, child_id, loop, acp.update_agent_thought_text(preview))
+            return
+
+        if event_type == "subagent.text":
+            if preview:
+                _send_update(conn, child_id, loop, acp.update_agent_message_text(preview))
+            return
+
+        if event_type == "subagent.complete":
+            _flush_dangling(child_id)
+            _send_running(child_id, False)
+            return
+
+    def _finalize() -> None:
+        """Close dangling child tool calls and running flags at turn end."""
+        for child_id in list(tool_ids):
+            _flush_dangling(child_id)
+        for child_id, is_running in list(running.items()):
+            if is_running:
+                _send_running(child_id, False)
+
+    _router.finalize = _finalize
+    return _router
+
+
+# ------------------------------------------------------------------
 # Tool progress callback
 # ------------------------------------------------------------------
 
@@ -118,6 +243,7 @@ def make_tool_progress_cb(
     tool_call_ids: Dict[str, Deque[str]],
     tool_call_meta: Dict[str, Dict[str, Any]],
     edit_approval_policy_getter: Callable[[], tuple[str, str | None]] | None = None,
+    subagent_router: Callable | None = None,
 ) -> Callable:
     """Create a ``tool_progress_callback`` for AIAgent.
 
@@ -132,6 +258,13 @@ def make_tool_progress_cb(
     """
 
     def _tool_progress(event_type: str, name: str = None, preview: str = None, args: Any = None, **kwargs) -> None:
+        # Relayed delegate-child events route to the CHILD session's own
+        # transcript; they are never parent tool calls. Events that predate
+        # the child's session_ref fill carry no child_session_id and drop.
+        if event_type.startswith("subagent."):
+            if subagent_router is not None and kwargs.get("child_session_id"):
+                subagent_router(event_type, name, preview, args, **kwargs)
+            return
         # A completed ``todo`` carries the authoritative task list in its result.
         # Emit the native ACP plan update here, on the live completion event, so
         # the turn's FINAL todo is reflected too. The step callback only observes
