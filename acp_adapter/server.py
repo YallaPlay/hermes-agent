@@ -130,6 +130,7 @@ _provider_catalogs_cache: tuple[float, list[tuple[str, str, list[tuple[str, str]
 
 def _authenticated_provider_catalogs(
     current_provider: str,
+    force_refresh: bool = False,
 ) -> list[tuple[str, str, list[tuple[str, str]]]]:
     """Return ``(provider_id, label, [(model_id, description), ...])`` per provider.
 
@@ -137,12 +138,18 @@ def _authenticated_provider_catalogs(
     are included. The current provider's catalog is moved to the front so the
     selector's first entries match the session's own provider. Results are
     cached for a few minutes because live catalog fetches are slow.
+    ``force_refresh`` bypasses the cache (and repopulates it) so newly added
+    credentials show up without waiting out the TTL.
     """
     global _provider_catalogs_cache
     import time as _time
 
     now = _time.monotonic()
-    if _provider_catalogs_cache and now - _provider_catalogs_cache[0] < _PROVIDER_CATALOGS_TTL_SECONDS:
+    if (
+        not force_refresh
+        and _provider_catalogs_cache
+        and now - _provider_catalogs_cache[0] < _PROVIDER_CATALOGS_TTL_SECONDS
+    ):
         catalogs = _provider_catalogs_cache[1]
     else:
         from hermes_cli.models import (
@@ -707,14 +714,17 @@ class HermesACPAgent(acp.Agent):
             return raw_model
         return f"{raw_provider}:{raw_model}"
 
-    def _build_model_state(self, state: SessionState) -> SessionModelState | None:
+    def _build_model_state(
+        self, state: SessionState, force_refresh: bool = False
+    ) -> SessionModelState | None:
         """Return the ACP model selector payload for editors like Zed.
 
         Lists models from EVERY authenticated provider (not just the current
         one) so clients can switch cross-provider — ``set_model`` already
         resolves ``provider:model`` ids via ``parse_model_input``. The current
         provider's catalog is listed first; providers with no addressable
-        models are skipped.
+        models are skipped. ``force_refresh`` bypasses the catalog cache so a
+        just-authenticated provider appears without waiting out the TTL.
         """
         model = str(state.model or getattr(state.agent, "model", "") or "").strip()
         provider = getattr(state.agent, "provider", None) or detect_provider() or "openrouter"
@@ -726,7 +736,9 @@ class HermesACPAgent(acp.Agent):
             available_models: list[ModelInfo] = []
             seen_ids: set[str] = set()
 
-            for prov, prov_name, catalog in _authenticated_provider_catalogs(normalized_provider):
+            for prov, prov_name, catalog in _authenticated_provider_catalogs(
+                normalized_provider, force_refresh=force_refresh
+            ):
                 for model_id, description in catalog:
                     rendered_model = str(model_id or "").strip()
                     if not rendered_model:
@@ -1757,6 +1769,43 @@ class HermesACPAgent(acp.Agent):
                         for w in snapshot.windows
                     ],
                     "details": list(snapshot.details),
+                },
+            }
+        if method == "refreshModels":
+            # Rebuild the cross-provider model catalog, bypassing the TTL
+            # cache, and return a fresh model-selector payload. Lets clients
+            # pull the live list when the user opens the model dropdown, so a
+            # provider authenticated after session creation (e.g. `hermes auth
+            # add openai-codex`) shows up without a window reload. The rebuild
+            # hits every authenticated provider's /models endpoint (slow,
+            # blocking), so it runs off the event loop.
+            session_id = params.get("sessionId")
+            if not session_id:
+                return {"ok": False, "error": "sessionId required"}
+            state = self.session_manager.get_session(session_id)
+            if state is None:
+                return {"ok": False, "error": "session not loaded"}
+            try:
+                model_state = await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: self._build_model_state(state, force_refresh=True)
+                )
+            except Exception as exc:  # catalog failure must not kill the RPC
+                logger.debug("refreshModels failed", exc_info=True)
+                return {"ok": False, "error": str(exc)}
+            if model_state is None:
+                return {"ok": True, "models": None}
+            return {
+                "ok": True,
+                "models": {
+                    "currentModelId": model_state.current_model_id,
+                    "availableModels": [
+                        {
+                            "modelId": m.model_id,
+                            "name": m.name,
+                            "description": m.description,
+                        }
+                        for m in model_state.available_models
+                    ],
                 },
             }
         raise RequestError.method_not_found(f"_{method}")

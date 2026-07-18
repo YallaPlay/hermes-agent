@@ -1521,6 +1521,72 @@ class TestListAndFork:
         mock_emit.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_ext_method_refresh_models_returns_fresh_payload(self, agent):
+        from acp.schema import ModelInfo as AcpModelInfo, SessionModelState
+
+        fresh = SessionModelState(
+            available_models=[
+                AcpModelInfo(
+                    model_id="openai-codex:gpt-5.6-sol",
+                    name="gpt-5.6-sol",
+                    description="Provider: OpenAI Codex",
+                )
+            ],
+            current_model_id="bedrock:global.anthropic.claude-fable-5",
+        )
+        state = SimpleNamespace(agent=MagicMock(), model="global.anthropic.claude-fable-5")
+        with patch.object(
+            agent.session_manager, "get_session", return_value=state
+        ) as mock_get, patch.object(
+            agent, "_build_model_state", return_value=fresh
+        ) as mock_build:
+            result = await agent.ext_method("refreshModels", {"sessionId": "s1"})
+        assert result["ok"] is True
+        assert result["models"]["currentModelId"] == "bedrock:global.anthropic.claude-fable-5"
+        assert result["models"]["availableModels"] == [
+            {
+                "modelId": "openai-codex:gpt-5.6-sol",
+                "name": "gpt-5.6-sol",
+                "description": "Provider: OpenAI Codex",
+            }
+        ]
+        mock_get.assert_called_once_with("s1")
+        mock_build.assert_called_once_with(state, force_refresh=True)
+
+    @pytest.mark.asyncio
+    async def test_ext_method_refresh_models_unknown_session(self, agent):
+        with patch.object(agent.session_manager, "get_session", return_value=None):
+            result = await agent.ext_method("refreshModels", {"sessionId": "nope"})
+        assert result["ok"] is False
+        assert "not loaded" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_ext_method_refresh_models_requires_session_id(self, agent):
+        result = await agent.ext_method("refreshModels", {})
+        assert result["ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_ext_method_refresh_models_none_state_is_ok_null(self, agent):
+        state = SimpleNamespace(agent=MagicMock(), model="")
+        with patch.object(
+            agent.session_manager, "get_session", return_value=state
+        ), patch.object(agent, "_build_model_state", return_value=None):
+            result = await agent.ext_method("refreshModels", {"sessionId": "s1"})
+        assert result == {"ok": True, "models": None}
+
+    @pytest.mark.asyncio
+    async def test_ext_method_refresh_models_build_failure_returns_error(self, agent):
+        state = SimpleNamespace(agent=MagicMock(), model="")
+        with patch.object(
+            agent.session_manager, "get_session", return_value=state
+        ), patch.object(
+            agent, "_build_model_state", side_effect=RuntimeError("catalog exploded")
+        ):
+            result = await agent.ext_method("refreshModels", {"sessionId": "s1"})
+        assert result["ok"] is False
+        assert "catalog exploded" in result["error"]
+
+    @pytest.mark.asyncio
     async def test_ext_method_unknown_raises_method_not_found(self, agent):
         from acp import RequestError
         with pytest.raises(RequestError):
