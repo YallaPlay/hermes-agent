@@ -70,6 +70,7 @@ from acp_adapter.events import (
     _build_plan_update_from_todo_result,
     make_message_cb,
     make_step_cb,
+    make_subagent_update_router,
     make_thinking_cb,
     make_tool_progress_cb,
 )
@@ -2140,6 +2141,7 @@ class HermesACPAgent(acp.Agent):
         streamed_message = False
 
         if conn:
+            subagent_router = make_subagent_update_router(conn, loop)
             tool_progress_cb = make_tool_progress_cb(
                 conn,
                 session_id,
@@ -2147,6 +2149,7 @@ class HermesACPAgent(acp.Agent):
                 tool_call_ids,
                 tool_call_meta,
                 edit_approval_policy_getter=lambda: self._edit_approval_policy_for_state(state),
+                subagent_router=subagent_router,
             )
             reasoning_cb = make_thinking_cb(conn, session_id, loop)
             step_cb = make_step_cb(conn, session_id, loop, tool_call_ids, tool_call_meta)
@@ -2171,6 +2174,7 @@ class HermesACPAgent(acp.Agent):
             except Exception:
                 logger.debug("Could not create ACP edit approval requester", exc_info=True)
         else:
+            subagent_router = None
             tool_progress_cb = None
             reasoning_cb = None
             step_cb = None
@@ -2296,6 +2300,19 @@ class HermesACPAgent(acp.Agent):
                 logger.exception("Agent error in session %s", session_id)
                 return {"final_response": f"Error: {e}", "messages": state.history}
             finally:
+                # Close any dangling child-session frames (un-popped tool
+                # calls, stuck isRunning) from delegate children that crashed
+                # or were interrupted before their subagent.complete. Runs in
+                # the executor thread on purpose: the router's sends hop onto
+                # the server loop threadsafe and BLOCK on the result, which
+                # would deadlock if called from the loop thread itself.
+                if subagent_router is not None:
+                    try:
+                        subagent_router.finalize()
+                    except Exception:
+                        logger.debug(
+                            "Could not finalize subagent session frames", exc_info=True
+                        )
                 # Restore the interactive contextvar for this context.
                 if interactive_token is not None:
                     reset_hermes_interactive_context(interactive_token)

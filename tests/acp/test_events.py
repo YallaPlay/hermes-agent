@@ -653,6 +653,73 @@ class TestSubagentUpdateRouter:
         # Nothing emitted on the PARENT session for subagent.* events.
         mock_send.assert_not_called()
 
+    def test_router_safe_from_worker_thread(self, mock_conn):
+        """Delegate children run in worker threads; frames must arrive on the
+        server loop via the threadsafe scheduling path."""
+        import threading
+
+        loop = asyncio.new_event_loop()
+        loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
+        loop_thread.start()
+        try:
+            router = make_subagent_update_router(mock_conn, loop)
+
+            def _fire():
+                router("subagent.tool", "terminal", "$ ls", {"command": "ls"},
+                       child_session_id="child-1")
+                router("subagent.tool_completed", "terminal", None,
+                       child_session_id="child-1", result="ok")
+
+            worker = threading.Thread(target=_fire)
+            worker.start()
+            worker.join(timeout=10)
+            assert not worker.is_alive()
+
+            # info update (lazy running) + tool start + tool complete
+            assert mock_conn.session_update.await_count == 3
+            session_ids = {
+                call.args[0] for call in mock_conn.session_update.await_args_list
+            }
+            assert session_ids == {"child-1"}
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            loop_thread.join(timeout=5)
+            loop.close()
+
+    def test_finalize_closes_dangling_state(self, mock_conn, event_loop_fixture):
+        """finalize() completes un-popped tool ids and flips isRunning off for
+        children whose subagent.complete never arrived (crash/interrupt)."""
+        router = self._make_router(mock_conn, event_loop_fixture)
+
+        with patch("acp_adapter.events._send_update") as mock_send:
+            router("subagent.tool", "terminal", "$ sleep", {"command": "sleep"},
+                   child_session_id="child-1")
+            mock_send.reset_mock()
+            router.finalize()
+
+        updates = [(call.args[1], call.args[3]) for call in mock_send.call_args_list]
+        kinds = [(sid, getattr(u, "session_update", None)) for sid, u in updates]
+        assert kinds == [
+            ("child-1", "tool_call_update"),
+            ("child-1", "session_info_update"),
+        ]
+        info = updates[-1][1]
+        assert info.field_meta["hermes"]["isRunning"] is False
+
+    def test_finalize_noop_after_clean_completion(self, mock_conn, event_loop_fixture):
+        router = self._make_router(mock_conn, event_loop_fixture)
+
+        with patch("acp_adapter.events._send_update") as mock_send:
+            router("subagent.tool", "terminal", "$ ls", {"command": "ls"},
+                   child_session_id="child-1")
+            router("subagent.tool_completed", "terminal", None,
+                   child_session_id="child-1", result="ok")
+            router("subagent.complete", None, "done", child_session_id="child-1")
+            mock_send.reset_mock()
+            router.finalize()
+
+        mock_send.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # Scheduler-failure regression

@@ -111,10 +111,7 @@ def _send_update(
 # Subagent update router
 # ------------------------------------------------------------------
 
-def make_subagent_update_router(
-    conn: acp.Client,
-    loop: asyncio.AbstractEventLoop,
-) -> Callable:
+class SubagentUpdateRouter:
     """Route relayed ``subagent.*`` delegate events to their CHILD session.
 
     Delegated children persist as real sessions and every relayed event
@@ -126,16 +123,23 @@ def make_subagent_update_router(
     dropped; the first routed event per child lazily synthesizes the
     ``isRunning: true`` info update so the miss is invisible.
 
-    Call ``router.finalize()`` at parent turn end to close dangling tool
-    calls and flip ``isRunning`` off for children that never completed
-    (crash/interrupt paths).
+    Call :meth:`finalize` at parent turn end to close dangling tool calls
+    and flip ``isRunning`` off for children that never completed
+    (crash/interrupt paths). Instances are per-turn: state dies with the
+    prompt's closure, so a new turn starts clean.
     """
-    from acp.schema import SessionInfoUpdate
 
-    tool_ids: Dict[str, Dict[str, Deque[str]]] = {}
-    running: Dict[str, bool] = {}
+    def __init__(self, conn: acp.Client, loop: asyncio.AbstractEventLoop) -> None:
+        self._conn = conn
+        self._loop = loop
+        self._tool_ids: Dict[str, Dict[str, Deque[str]]] = {}
+        self._running: Dict[str, bool] = {}
 
-    def _send_running(child_id: str, is_running: bool, prompt_text: str | None = None) -> None:
+    def _send_running(
+        self, child_id: str, is_running: bool, prompt_text: str | None = None
+    ) -> None:
+        from acp.schema import SessionInfoUpdate
+
         hermes_meta: Dict[str, Any] = {"isRunning": is_running}
         if prompt_text:
             hermes_meta["currentPromptText"] = prompt_text
@@ -143,19 +147,26 @@ def make_subagent_update_router(
             session_update="session_info_update",
             field_meta={"hermes": hermes_meta},
         )
-        _send_update(conn, child_id, loop, update)
-        running[child_id] = is_running
+        _send_update(self._conn, child_id, self._loop, update)
+        self._running[child_id] = is_running
 
-    def _flush_dangling(child_id: str) -> None:
-        for name, queue in tool_ids.get(child_id, {}).items():
+    def _flush_dangling(self, child_id: str) -> None:
+        for name, queue in self._tool_ids.get(child_id, {}).items():
             while queue:
                 tc_id = queue.popleft()
                 _send_update(
-                    conn, child_id, loop, build_tool_complete(tc_id, name)
+                    self._conn, child_id, self._loop, build_tool_complete(tc_id, name)
                 )
-        tool_ids.pop(child_id, None)
+        self._tool_ids.pop(child_id, None)
 
-    def _router(event_type: str, name: str = None, preview: str = None, args: Any = None, **kwargs) -> None:
+    def __call__(
+        self,
+        event_type: str,
+        name: str = None,
+        preview: str = None,
+        args: Any = None,
+        **kwargs,
+    ) -> None:
         child_id = kwargs.get("child_session_id")
         if not child_id:
             return
@@ -165,8 +176,8 @@ def make_subagent_update_router(
             # Batched summary — redundant once per-tool frames stream.
             return
 
-        if not running.get(child_id) and event_type != "subagent.complete":
-            _send_running(
+        if not self._running.get(child_id) and event_type != "subagent.complete":
+            self._send_running(
                 child_id, True, str(kwargs.get("goal") or preview or "") or None
             )
             if event_type == "subagent.start":
@@ -184,21 +195,23 @@ def make_subagent_update_router(
             if not isinstance(args, dict):
                 args = {}
             tc_id = make_tool_call_id()
-            queues = tool_ids.setdefault(child_id, {})
+            queues = self._tool_ids.setdefault(child_id, {})
             queues.setdefault(name or "", deque()).append(tc_id)
-            _send_update(conn, child_id, loop, build_tool_start(tc_id, name, args))
+            _send_update(
+                self._conn, child_id, self._loop, build_tool_start(tc_id, name, args)
+            )
             return
 
         if event_type == "subagent.tool_completed":
-            queue = tool_ids.get(child_id, {}).get(name or "")
+            queue = self._tool_ids.get(child_id, {}).get(name or "")
             if not queue:
                 return
             tc_id = queue.popleft()
             result = kwargs.get("result")
             _send_update(
-                conn,
+                self._conn,
                 child_id,
-                loop,
+                self._loop,
                 build_tool_complete(
                     tc_id, name, result=str(result) if result is not None else None
                 ),
@@ -207,29 +220,38 @@ def make_subagent_update_router(
 
         if event_type == "subagent.thinking":
             if preview:
-                _send_update(conn, child_id, loop, acp.update_agent_thought_text(preview))
+                _send_update(
+                    self._conn, child_id, self._loop, acp.update_agent_thought_text(preview)
+                )
             return
 
         if event_type == "subagent.text":
             if preview:
-                _send_update(conn, child_id, loop, acp.update_agent_message_text(preview))
+                _send_update(
+                    self._conn, child_id, self._loop, acp.update_agent_message_text(preview)
+                )
             return
 
         if event_type == "subagent.complete":
-            _flush_dangling(child_id)
-            _send_running(child_id, False)
+            self._flush_dangling(child_id)
+            self._send_running(child_id, False)
             return
 
-    def _finalize() -> None:
+    def finalize(self) -> None:
         """Close dangling child tool calls and running flags at turn end."""
-        for child_id in list(tool_ids):
-            _flush_dangling(child_id)
-        for child_id, is_running in list(running.items()):
+        for child_id in list(self._tool_ids):
+            self._flush_dangling(child_id)
+        for child_id, is_running in list(self._running.items()):
             if is_running:
-                _send_running(child_id, False)
+                self._send_running(child_id, False)
 
-    _router.finalize = _finalize
-    return _router
+
+def make_subagent_update_router(
+    conn: acp.Client,
+    loop: asyncio.AbstractEventLoop,
+) -> SubagentUpdateRouter:
+    """Create a per-turn :class:`SubagentUpdateRouter`."""
+    return SubagentUpdateRouter(conn, loop)
 
 
 # ------------------------------------------------------------------

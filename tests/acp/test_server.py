@@ -2100,6 +2100,51 @@ class TestPrompt:
         assert captured["user_message"] == "hello"
 
     @pytest.mark.asyncio
+    async def test_prompt_wires_subagent_router_and_finalizes(self, agent):
+        """prompt() builds a subagent router for the turn, hands subagent.*
+        events to it via the tool progress callback, and finalizes it at turn
+        end so a crashed child can't leave a stuck-running child session."""
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        def _run(**kwargs):
+            # Simulate a delegate child relaying events mid-turn, with a
+            # child that never sends subagent.complete (crash path).
+            cb = state.agent.tool_progress_callback
+            cb("subagent.tool", "terminal", "$ ls", {"command": "ls"},
+               child_session_id="child-abc")
+            return {"final_response": "done", "messages": [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": "done"},
+            ]}
+
+        state.agent.run_conversation = MagicMock(side_effect=_run)
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        await agent.prompt(prompt=[TextContentBlock(type="text", text="go")],
+                           session_id=new_resp.session_id)
+
+        child_updates = [
+            call.kwargs.get("update") if "update" in call.kwargs else call.args[1]
+            for call in mock_conn.session_update.await_args_list
+            if (call.kwargs.get("session_id") or (call.args[0] if call.args else None))
+            == "child-abc"
+        ]
+        kinds = [getattr(u, "session_update", None) for u in child_updates]
+        # Lazy isRunning:true, tool start, then finalize's dangling completion
+        # + isRunning:false at turn end.
+        assert kinds == [
+            "session_info_update",
+            "tool_call",
+            "tool_call_update",
+            "session_info_update",
+        ]
+        assert child_updates[0].field_meta["hermes"]["isRunning"] is True
+        assert child_updates[-1].field_meta["hermes"]["isRunning"] is False
+
+    @pytest.mark.asyncio
     async def test_prompt_updates_history(self, agent):
         """After a prompt, session history should be updated."""
         new_resp = await agent.new_session(cwd=".")
