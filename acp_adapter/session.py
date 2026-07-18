@@ -1127,6 +1127,16 @@ class SessionManager:
             "model": model or default_model,
         }
 
+        # Honor agent.max_turns on the ACP surface, matching the CLI
+        # (cli_agent_setup_mixin passes max_iterations=self.max_turns).
+        # Unset/invalid → omit so AIAgent's own default applies.
+        try:
+            max_turns = int(agent_cfg.get("max_turns") or 0)
+        except (TypeError, ValueError):
+            max_turns = 0
+        if max_turns > 0:
+            kwargs["max_iterations"] = max_turns
+
         try:
             runtime = resolve_runtime_provider(requested=requested_provider or config_provider)
             kwargs.update(

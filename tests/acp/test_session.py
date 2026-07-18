@@ -155,6 +155,106 @@ class TestCreateSession:
 
         assert state.agent.kwargs["disabled_toolsets"] == ["browser"]
 
+    def test_make_agent_passes_config_max_turns(self, monkeypatch):
+        """agent.max_turns from config.yaml must reach the ACP agent as
+        max_iterations, matching the CLI surface (cli_agent_setup_mixin
+        passes max_iterations=self.max_turns). Without this, editor sessions
+        are always capped at the hardcoded default regardless of config."""
+
+        class FakeAgent:
+            model = "fake-model"
+
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        cfg = {
+            "model": {"default": "fake-model", "provider": "fake-provider"},
+            "mcp_servers": {},
+            "agent": {"max_turns": 150},
+        }
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr("acp_adapter.session.load_config", lambda: cfg, raising=False)
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None: {
+                "provider": requested,
+                "api_mode": "codex_app_server",
+                "base_url": "https://example.invalid",
+                "api_key": "test-key",
+            },
+        )
+        monkeypatch.setattr("acp_adapter.session._register_task_cwd", lambda task_id, cwd: None)
+
+        state = SessionManager(db=None).create_session(cwd="/tmp/project")
+
+        assert state.agent.kwargs["max_iterations"] == 150
+
+    def test_make_agent_omits_max_iterations_when_unset(self, monkeypatch):
+        """No agent.max_turns in config → don't pass max_iterations at all,
+        so AIAgent's own default applies (avoid re-stating it here)."""
+
+        class FakeAgent:
+            model = "fake-model"
+
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        cfg = {
+            "model": {"default": "fake-model", "provider": "fake-provider"},
+            "mcp_servers": {},
+            "agent": {},
+        }
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr("acp_adapter.session.load_config", lambda: cfg, raising=False)
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None: {
+                "provider": requested,
+                "api_mode": "codex_app_server",
+                "base_url": "https://example.invalid",
+                "api_key": "test-key",
+            },
+        )
+        monkeypatch.setattr("acp_adapter.session._register_task_cwd", lambda task_id, cwd: None)
+
+        state = SessionManager(db=None).create_session(cwd="/tmp/project")
+
+        assert "max_iterations" not in state.agent.kwargs
+
+    def test_make_agent_ignores_invalid_max_turns(self, monkeypatch):
+        """A junk agent.max_turns value must not crash agent creation."""
+
+        class FakeAgent:
+            model = "fake-model"
+
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        cfg = {
+            "model": {"default": "fake-model", "provider": "fake-provider"},
+            "mcp_servers": {},
+            "agent": {"max_turns": "not-a-number"},
+        }
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr("acp_adapter.session.load_config", lambda: cfg, raising=False)
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None: {
+                "provider": requested,
+                "api_mode": "codex_app_server",
+                "base_url": "https://example.invalid",
+                "api_key": "test-key",
+            },
+        )
+        monkeypatch.setattr("acp_adapter.session._register_task_cwd", lambda task_id, cwd: None)
+
+        state = SessionManager(db=None).create_session(cwd="/tmp/project")
+
+        assert "max_iterations" not in state.agent.kwargs
+
 
 
 
