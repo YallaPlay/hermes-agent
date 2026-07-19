@@ -42,6 +42,11 @@ from hermes_cli.auth import (
 logger = logging.getLogger(__name__)
 
 
+def _cred_log_ctx() -> str:
+    """Process context appended to credential-destruction forensic logs."""
+    return f"pid={os.getpid()} profile={os.getenv('HERMES_PROFILE') or 'default'}"
+
+
 def _load_config_safe() -> Optional[dict]:
     """Load config.yaml read-only, returning None on any error.
 
@@ -1214,7 +1219,16 @@ class CredentialPool:
             else:
                 return entry
         except Exception as exc:
-            logger.debug("Credential refresh failed for %s/%s: %s", self.provider, entry.id, exc)
+            logger.warning(
+                "Credential refresh failed for %s/%s (source=%s label=%s code=%s %s): %s",
+                self.provider,
+                entry.id,
+                entry.source,
+                entry.label,
+                getattr(exc, "code", None),
+                _cred_log_ctx(),
+                exc,
+            )
             # For anthropic claude_code entries: the refresh token may have been
             # consumed by another process. Check if ~/.claude/.credentials.json
             # has a newer token pair and retry once.
@@ -1264,8 +1278,11 @@ class CredentialPool:
             if self.provider == "xai-oauth":
                 synced = self._sync_xai_oauth_entry_from_auth_store(entry)
                 if synced.refresh_token != entry.refresh_token:
-                    logger.debug(
-                        "xAI OAuth refresh failed but auth.json has newer tokens — adopting"
+                    logger.warning(
+                        "xAI OAuth refresh failed but auth.json has newer tokens — "
+                        "adopting (entry=%s %s)",
+                        entry.id,
+                        _cred_log_ctx(),
                     )
                     updated = replace(
                         synced,
@@ -1285,8 +1302,14 @@ class CredentialPool:
                 # remove all singleton-seeded xAI entries from the in-memory
                 # pool. Mirrors the Nous quarantine path above.
                 if auth_mod._is_terminal_xai_oauth_refresh_error(exc):
-                    logger.debug(
-                        "xAI OAuth refresh token is terminally invalid; clearing local token state"
+                    logger.warning(
+                        "xAI OAuth refresh token is terminally invalid; clearing "
+                        "local token state (entry=%s source=%s label=%s code=%s %s)",
+                        entry.id,
+                        entry.source,
+                        entry.label,
+                        getattr(exc, "code", None),
+                        _cred_log_ctx(),
                     )
                     try:
                         with _auth_store_lock():
@@ -1334,8 +1357,11 @@ class CredentialPool:
             if self.provider == "openai-codex":
                 synced = self._sync_codex_entry_from_auth_store(entry)
                 if synced.refresh_token != entry.refresh_token:
-                    logger.debug(
-                        "Codex OAuth refresh failed but auth.json has newer tokens — adopting"
+                    logger.warning(
+                        "Codex OAuth refresh failed but auth.json has newer tokens — "
+                        "adopting (entry=%s %s)",
+                        entry.id,
+                        _cred_log_ctx(),
                     )
                     updated = replace(
                         synced,
@@ -1350,13 +1376,69 @@ class CredentialPool:
                     self._persist()
                     return updated
                 # Terminal error: auth.json has no newer tokens — the stored
-                # refresh_token is dead.  Clear it from auth.json so the next
-                # session does not re-seed the same revoked credentials, and
-                # remove all singleton-seeded (device_code) entries from the
-                # in-memory pool.  Mirrors the xAI and Nous quarantine paths.
+                # refresh_token is dead.  Before destroying local token state,
+                # try adopting a valid pair from the Codex CLI
+                # (~/.codex/auth.json): a transient refresh race must never
+                # wipe the profile's only credential when a recoverable pair
+                # exists.  Only when recovery fails do we clear auth.json (so
+                # the next session does not re-seed the revoked credentials)
+                # and remove singleton-seeded (device_code) entries.  Manual
+                # entries are never deleted here — they are marked DEAD so
+                # `hermes auth list` still shows the entry and its failure
+                # reason (absent is not diagnosable).
                 if auth_mod._is_terminal_codex_oauth_refresh_error(exc):
-                    logger.debug(
-                        "Codex OAuth refresh token is terminally invalid; clearing local token state"
+                    recovered = None
+                    try:
+                        recovered = auth_mod._recover_codex_tokens_from_cli(
+                            f"terminal refresh failure: {getattr(exc, 'code', None) or 'auth_error'}"
+                        )
+                    except Exception as rec_exc:
+                        logger.warning(
+                            "Codex CLI token recovery failed: %s (%s)",
+                            rec_exc,
+                            _cred_log_ctx(),
+                        )
+                    if (
+                        isinstance(recovered, dict)
+                        and str(recovered.get("access_token") or "").strip()
+                        and str(recovered.get("refresh_token") or "").strip()
+                        # Same refresh token that just failed terminally is
+                        # not a recovery — adopting it would loop forever.
+                        and str(recovered.get("refresh_token") or "").strip()
+                        != str(entry.refresh_token or "").strip()
+                    ):
+                        logger.warning(
+                            "Codex OAuth refresh token terminally invalid for entry %s "
+                            "(source=%s label=%s code=%s) but Codex CLI has a valid pair — "
+                            "adopting instead of wiping (%s)",
+                            entry.id,
+                            entry.source,
+                            entry.label,
+                            getattr(exc, "code", None),
+                            _cred_log_ctx(),
+                        )
+                        updated = replace(
+                            entry,
+                            access_token=str(recovered["access_token"]).strip(),
+                            refresh_token=str(recovered["refresh_token"]).strip(),
+                            last_status=STATUS_OK,
+                            last_status_at=None,
+                            last_error_code=None,
+                            last_error_reason=None,
+                            last_error_message=None,
+                            last_error_reset_at=None,
+                        )
+                        self._replace_entry(entry, updated)
+                        self._persist()
+                        return updated
+                    logger.warning(
+                        "Codex OAuth refresh token is terminally invalid; clearing "
+                        "local token state (entry=%s source=%s label=%s code=%s %s)",
+                        entry.id,
+                        entry.source,
+                        entry.label,
+                        getattr(exc, "code", None),
+                        _cred_log_ctx(),
                     )
                     try:
                         with _auth_store_lock():
@@ -1382,8 +1464,10 @@ class CredentialPool:
                                         _save_provider_state(auth_store, "openai-codex", state)
                                         _save_auth_store(auth_store)
                     except Exception as clear_exc:
-                        logger.debug(
-                            "Failed to clear terminal Codex OAuth state: %s", clear_exc
+                        logger.warning(
+                            "Failed to clear terminal Codex OAuth state: %s (%s)",
+                            clear_exc,
+                            _cred_log_ctx(),
                         )
                     removed_ids = [
                         item.id for item in self._entries
@@ -1395,6 +1479,27 @@ class CredentialPool:
                     ]
                     if self._current_id == entry.id:
                         self._current_id = None
+                    if _is_manual_source(entry.source) and any(
+                        item.id == entry.id for item in self._entries
+                    ):
+                        logger.warning(
+                            "credential pool: marking manual openai-codex entry %s "
+                            "(source=%s label=%s) DEAD after terminal refresh failure "
+                            "(code=%s %s) — re-add via `hermes auth add openai-codex`",
+                            entry.id,
+                            entry.source,
+                            entry.label,
+                            getattr(exc, "code", None),
+                            _cred_log_ctx(),
+                        )
+                        dead = replace(
+                            entry,
+                            last_status=STATUS_DEAD,
+                            last_status_at=time.time(),
+                            last_error_reason=str(getattr(exc, "code", None) or "terminal_refresh_failure"),
+                            last_error_message=str(exc),
+                        )
+                        self._replace_entry(entry, dead)
                     self._persist(removed_ids=removed_ids)
                     return None
             # For nous: another process may have consumed the refresh token
@@ -1418,7 +1523,15 @@ class CredentialPool:
                     self._sync_device_code_entry_to_auth_store(updated)
                     return updated
                 if auth_mod._is_terminal_nous_refresh_error(exc):
-                    logger.debug("Nous refresh token is terminally invalid; clearing local token state")
+                    logger.warning(
+                        "Nous refresh token is terminally invalid; clearing "
+                        "local token state (entry=%s source=%s label=%s code=%s %s)",
+                        entry.id,
+                        entry.source,
+                        entry.label,
+                        getattr(exc, "code", None),
+                        _cred_log_ctx(),
+                    )
                     try:
                         with _auth_store_lock():
                             auth_store = _load_auth_store()

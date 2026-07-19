@@ -1494,6 +1494,32 @@ def write_credential_pool(
             if not disk_id or disk_id in new_ids or disk_id in removed:
                 continue
             merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
+        if removed:
+            # Forensic attribution for credential destruction: dropped pool
+            # entries were historically silent, making wiped credentials
+            # (e.g. a vanished manual:device_code openai-codex entry)
+            # undiagnosable after the fact.  Log id/source/label only —
+            # never token material.
+            dropped_meta = []
+            for disk_entry in existing_list:
+                if isinstance(disk_entry, dict) and disk_entry.get("id") in removed:
+                    dropped_meta.append(
+                        f"{disk_entry.get('id')} (source={disk_entry.get('source')}"
+                        f" label={disk_entry.get('label')})"
+                    )
+            for rid in removed:
+                if not any(str(rid) in item for item in dropped_meta):
+                    dropped_meta.append(f"{rid} (not on disk)")
+            logger.warning(
+                "write_credential_pool: removing %d %s pool entr%s: %s "
+                "[pid=%d profile=%s]",
+                len(removed),
+                provider_id,
+                "y" if len(removed) == 1 else "ies",
+                "; ".join(sorted(dropped_meta)),
+                os.getpid(),
+                os.getenv("HERMES_PROFILE") or "default",
+            )
         pool[provider_id] = merged
         return _save_auth_store(auth_store)
 
@@ -1675,6 +1701,27 @@ def clear_provider_auth(provider_id: Optional[str] = None) -> bool:
             del providers[target]
             cleared = True
         if target in pool:
+            # Forensic attribution: this drops the ENTIRE pool for the
+            # provider, including manual (independent-account) entries.
+            # Log which entries died so a later "credential vanished"
+            # report can be traced to this logout.  Metadata only — never
+            # token material.
+            dropped = pool[target]
+            dropped_meta = [
+                f"{item.get('id')} (source={item.get('source')} label={item.get('label')})"
+                for item in dropped
+                if isinstance(item, dict)
+            ]
+            logger.warning(
+                "clear_provider_auth: dropping %d %s pool entr%s: %s "
+                "[pid=%d profile=%s]",
+                len(dropped_meta),
+                target,
+                "y" if len(dropped_meta) == 1 else "ies",
+                "; ".join(dropped_meta) or "(unparseable)",
+                os.getpid(),
+                os.getenv("HERMES_PROFILE") or "default",
+            )
             del pool[target]
             cleared = True
 
