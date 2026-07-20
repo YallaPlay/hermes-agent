@@ -429,6 +429,47 @@ class TestForkSession:
         assert restored is not None
         assert restored.parent_id == original.session_id
 
+    def test_archive_in_memory_fork_hides_it_from_active_list(self, manager):
+        """Regression: archiving a fork looked like a no-op in VS Code.
+
+        A fork is born live in memory with a full copied history, and the
+        in-memory branch of list_sessions used to hardcode archived=False
+        (while its seen-id claim also blocked the DB merge), so the archived
+        row kept reappearing in the active view and never showed in the
+        archived view.
+        """
+        original = manager.create_session(cwd="/a")
+        original.history.append({"role": "user", "content": "hello"})
+        manager.save_session(original.session_id)
+        forked = manager.fork_session(original.session_id, cwd="/a")
+        fid = forked.session_id
+
+        assert manager.set_session_archived(fid, True)
+
+        active_ids = {s["session_id"] for s in manager.list_sessions()}
+        assert fid not in active_ids
+        assert original.session_id in active_ids
+
+        archived = {s["session_id"]: s for s in manager.list_sessions(archived_only=True)}
+        assert fid in archived
+        assert archived[fid]["archived"] is True
+
+        # And unarchiving restores it to the active view.
+        assert manager.set_session_archived(fid, False)
+        active_ids = {s["session_id"] for s in manager.list_sessions()}
+        assert fid in active_ids
+
+    def test_include_archived_marks_in_memory_fork_row(self, manager):
+        original = manager.create_session(cwd="/a")
+        original.history.append({"role": "user", "content": "hello"})
+        manager.save_session(original.session_id)
+        forked = manager.fork_session(original.session_id, cwd="/a")
+        manager.set_session_archived(forked.session_id, True)
+
+        listing = {s["session_id"]: s for s in manager.list_sessions(include_archived=True)}
+        assert listing[forked.session_id]["archived"] is True
+        assert listing[original.session_id]["archived"] is False
+
     def test_fork_session_preserves_mode(self, manager):
         original = manager.create_session()
         original.mode = "acceptEdits"
@@ -1495,18 +1536,28 @@ def _mgr_with_db(rows, archived_ok=True):
     return mgr, db
 
 
-def test_list_sessions_forwards_archived_flags_and_maps_archived_field():
-    rows = [{
-        "id": "s1", "cwd": ".", "model": "m", "message_count": 3,
-        "title": "T", "last_active": 1.0, "started_at": 0.0, "archived": 1,
-    }]
+def test_list_sessions_fetches_all_and_filters_archived_in_python():
+    rows = [
+        {
+            "id": "s1", "cwd": ".", "model": "m", "message_count": 3,
+            "title": "T", "last_active": 1.0, "started_at": 0.0, "archived": 1,
+        },
+        {
+            "id": "s2", "cwd": ".", "model": "m", "message_count": 3,
+            "title": "U", "last_active": 1.0, "started_at": 0.0, "archived": 0,
+        },
+    ]
     mgr, db = _mgr_with_db(rows)
     out = mgr.list_sessions(archived_only=True)
-    # forwarded to the DB layer
-    _, kwargs = db.list_sessions_rich.call_args
-    assert kwargs.get("archived_only") is True
-    # archived surfaced as a bool on the result dict
-    assert out and out[0]["archived"] is True
+    # The DB fetch is unfiltered (include_archived=True, no archived_only):
+    # archived state must be visible for in-memory sessions too, so the
+    # archived/active filtering happens per-row in Python.
+    _, kwargs = db.list_sessions_rich.call_args_list[0]
+    assert kwargs.get("include_archived") is True
+    assert "archived_only" not in kwargs
+    # only the archived row is surfaced, marked as such
+    assert [s["session_id"] for s in out] == ["s1"]
+    assert out[0]["archived"] is True
 
 
 def test_list_sessions_orders_by_last_user_message_not_last_activity():

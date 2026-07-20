@@ -522,16 +522,25 @@ class SessionManager:
 
         if db is not None:
             try:
+                # Always fetch archived rows and filter per-row below. An
+                # archived session can still be live in memory (e.g. a fork
+                # archived right after creation), and the in-memory branch
+                # needs its persisted archived flag to honor the filter —
+                # a DB-side filter would just drop the row from this dict.
                 for row in db.list_sessions_rich(
                     source="acp",
                     limit=1000,
-                    include_archived=include_archived,
-                    archived_only=archived_only,
+                    include_archived=True,
                     owner=owner_filter,
                 ):
                     persisted_rows[str(row["id"])] = dict(row)
             except Exception:
                 logger.debug("Failed to load ACP sessions from DB", exc_info=True)
+
+        def _admits(row_archived: bool) -> bool:
+            if archived_only:
+                return row_archived
+            return include_archived or not row_archived
 
         # Collect in-memory sessions first.
         with self._lock:
@@ -550,11 +559,15 @@ class SessionManager:
                     # the entire duration of its first turn.
                     seen_ids.discard(s.session_id)
                     continue
-                if archived_only:
+                persisted = persisted_rows.get(s.session_id, {})
+                # Archived state lives only in the DB row; an in-memory session
+                # (e.g. a just-archived fork still resident in the process) must
+                # honor it or archiving looks like a no-op in the client.
+                row_archived = bool(persisted.get("archived"))
+                if not _admits(row_archived):
                     continue
                 if normalized_cwd and _normalize_cwd_for_compare(s.cwd) != normalized_cwd:
                     continue
-                persisted = persisted_rows.get(s.session_id, {})
                 if owner_filter:
                     # Mirror the DB filter for in-memory rows: STRICT ownership —
                     # show only the caller's own sessions, hide untagged and
@@ -596,7 +609,7 @@ class SessionManager:
                             or persisted.get("started_at")
                             or time.time()
                         ),
-                        "archived": False,
+                        "archived": row_archived,
                         "parent_id": parent_id,
                         # A fork of a Slack session is an ACP/VS Code session in
                         # its own right — don't inherit the Slack badge.
@@ -608,6 +621,9 @@ class SessionManager:
         # Merge any persisted sessions not currently in memory.
         for sid, row in persisted_rows.items():
             if sid in seen_ids:
+                continue
+            row_archived = bool(row.get("archived"))
+            if not _admits(row_archived):
                 continue
             message_count = int(row.get("message_count") or 0)
             if message_count <= 0:
@@ -635,7 +651,7 @@ class SessionManager:
                 "updated_at": _format_updated_at(
                     row.get("last_user_active") or row.get("last_active") or row.get("started_at")
                 ),
-                "archived": bool(row.get("archived")),
+                "archived": row_archived,
                 "parent_id": parent_id,
                 # Forks of Slack sessions are not Slack sessions — no badge.
                 "slack": not parent_id and _is_slack_preview(row.get("preview")),
