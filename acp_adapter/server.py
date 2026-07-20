@@ -881,6 +881,34 @@ class HermesACPAgent(acp.Agent):
             used=max(used, 0),
         )
 
+    def _notify_midturn_usage(
+        self, state: SessionState, loop: asyncio.AbstractEventLoop
+    ) -> None:
+        """Refresh the client's context indicator between API calls.
+
+        Called from the agent's step callback in the executor thread.
+        ``state.history`` is frozen until turn end, so ``_build_usage_update``'s
+        history-based estimate would be stale here; the compressor's
+        provider-reported ``last_prompt_tokens`` from the just-finished API
+        call is the current request pressure.
+        """
+        if not self._conn:
+            return
+        compressor = getattr(state.agent, "context_compressor", None)
+        size = int(getattr(compressor, "context_length", 0) or 0)
+        used = int(getattr(compressor, "last_prompt_tokens", 0) or 0)
+        if size <= 0 or used <= 0:
+            return
+        update = UsageUpdate(session_update="usage_update", size=size, used=used)
+        from agent.async_utils import safe_schedule_threadsafe
+
+        safe_schedule_threadsafe(
+            self._conn.session_update(session_id=state.session_id, update=update),
+            loop,
+            logger=logger,
+            log_message="Failed to send mid-turn ACP usage update",
+        )
+
     async def _send_usage_update(self, state: SessionState) -> None:
         """Send ACP native context usage to the connected client."""
         if not self._conn:
@@ -2223,7 +2251,15 @@ class HermesACPAgent(acp.Agent):
                 subagent_router=subagent_router,
             )
             reasoning_cb = make_thinking_cb(conn, session_id, loop)
-            step_cb = make_step_cb(conn, session_id, loop, tool_call_ids, tool_call_meta)
+            _base_step_cb = make_step_cb(conn, session_id, loop, tool_call_ids, tool_call_meta)
+
+            def _step_with_usage(api_call_count: int, prev_tools: Any = None) -> None:
+                _base_step_cb(api_call_count, prev_tools)
+                # Keep the client's context indicator live during long turns
+                # instead of only refreshing it at turn end.
+                self._notify_midturn_usage(state, loop)
+
+            step_cb = _step_with_usage
             message_cb = make_message_cb(conn, session_id, loop)
 
             def stream_delta_cb(text: str) -> None:

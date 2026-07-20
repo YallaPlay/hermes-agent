@@ -393,6 +393,88 @@ class TestSessionOps:
         assert update.used == 25_000
 
     @pytest.mark.asyncio
+    async def test_notify_midturn_usage_sends_provider_reported_pressure(
+        self, agent, mock_manager
+    ):
+        """Mid-turn refreshes use the compressor's provider-reported prompt
+        tokens (state.history is frozen until turn end)."""
+        state = mock_manager.create_session(cwd="/tmp")
+        state.agent.context_compressor = MagicMock(
+            context_length=100_000, last_prompt_tokens=42_000
+        )
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        loop = asyncio.get_running_loop()
+        await asyncio.to_thread(agent._notify_midturn_usage, state, loop)
+        await asyncio.sleep(0)
+
+        mock_conn.session_update.assert_awaited_once()
+        call = mock_conn.session_update.await_args
+        assert call.kwargs["session_id"] == state.session_id
+        update = call.kwargs["update"]
+        assert isinstance(update, UsageUpdate)
+        assert update.session_update == "usage_update"
+        assert update.size == 100_000
+        assert update.used == 42_000
+
+    @pytest.mark.asyncio
+    async def test_notify_midturn_usage_skips_without_real_usage(
+        self, agent, mock_manager
+    ):
+        """No provider-reported prompt tokens yet (first API call still in
+        flight, or compaction reset) — send nothing rather than a bogus 0."""
+        state = mock_manager.create_session(cwd="/tmp")
+        state.agent.context_compressor = MagicMock(
+            context_length=100_000, last_prompt_tokens=0
+        )
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        loop = asyncio.get_running_loop()
+        await asyncio.to_thread(agent._notify_midturn_usage, state, loop)
+        await asyncio.sleep(0)
+
+        mock_conn.session_update.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_prompt_step_callback_sends_midturn_usage_update(self, agent):
+        """The step callback installed by prompt() must refresh the context
+        indicator between API calls, not just at turn end."""
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        state.agent.context_compressor = MagicMock(
+            context_length=100_000, last_prompt_tokens=37_000
+        )
+
+        def _run(**kwargs):
+            state.agent.step_callback(1, [])
+            return {"final_response": "hi", "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+            ]}
+
+        state.agent.run_conversation = MagicMock(side_effect=_run)
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        prompt = [TextContentBlock(type="text", text="hello")]
+        await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        usage_updates = [
+            call.kwargs.get("update") or call.args[1]
+            for call in mock_conn.session_update.call_args_list
+            if isinstance(
+                call.kwargs.get("update") or (call.args[1] if len(call.args) > 1 else None),
+                UsageUpdate,
+            )
+        ]
+        assert any(u.used == 37_000 for u in usage_updates)
+
+    @pytest.mark.asyncio
     async def test_cancel_sets_event(self, agent):
         resp = await agent.new_session(cwd=".")
         state = agent.session_manager.get_session(resp.session_id)
