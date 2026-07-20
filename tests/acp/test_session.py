@@ -385,6 +385,30 @@ class TestForkSession:
         assert listing[forked.session_id]["parent_id"] == original.session_id
         assert listing[original.session_id]["parent_id"] is None
 
+    def test_fork_stamps_lineage_title_from_parent(self, manager):
+        """A fork of a titled parent gets 'Parent Title #2' immediately, so
+        the sidebar never shows the raw first-message preview for it."""
+        original = manager.create_session(cwd="/a")
+        original.history.append({"role": "user", "content": "hello"})
+        manager.save_session(original.session_id)
+        db = manager._get_db()
+        db.set_session_title(original.session_id, "My Investigation")
+
+        forked = manager.fork_session(original.session_id, cwd="/a")
+        assert db.get_session_title(forked.session_id) == "My Investigation #2"
+
+        second = manager.fork_session(original.session_id, cwd="/a")
+        assert db.get_session_title(second.session_id) == "My Investigation #3"
+
+    def test_fork_of_untitled_parent_stays_untitled(self, manager):
+        """No parent title → no stamp; the background derive backfill owns
+        titling in that case."""
+        original = manager.create_session(cwd="/a")
+        original.history.append({"role": "user", "content": "hello"})
+        forked = manager.fork_session(original.session_id, cwd="/a")
+        db = manager._get_db()
+        assert db.get_session_title(forked.session_id) is None
+
     def test_fork_lineage_survives_restart(self, manager):
         """DB-only forks (post process restart) still report their parent."""
         original = manager.create_session(cwd="/a")

@@ -485,6 +485,25 @@ class SessionManager:
             self._sessions[new_id] = state
         _register_task_cwd(new_id, cwd)
         self._persist(state)
+        # Stamp the fork's title from the parent's canonical title ("Parent
+        # Title #2") — otherwise the fork row falls back to the first-user-
+        # message preview, which is identical to the parent's and useless for
+        # telling forks apart. Untitled parents leave the fork untitled (the
+        # background derive backfill handles those).
+        parent_title = self.get_session_title(session_id)
+        if parent_title:
+            db = self._get_db()
+            if db is not None:
+                try:
+                    db.set_session_title(
+                        new_id, db.get_next_title_in_lineage(parent_title)
+                    )
+                except ValueError:
+                    logger.debug(
+                        "fork_session: could not stamp lineage title for %s",
+                        new_id,
+                        exc_info=True,
+                    )
         logger.info("Forked ACP session %s -> %s", session_id, new_id)
         return state
 
