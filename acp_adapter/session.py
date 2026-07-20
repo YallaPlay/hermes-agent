@@ -1055,11 +1055,17 @@ class SessionManager:
                 )
             return ""
 
-        first_user = next((_text(m) for m in messages if m.get("role") == "user"), "")
+        first_user = next(
+            (t for m in messages if m.get("role") == "user" and (t := _text(m).strip())), ""
+        )
         # Owned sessions carry the authenticated-owner note in their first user
         # message — title from the actual prompt, not the identity envelope.
         first_user = strip_owner_note(first_user)
-        first_assistant = next((_text(m) for m in messages if m.get("role") == "assistant"), "")
+        # First assistant message WITH text: turns that open with tool calls
+        # persist content-less assistant rows first.
+        first_assistant = next(
+            (t for m in messages if m.get("role") == "assistant" and (t := _text(m).strip())), ""
+        )
         if not first_user or not first_assistant:
             return None  # no completed exchange yet — nothing to title from
 
@@ -1075,9 +1081,16 @@ class SessionManager:
             if db.set_session_title(session_id, title):
                 return title
         except ValueError:
-            # Extremely unlikely (a derived title colliding with another
-            # session); leave untitled rather than error a background derive.
-            logger.debug("derive_session_title: title collision for %s", session_id, exc_info=True)
+            # Derived-title collision — near-identical first prompts (e.g. two
+            # handoff sessions) title identically. Suffix like fork lineage.
+            try:
+                suffixed = db.get_next_title_in_lineage(title)
+                if db.set_session_title(session_id, suffixed):
+                    return suffixed
+            except ValueError:
+                logger.debug(
+                    "derive_session_title: title collision for %s", session_id, exc_info=True
+                )
         return None
 
     # ---- internal -----------------------------------------------------------
