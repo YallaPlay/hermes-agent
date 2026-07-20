@@ -1619,6 +1619,62 @@ class TestListAndFork:
         assert resp.next_cursor is None
 
     @pytest.mark.asyncio
+    async def test_list_sessions_backfills_untitled_rows(self, agent):
+        infos = [
+            {"session_id": "s1", "cwd": "/tmp", "title": "prompt preview", "untitled": True,
+             "updated_at": 0.0},
+            {"session_id": "s2", "cwd": "/tmp", "title": "Real Title", "untitled": False,
+             "updated_at": 0.0},
+            {"session_id": "s3", "cwd": "/tmp", "title": "child preview", "untitled": True,
+             "subagent": True, "updated_at": 0.0},
+        ]
+        with patch.object(agent.session_manager, "list_sessions", return_value=infos), \
+             patch.object(
+                 agent.session_manager, "derive_session_title", return_value="Derived"
+             ) as mock_derive, \
+             patch.object(agent, "_send_session_info_update") as mock_emit:
+            await agent.list_sessions()
+            await asyncio.sleep(0.05)  # let the backfill tasks run
+
+        # Only the untitled non-subagent row is derived; success emits an update.
+        mock_derive.assert_called_once_with("s1")
+        mock_emit.assert_awaited_once_with("s1")
+
+    @pytest.mark.asyncio
+    async def test_list_sessions_backfill_attempts_once_per_session(self, agent):
+        infos = [
+            {"session_id": "s1", "cwd": "/tmp", "title": "preview", "untitled": True,
+             "updated_at": 0.0},
+        ]
+        with patch.object(agent.session_manager, "list_sessions", return_value=infos), \
+             patch.object(
+                 agent.session_manager, "derive_session_title", return_value=None
+             ) as mock_derive:
+            await agent.list_sessions()
+            await asyncio.sleep(0.05)
+            await agent.list_sessions()
+            await asyncio.sleep(0.05)
+
+        # Second list must not retry the failed derive.
+        mock_derive.assert_called_once_with("s1")
+
+    @pytest.mark.asyncio
+    async def test_list_sessions_backfill_capped_per_call(self, agent):
+        infos = [
+            {"session_id": f"s{i}", "cwd": "/tmp", "title": f"p{i}", "untitled": True,
+             "updated_at": 0.0}
+            for i in range(10)
+        ]
+        with patch.object(agent.session_manager, "list_sessions", return_value=infos), \
+             patch.object(
+                 agent.session_manager, "derive_session_title", return_value=None
+             ) as mock_derive:
+            await agent.list_sessions()
+            await asyncio.sleep(0.05)
+
+        assert mock_derive.call_count == agent._TITLE_BACKFILL_MAX_PER_LIST
+
+    @pytest.mark.asyncio
     async def test_ext_method_set_archived_delegates_and_returns_ok(self, agent):
         with patch.object(
             agent.session_manager, "set_session_archived", return_value=True

@@ -676,6 +676,10 @@ class HermesACPAgent(acp.Agent):
         super().__init__()
         self.session_manager = session_manager or SessionManager()
         self._conn: Optional[acp.Client] = None
+        # Session ids already sent through the background title backfill —
+        # one derive attempt per session per process, so a failing aux model
+        # doesn't get hammered on every sessions-list refresh.
+        self._title_backfill_attempted: set[str] = set()
 
     # ---- Connection lifecycle -----------------------------------------------
 
@@ -1951,6 +1955,13 @@ class HermesACPAgent(acp.Agent):
         has_more = len(infos) > _LIST_SESSIONS_PAGE_SIZE
         infos = infos[:_LIST_SESSIONS_PAGE_SIZE]
 
+        # Opportunistic title backfill: sessions that missed the first-exchange
+        # auto-title (long/interrupted first turn, aux failure) otherwise fall
+        # back to the first-user-message preview as their list title. Derive
+        # real titles in the background — capped per call, once per session per
+        # process — and push each result via session_info updates.
+        self._schedule_title_backfill(infos)
+
         sessions = []
         for s in infos:
             updated_at = s.get("updated_at")
@@ -1990,6 +2001,44 @@ class HermesACPAgent(acp.Agent):
 
         next_cursor = sessions[-1].session_id if has_more and sessions else None
         return ListSessionsResponse(sessions=sessions, next_cursor=next_cursor)
+
+    _TITLE_BACKFILL_MAX_PER_LIST = 3
+
+    def _schedule_title_backfill(self, infos: list[dict[str, Any]]) -> None:
+        """Kick off background title derivation for untitled listed sessions.
+
+        Each candidate gets one attempt per process (derive failures — no
+        completed exchange yet, aux-model errors — are not retried on every
+        list refresh). The blocking aux call runs off the event loop;
+        successes push a session_info update so open sidebars re-render.
+        Skips subagent children — their transcripts are delegate work
+        products, not user threads worth an aux call.
+        """
+        candidates = [
+            s["session_id"]
+            for s in infos
+            if s.get("untitled") and not s.get("subagent")
+            and s["session_id"] not in self._title_backfill_attempted
+        ][: self._TITLE_BACKFILL_MAX_PER_LIST]
+        if not candidates:
+            return
+        self._title_backfill_attempted.update(candidates)
+        loop = asyncio.get_running_loop()
+
+        async def _backfill(session_id: str) -> None:
+            try:
+                title = await loop.run_in_executor(
+                    None, self.session_manager.derive_session_title, session_id
+                )
+                if title:
+                    await self._send_session_info_update(session_id)
+            except Exception:
+                logger.debug(
+                    "Background title backfill failed for %s", session_id, exc_info=True
+                )
+
+        for sid in candidates:
+            asyncio.create_task(_backfill(sid))
 
     # ---- Prompt (core) ------------------------------------------------------
 
@@ -2216,8 +2265,10 @@ class HermesACPAgent(acp.Agent):
         # would waste tokens. Text-only prompts only (a plain string user_content);
         # multimodal turns keep their structured content untouched.
         if state.owner and not state.history and isinstance(user_content, str):
+            from hermes_constants import ACP_OWNER_NOTE_PREFIX
+
             owner_note = (
-                f"[authenticated user: {state.owner}]\n"
+                f"{ACP_OWNER_NOTE_PREFIX} {state.owner}]\n"
                 "(This is the signed-in user you are talking to, from the "
                 "surface's SSO/identity provider. Use it to address and identify "
                 "them; do not ask who they are.)\n\n"

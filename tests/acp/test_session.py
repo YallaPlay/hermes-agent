@@ -584,6 +584,36 @@ class TestListAndCleanup:
         # First user message is image-only → placeholder wins (first match).
         assert listing[0]["title"] == "[multimodal content]"
 
+    def test_list_sessions_strips_owner_note_from_title(self, manager):
+        """An owned session's first user message carries the authenticated-owner
+        note; the fallback title must show the prompt, not the owner email."""
+        s = manager.create_session(cwd="/owned")
+        s.history.append(
+            {
+                "role": "user",
+                "content": (
+                    "[authenticated user: israel.lot@yallaplay.com]\n"
+                    "(This is the signed-in user you are talking to, from the "
+                    "surface's SSO/identity provider. Use it to address and "
+                    "identify them; do not ask who they are.)\n\n"
+                    "help me fix the sessions sidebar"
+                ),
+            }
+        )
+        listing = manager.list_sessions()
+        assert len(listing) == 1
+        title = listing[0]["title"]
+        assert title.startswith("help me fix the sessions sidebar")
+        assert "authenticated user" not in title
+        assert "israel.lot@yallaplay.com" not in title
+
+    def test_list_sessions_marks_untitled_rows(self, manager):
+        s = manager.create_session(cwd="/untitled")
+        s.history.append({"role": "user", "content": "some prompt"})
+        listing = manager.list_sessions()
+        assert len(listing) == 1
+        assert listing[0]["untitled"] is True
+
     def test_save_session_preserves_existing_messages_on_encode_failure(self, manager):
         """Regression for #13675: a bad message in state.history must not
         clobber the previously-persisted transcript.  replace_messages()

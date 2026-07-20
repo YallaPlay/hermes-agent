@@ -869,3 +869,37 @@ class TestWslPathTranslation:
         assert hermes_constants.translate_cwd_for_wsl_backend(r"\\wsl.localhost\Ubuntu\home\alex") == "/home/alex"
         # Already-POSIX paths pass through untouched.
         assert hermes_constants.translate_cwd_for_wsl_backend("/home/alex") == "/home/alex"
+
+
+class TestStripOwnerNote:
+    OWNER_NOTE = (
+        "[authenticated user: israel.lot@yallaplay.com]\n"
+        "(This is the signed-in user you are talking to, from the "
+        "surface's SSO/identity provider. Use it to address and identify "
+        "them; do not ask who they are.)\n\n"
+    )
+
+    def test_strips_full_note_with_parenthetical(self):
+        text = self.OWNER_NOTE + "let's figure out session titles"
+        assert hermes_constants.strip_owner_note(text) == "let's figure out session titles"
+
+    def test_strips_bracket_only_note(self):
+        text = "[authenticated user: a@b.com]\nreal prompt"
+        assert hermes_constants.strip_owner_note(text) == "real prompt"
+
+    def test_no_note_passthrough(self):
+        assert hermes_constants.strip_owner_note("plain message") == "plain message"
+
+    def test_unclosed_bracket_passthrough(self):
+        text = "[authenticated user: broken"
+        assert hermes_constants.strip_owner_note(text) == text
+
+    def test_non_string_passthrough(self):
+        assert hermes_constants.strip_owner_note(None) is None
+
+    def test_note_only_message_becomes_empty(self):
+        assert hermes_constants.strip_owner_note(self.OWNER_NOTE) == ""
+
+    def test_bracket_mid_message_untouched(self):
+        text = "see the [authenticated user: x] marker"
+        assert hermes_constants.strip_owner_note(text) == text

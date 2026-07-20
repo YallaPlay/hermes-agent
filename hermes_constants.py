@@ -1031,3 +1031,37 @@ FINISH_REASON_LENGTH = "length"
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_MODELS_URL = f"{OPENROUTER_BASE_URL}/models"
+
+
+# ─── Authenticated-owner note (ACP first-turn identity) ──────────────────────
+
+# The ACP server prepends this note to a session's FIRST user message when the
+# session carries an authenticated owner (e.g. a Cloudflare Access email
+# stamped at session/new). It is persisted as part of the message, so any
+# display surface that previews the first user message (sessions list titles,
+# search snippets) must strip it or it leaks the owner's email.
+ACP_OWNER_NOTE_PREFIX = "[authenticated user:"
+
+
+def strip_owner_note(text: str) -> str:
+    """Remove a leading authenticated-owner note from message text.
+
+    The note is a bracketed identity line optionally followed by one
+    parenthetical explanation (see ``ACP_OWNER_NOTE_PREFIX`` usage in the ACP
+    server). Returns *text* unchanged when no note is present.
+    """
+    if not isinstance(text, str):
+        return text
+    stripped = text.lstrip()
+    if not stripped.startswith(ACP_OWNER_NOTE_PREFIX):
+        return text
+    rest = stripped[len(ACP_OWNER_NOTE_PREFIX):]
+    bracket_close = rest.find("]")
+    if bracket_close == -1:
+        return text
+    rest = rest[bracket_close + 1:].lstrip()
+    if rest.startswith("("):
+        paren_close = rest.find(")")
+        if paren_close != -1:
+            rest = rest[paren_close + 1:]
+    return rest.lstrip()

@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, strip_owner_note
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
@@ -3827,6 +3827,9 @@ class SessionDB:
             text = decoded
         else:
             text = str(decoded)
+        # Strip the ACP authenticated-owner note an owned session's first user
+        # message carries, so previews don't leak the owner's email.
+        text = strip_owner_note(text)
         text = " ".join(text.split())  # collapse whitespace/newlines
         return text[:limit] + ("..." if len(text) > limit else "")
 

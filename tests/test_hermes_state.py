@@ -3918,6 +3918,25 @@ class TestListSessionsRich:
         sessions = db.list_sessions_rich()
         assert sessions[0]["preview"] == ""
 
+    def test_preview_strips_acp_owner_note(self, db):
+        # Owned ACP sessions persist the authenticated-owner note at the top of
+        # the first user message; previews must not leak the owner email.
+        db.create_session("s1", "acp")
+        db.append_message(
+            "s1",
+            "user",
+            "[authenticated user: israel.lot@yallaplay.com]\n"
+            "(This is the signed-in user you are talking to, from the "
+            "surface's SSO/identity provider. Use it to address and identify "
+            "them; do not ask who they are.)\n\n"
+            "let's figure out session titles",
+        )
+        sessions = db.list_sessions_rich()
+        preview = sessions[0]["preview"]
+        assert preview.startswith("let's figure out session titles")
+        assert "israel.lot@yallaplay.com" not in preview
+        assert "authenticated user" not in preview
+
     def test_preview_flattens_multimodal_content(self, db):
         # A user message with an image attachment persists as a content list
         # (\x00json:-prefixed). The preview must show the text, not the repr.

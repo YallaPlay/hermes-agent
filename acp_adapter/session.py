@@ -8,7 +8,7 @@ history.
 """
 from __future__ import annotations
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, strip_owner_note
 
 import copy
 import json
@@ -78,6 +78,9 @@ def _preview_text(content: Any, limit: int = 60) -> str:
         text = text or "[multimodal content]"
     else:
         text = str(content or "").strip()
+    # An owned session's first user message carries the authenticated-owner
+    # note; stripping it here keeps the owner email out of list titles.
+    text = strip_owner_note(text)
     text = " ".join(text.split())
     return text[:limit] + ("..." if len(text) > limit else "")
 
@@ -560,6 +563,9 @@ class SessionManager:
                         "history_len": history_len,
                         "user_id": s.owner or persisted.get("user_id") or "",
                         "title": _build_session_title(persisted.get("title"), preview, s.cwd),
+                        # No canonical title yet — candidate for background
+                        # title backfill (see HermesACPAgent.list_sessions).
+                        "untitled": not str(persisted.get("title") or "").strip(),
                         # Order by the LAST USER MESSAGE, not any message: an
                         # agent that keeps streaming/tool-calling after the user
                         # moved on shouldn't keep hoisting its row. Fall back to
@@ -605,6 +611,7 @@ class SessionManager:
                 "history_len": message_count,
                 "user_id": row.get("user_id") or "",
                 "title": _build_session_title(row.get("title"), row.get("preview"), session_cwd),
+                "untitled": not str(row.get("title") or "").strip(),
                 # Last user message wins for recency (see the in-memory branch).
                 "updated_at": _format_updated_at(
                     row.get("last_user_active") or row.get("last_active") or row.get("started_at")
@@ -1049,6 +1056,9 @@ class SessionManager:
             return ""
 
         first_user = next((_text(m) for m in messages if m.get("role") == "user"), "")
+        # Owned sessions carry the authenticated-owner note in their first user
+        # message — title from the actual prompt, not the identity envelope.
+        first_user = strip_owner_note(first_user)
         first_assistant = next((_text(m) for m in messages if m.get("role") == "assistant"), "")
         if not first_user or not first_assistant:
             return None  # no completed exchange yet — nothing to title from
