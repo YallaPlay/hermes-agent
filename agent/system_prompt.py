@@ -45,6 +45,7 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     drain_truncation_warnings,
+    reasoning_effort_status_line,
 )
 from agent.runtime_cwd import resolve_context_cwd
 from hermes_constants import get_hermes_home
@@ -235,10 +236,21 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
     if "skill_manage" in agent.valid_tool_names:
         tool_guidance.append(SKILLS_GUIDANCE)
-    # Static text only — the current level is NOT rendered here, so the
-    # prompt stays byte-stable when the tool changes reasoning_config.
+    # Static text plus a session-start status line. The line is computed ONCE
+    # (first build) from the then-current reasoning_config and pinned on the
+    # agent, so rebuilds stay byte-stable even after the tool mutates
+    # reasoning_config mid-session (the model learns live changes from the
+    # tool result, not from the prompt). Rendering the start level lets the
+    # model skip a redundant reasoning_effort call when skill guidance
+    # requests the level it already has.
     if "reasoning_effort" in agent.valid_tool_names:
-        tool_guidance.append(REASONING_EFFORT_GUIDANCE)
+        _re_status = getattr(agent, "_reasoning_effort_status_line", None)
+        if _re_status is None:
+            _re_status = reasoning_effort_status_line(
+                getattr(agent, "reasoning_config", None)
+            )
+            agent._reasoning_effort_status_line = _re_status
+        tool_guidance.append(REASONING_EFFORT_GUIDANCE + _re_status)
     # Kanban worker/orchestrator lifecycle — only present when the
     # dispatcher spawned this process (kanban_show check_fn gates on
     # HERMES_KANBAN_TASK env var). Normal chat sessions never see

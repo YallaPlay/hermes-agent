@@ -68,6 +68,28 @@ class TestGuidanceConstants:
         assert "{" not in REASONING_EFFORT_GUIDANCE
         assert "%s" not in REASONING_EFFORT_GUIDANCE
 
+    def test_reasoning_effort_status_line_renders_start_level(self):
+        from agent.prompt_builder import reasoning_effort_status_line
+
+        line = reasoning_effort_status_line({"enabled": True, "effort": "low"})
+        assert "session start: low" in line
+        assert "no-op" in line
+
+    def test_reasoning_effort_status_line_disabled_and_unset(self):
+        from agent.prompt_builder import reasoning_effort_status_line
+
+        assert "session start: none" in reasoning_effort_status_line({"enabled": False})
+        assert "provider default" in reasoning_effort_status_line(None)
+        assert "provider default" in reasoning_effort_status_line({"enabled": True})
+
+    def test_reasoning_effort_status_line_is_deterministic(self):
+        # Same input → same bytes: the line is computed once at prompt build
+        # and must not depend on anything volatile.
+        from agent.prompt_builder import reasoning_effort_status_line
+
+        cfg = {"enabled": True, "effort": "high"}
+        assert reasoning_effort_status_line(cfg) == reasoning_effort_status_line(cfg)
+
 
 # =========================================================================
 # Context injection scanning

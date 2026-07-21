@@ -14,7 +14,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
-from typing import Optional
+from typing import Any, Optional
 
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
@@ -208,6 +208,32 @@ REASONING_EFFORT_GUIDANCE = (
     "the session unless changed again; pass persist=true only when the user asks "
     "for a permanent default."
 )
+
+
+def reasoning_effort_status_line(reasoning_config: Any) -> str:
+    """Session-start effort status appended after REASONING_EFFORT_GUIDANCE.
+
+    Byte-stable by construction: computed once when the system prompt is built
+    (agent lifetime) from the agent's init-time ``reasoning_config``. It states
+    the START level, never a live value — the model tracks later changes from
+    reasoning_effort tool results, which report the new level. Telling the
+    model where it starts lets it SKIP a redundant reasoning_effort call (and
+    the round-trip) when skill guidance asks for a level that already matches.
+    """
+    if isinstance(reasoning_config, dict):
+        if reasoning_config.get("enabled") is False:
+            level = "none"
+        else:
+            level = str(reasoning_config.get("effort") or "").strip().lower()
+            if not level:
+                level = "the provider default"
+    else:
+        level = "the provider default"
+    return (
+        f" Reasoning effort at session start: {level}. "
+        "Do not call the tool to set a level that already matches the "
+        "current one — that is a no-op and wastes a round-trip."
+    )
 
 KANBAN_GUIDANCE = (
     "# Kanban task execution protocol\n"
