@@ -32,12 +32,6 @@ _REQUIRED_REQUEST_FIELDS = {
     "max_output_bytes",
     "connect_timeout_seconds",
     "read_timeout_seconds",
-    "credentials",
-}
-_REQUIRED_CREDENTIAL_FIELDS = {
-    "access_key_id",
-    "secret_access_key",
-    "session_token",
 }
 _REGION_PATTERN = re.compile(r"^[a-z]{2}(?:-gov)?-[a-z]+-\d$", re.IGNORECASE)
 
@@ -109,18 +103,6 @@ def _validate_request(value: Any) -> dict[str, Any]:
         maximum=600,
     )
 
-    credentials = value.get("credentials")
-    if not isinstance(credentials, dict) or set(credentials) != _REQUIRED_CREDENTIAL_FIELDS:
-        raise WorkerInputError("worker credential snapshot has invalid fields")
-    access_key = credentials.get("access_key_id")
-    secret_key = credentials.get("secret_access_key")
-    session_token = credentials.get("session_token")
-    if not isinstance(access_key, str) or not access_key:
-        raise WorkerInputError("worker credential snapshot has no access key")
-    if not isinstance(secret_key, str) or not secret_key:
-        raise WorkerInputError("worker credential snapshot has no secret key")
-    if session_token is not None and not isinstance(session_token, str):
-        raise WorkerInputError("worker credential snapshot has an invalid session token")
 
     # Return detached plain values.  Do not retain an alias to caller-owned data.
     return {
@@ -134,11 +116,6 @@ def _validate_request(value: Any) -> dict[str, Any]:
         "max_output_bytes": PROJECTOR_OUTPUT_MAX_BYTES,
         "connect_timeout_seconds": connect_timeout,
         "read_timeout_seconds": read_timeout,
-        "credentials": {
-            "access_key_id": access_key,
-            "secret_access_key": secret_key,
-            "session_token": session_token,
-        },
     }
 
 
@@ -268,7 +245,6 @@ def _project_bedrock(
     if config_type is None:
         from botocore.config import Config as config_type  # type: ignore[no-redef]
 
-    credentials = request["credentials"]
     config = config_type(
         connect_timeout=request["connect_timeout_seconds"],
         read_timeout=request["read_timeout_seconds"],
@@ -277,9 +253,6 @@ def _project_bedrock(
     client = boto3_module.client(
         "bedrock-runtime",
         region_name=request["region"],
-        aws_access_key_id=credentials["access_key_id"],
-        aws_secret_access_key=credentials["secret_access_key"],
-        aws_session_token=credentials["session_token"],
         config=config,
     )
     converse = getattr(client, "converse", None)

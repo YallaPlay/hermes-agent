@@ -8,7 +8,7 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
+
 
 import pytest
 
@@ -24,12 +24,10 @@ from agent.continuation_projector import (
     BEDROCK_PROJECTOR_PROTOCOL_V1,
     WORKER_STDERR_MAX_BYTES,
     WORKER_STDOUT_MAX_BYTES,
-    BedrockCredentialSnapshotV1,
     BedrockProjectorFailureCode,
     BedrockProjectorTransportError,
     ContinuationPreviewConfigurationError,
     StrictBedrockProjectorV1,
-    resolve_bedrock_credential_snapshot,
     resolve_continuation_preview_settings,
 )
 from agent.continuation_projector_worker import (
@@ -63,14 +61,6 @@ def _settings(*, timeout: float = 2.0):
     return resolve_continuation_preview_settings(_config(timeout=timeout), environ={})
 
 
-def _credentials() -> BedrockCredentialSnapshotV1:
-    return BedrockCredentialSnapshotV1(
-        access_key_id="AKIA_TEST_ONLY",
-        secret_access_key="secret-test-only",
-        session_token="session-test-only",
-    )
-
-
 def _request(attempt: int = 1) -> ProjectorRequestV1:
     return ProjectorRequestV1(
         kind=ProjectorRequestKind.PRIMARY if attempt == 1 else ProjectorRequestKind.REPAIR,
@@ -99,7 +89,8 @@ raw = json.dumps({{
     "region": request["region"],
     "max_output_tokens": request["max_output_tokens"],
     "hermes_home": os.environ.get("HERMES_HOME"),
-    "inherited_access_key": os.environ.get("AWS_ACCESS_KEY_ID"),
+    "inherited_access_key": bool(os.environ.get("AWS_ACCESS_KEY_ID")),
+    "metadata_disabled": os.environ.get("AWS_EC2_METADATA_DISABLED"),
     "worker_home": os.environ.get("HOME"),
 }})
 json.dump({{
@@ -213,37 +204,13 @@ def test_preview_enabled_requires_a_real_boolean():
         )
 
 
-def test_resolve_credentials_returns_an_immutable_frozen_snapshot():
-    frozen = SimpleNamespace(
-        access_key="resolved-key",
-        secret_key="resolved-secret",
-        token="resolved-token",
-    )
-    refreshable = SimpleNamespace(get_frozen_credentials=lambda: frozen)
-    session = SimpleNamespace(get_credentials=lambda: refreshable)
-
-    result = resolve_bedrock_credential_snapshot(session=session)
-
-    assert result.access_key_id == "resolved-key"
-    assert result.secret_access_key == "resolved-secret"
-    assert result.session_token == "resolved-token"
-    with pytest.raises(AttributeError):
-        result.access_key_id = "changed"
-    assert "resolved-secret" not in repr(result)
-
-
-def test_resolve_credentials_fails_closed_when_refresh_or_auth_is_required():
-    session = SimpleNamespace(get_credentials=lambda: None)
-    with pytest.raises(ContinuationPreviewConfigurationError, match="credentials"):
-        resolve_bedrock_credential_snapshot(session=session)
-
-
-def test_strict_projector_runs_detached_worker_with_scrubbed_environment(tmp_path, monkeypatch):
+def test_strict_projector_runs_detached_worker_with_zero_write_credential_sources(
+    tmp_path, monkeypatch
+):
     monkeypatch.setenv("HERMES_HOME", "/secret/profile")
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "ambient-key-must-not-leak")
     projector = StrictBedrockProjectorV1(
         _settings(),
-        _credentials(),
         worker_command=_echo_worker(tmp_path),
     )
 
@@ -258,7 +225,8 @@ def test_strict_projector_runs_detached_worker_with_scrubbed_environment(tmp_pat
         "region": "us-west-2",
         "max_output_tokens": BEDROCK_PROJECTOR_MAX_OUTPUT_TOKENS,
         "hermes_home": None,
-        "inherited_access_key": None,
+        "inherited_access_key": True,
+        "metadata_disabled": None,
         "worker_home": "/",
     }
     assert response.metadata.projector == "bedrock/global.anthropic.claude-sonnet-5"
@@ -274,7 +242,6 @@ def test_strict_projector_runs_detached_worker_with_scrubbed_environment(tmp_pat
 def test_strict_projector_allows_only_primary_then_one_repair(tmp_path):
     projector = StrictBedrockProjectorV1(
         _settings(),
-        _credentials(),
         worker_command=_echo_worker(tmp_path),
     )
 
@@ -289,7 +256,6 @@ def test_strict_projector_allows_only_primary_then_one_repair(tmp_path):
 def test_strict_projector_rejects_repair_as_first_call_without_spawning(tmp_path):
     projector = StrictBedrockProjectorV1(
         _settings(),
-        _credentials(),
         worker_command=_echo_worker(tmp_path),
     )
 
@@ -321,7 +287,7 @@ else:
 """,
     )
     settings = replace(_settings(), timeout_seconds=0.22)
-    projector = StrictBedrockProjectorV1(settings, _credentials(), worker_command=worker)
+    projector = StrictBedrockProjectorV1(settings, worker_command=worker)
 
     projector(_request(1))
     with pytest.raises(TimeoutError):
@@ -341,7 +307,6 @@ def test_cancellation_callback_kills_worker_and_is_typed(tmp_path):
     threading.Timer(0.08, cancelled.set).start()
     projector = StrictBedrockProjectorV1(
         _settings(),
-        _credentials(),
         worker_command=worker,
         cancellation_requested=cancelled.is_set,
     )
@@ -356,7 +321,7 @@ def test_worker_stdout_and_stderr_are_hard_bounded(tmp_path):
         f"import sys\nsys.stdout.buffer.write(b'x' * {WORKER_STDOUT_MAX_BYTES + 1})\n",
     )
     stdout_projector = StrictBedrockProjectorV1(
-        _settings(), _credentials(), worker_command=too_much_stdout
+        _settings(), worker_command=too_much_stdout
     )
     with pytest.raises(ProjectorResponseError, match="stdout"):
         stdout_projector(_request())
@@ -366,7 +331,7 @@ def test_worker_stdout_and_stderr_are_hard_bounded(tmp_path):
         f"import sys\nsys.stderr.buffer.write(b'x' * {WORKER_STDERR_MAX_BYTES + 1})\n",
     )
     stderr_projector = StrictBedrockProjectorV1(
-        _settings(), _credentials(), worker_command=too_much_stderr
+        _settings(), worker_command=too_much_stderr
     )
     with pytest.raises(ProjectorTransportError, match="stderr"):
         stderr_projector(_request())
@@ -391,7 +356,6 @@ def test_worker_stdout_and_stderr_are_hard_bounded(tmp_path):
 def test_worker_protocol_failures_are_typed(tmp_path, source, error_type, match):
     projector = StrictBedrockProjectorV1(
         _settings(),
-        _credentials(),
         worker_command=_write_worker(tmp_path, source),
     )
 
@@ -410,7 +374,6 @@ print(json.dumps({{
 """
     projector = StrictBedrockProjectorV1(
         _settings(),
-        _credentials(),
         worker_command=_write_worker(tmp_path, source),
     )
 
@@ -432,7 +395,6 @@ print(json.dumps({{
 """
     projector = StrictBedrockProjectorV1(
         _settings(),
-        _credentials(),
         worker_command=_write_worker(tmp_path, source),
     )
 
@@ -454,11 +416,6 @@ def _worker_payload(**updates):
         "max_output_bytes": PROJECTOR_OUTPUT_MAX_BYTES,
         "connect_timeout_seconds": 10.0,
         "read_timeout_seconds": 30.0,
-        "credentials": {
-            "access_key_id": "key",
-            "secret_access_key": "secret",
-            "session_token": "token",
-        },
     }
     payload.update(updates)
     return payload
@@ -473,7 +430,7 @@ def test_worker_validation_rejects_unknown_fields_and_unbounded_values():
         _validate_request(_worker_payload(max_output_bytes=PROJECTOR_OUTPUT_MAX_BYTES + 1))
 
 
-def test_worker_calls_bedrock_once_with_static_credentials_and_no_sampling_parameters():
+def test_worker_calls_bedrock_once_without_transporting_credentials_or_sampling_parameters():
     captured = {}
 
     class FakeClient:
@@ -503,9 +460,9 @@ def test_worker_calls_bedrock_once_with_static_credentials_and_no_sampling_param
     )
 
     assert captured["service"] == "bedrock-runtime"
-    assert captured["client"]["aws_access_key_id"] == "key"
-    assert captured["client"]["aws_secret_access_key"] == "secret"
-    assert captured["client"]["aws_session_token"] == "token"
+    assert "aws_access_key_id" not in captured["client"]
+    assert "aws_secret_access_key" not in captured["client"]
+    assert "aws_session_token" not in captured["client"]
     assert captured["config"]["retries"] == {"total_max_attempts": 1, "mode": "standard"}
     inference = captured["converse"]["inferenceConfig"]
     assert inference == {"maxTokens": BEDROCK_PROJECTOR_MAX_OUTPUT_TOKENS}

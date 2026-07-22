@@ -4,7 +4,7 @@ This module owns two boundaries:
 
 * pure resolution from an already-loaded configuration mapping; it never calls
   Hermes config/plugin/provider discovery itself, and
-* a one-route subprocess adapter with static credentials, a cumulative
+* a one-route subprocess adapter with zero-write credential sources, a cumulative
   deadline, no fallback/retry/accounting, and bounded streamed output.
 
 The corresponding worker is intentionally standalone and installs a Python
@@ -138,24 +138,6 @@ class ContinuationPreviewSettingsV1:
                 "disabled continuation preview cannot resolve a projector route"
             )
 
-
-@dataclass(frozen=True)
-class BedrockCredentialSnapshotV1:
-    """Already-refreshed AWS credentials copied before the strict region."""
-
-    access_key_id: str = field(repr=False)
-    secret_access_key: str = field(repr=False)
-    session_token: str | None = field(default=None, repr=False)
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.access_key_id, str) or not self.access_key_id:
-            raise ContinuationPreviewConfigurationError("Bedrock credentials have no access key")
-        if not isinstance(self.secret_access_key, str) or not self.secret_access_key:
-            raise ContinuationPreviewConfigurationError("Bedrock credentials have no secret key")
-        if self.session_token is not None and not isinstance(self.session_token, str):
-            raise ContinuationPreviewConfigurationError(
-                "Bedrock credentials have an invalid session token"
-            )
 
 
 def _mapping(value: Any, path: str) -> Mapping[str, Any]:
@@ -312,41 +294,6 @@ def resolve_continuation_preview_settings(
     )
 
 
-def resolve_bedrock_credential_snapshot(*, session: Any = None) -> BedrockCredentialSnapshotV1:
-    """Freeze the active AWS credential before entering the strict worker.
-
-    ``get_frozen_credentials`` may refresh an SSO/assume-role source, so callers
-    must invoke this while preparing preview settings, never from the worker.
-    """
-
-    try:
-        if session is None:
-            import botocore.session
-
-            session = botocore.session.get_session()
-        credentials = session.get_credentials()
-        if credentials is None:
-            raise ContinuationPreviewConfigurationError(
-                "Bedrock credentials are unavailable or require authentication"
-            )
-        frozen = credentials.get_frozen_credentials()
-        if frozen is None:
-            raise ContinuationPreviewConfigurationError(
-                "Bedrock credentials could not be frozen"
-            )
-        return BedrockCredentialSnapshotV1(
-            access_key_id=frozen.access_key,
-            secret_access_key=frozen.secret_key,
-            session_token=getattr(frozen, "token", None),
-        )
-    except ContinuationPreviewConfigurationError:
-        raise
-    except Exception as exc:
-        raise ContinuationPreviewConfigurationError(
-            "Bedrock credentials could not be resolved before the strict preview boundary"
-        ) from exc
-
-
 def _default_worker_command() -> tuple[str, ...]:
     worker = Path(__file__).with_name("continuation_projector_worker.py").resolve()
     return (sys.executable, "-I", "-B", str(worker))
@@ -368,6 +315,19 @@ def _worker_environment(source: Mapping[str, str]) -> dict[str, str]:
         "https_proxy",
         "http_proxy",
         "no_proxy",
+        # Zero-local-write AWS sources only. Shared config and credential files
+        # are redirected to /dev/null below; the worker audit hook denies any
+        # cache write attempted by a refreshable source.
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_SECURITY_TOKEN",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_ROLE_ARN",
+        "AWS_ROLE_SESSION_NAME",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
     )
     env = {key: value for key in allowed if (value := source.get(key))}
     env.update(
@@ -376,7 +336,6 @@ def _worker_environment(source: Mapping[str, str]) -> dict[str, str]:
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONNOUSERSITE": "1",
             "PYTHONWARNINGS": "ignore",
-            "AWS_EC2_METADATA_DISABLED": "true",
             "AWS_METADATA_SERVICE_TIMEOUT": "1",
             "AWS_METADATA_SERVICE_NUM_ATTEMPTS": "1",
             "AWS_SHARED_CREDENTIALS_FILE": os.devnull,
@@ -481,7 +440,6 @@ class StrictBedrockProjectorV1:
     def __init__(
         self,
         settings: ContinuationPreviewSettingsV1,
-        credentials: BedrockCredentialSnapshotV1,
         *,
         worker_command: tuple[str, ...] | None = None,
         cancellation_requested: Callable[[], bool] | None = None,
@@ -492,15 +450,11 @@ class StrictBedrockProjectorV1:
             raise ContinuationPreviewConfigurationError(
                 "strict Bedrock projector requires enabled preview settings"
             )
-        if not isinstance(credentials, BedrockCredentialSnapshotV1):
-            raise ContinuationPreviewConfigurationError(
-                "strict Bedrock projector requires frozen credentials"
-            )
+
         command = tuple(worker_command or _default_worker_command())
         if not command or any(not isinstance(part, str) or not part for part in command):
             raise ContinuationPreviewConfigurationError("worker command is invalid")
         self.settings = settings
-        self._credentials = credentials
         self._worker_command = command
         self._cancellation_requested = cancellation_requested or (lambda: False)
         self._environment = _worker_environment(environ if environ is not None else os.environ)
@@ -561,11 +515,6 @@ class StrictBedrockProjectorV1:
             "max_output_bytes": request.max_output_bytes,
             "connect_timeout_seconds": min(_DEFAULT_CONNECT_TIMEOUT_SECONDS, remaining),
             "read_timeout_seconds": min(600.0, remaining),
-            "credentials": {
-                "access_key_id": self._credentials.access_key_id,
-                "secret_access_key": self._credentials.secret_access_key,
-                "session_token": self._credentials.session_token,
-            },
         }
         payload = json.dumps(
             value,
