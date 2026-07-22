@@ -2764,8 +2764,8 @@ class HermesACPAgent(acp.Agent):
             specs.append(
                 {
                     "name": "rebase",
-                    "description": "Preview a read-only continuation checkpoint",
-                    "input_hint": "--preview",
+                    "description": "Continuation checkpoint: preview it, or spawn a new session from it",
+                    "input_hint": "--preview | --spawn",
                 }
             )
         for spec in specs:
@@ -2849,7 +2849,7 @@ class HermesACPAgent(acp.Agent):
         for cmd, desc in self._SLASH_COMMANDS.items():
             lines.append(f"  /{cmd:10s}  {desc}")
         if self._continuation_preview_enabled():
-            lines.append("  /rebase     Preview a read-only continuation checkpoint")
+            lines.append("  /rebase     Preview a continuation checkpoint (--preview) or spawn a new session from it (--spawn)")
         lines.append("")
         lines.append("Unrecognized /commands are sent to the model as normal messages.")
         return "\n".join(lines)
@@ -3124,10 +3124,18 @@ class HermesACPAgent(acp.Agent):
         return f"Queued for the next turn. ({depth} queued)"
 
     def _cmd_rebase(self, args: str, state: SessionState) -> str:
-        """Render a disabled-by-default checkpoint preview without persisting it."""
+        """Render a checkpoint preview, or spawn a new session from it.
 
-        if args.strip() != "--preview":
-            return "Usage: /rebase --preview"
+        ``--preview`` compiles and renders without persisting anything.
+        ``--spawn`` compiles the same read-only checkpoint and then creates a
+        NEW session seeded with the four-message paused bootstrap. The parent
+        session is never mutated in either mode: spawn is additive (one new
+        session row) and manual — no automatic rebasing occurs.
+        """
+
+        mode = args.strip()
+        if mode not in ("--preview", "--spawn"):
+            return "Usage: /rebase --preview | --spawn"
         if self._continuation_preview_config_error:
             return "Continuation preview unavailable: invalid strict projector configuration."
         settings = self._continuation_preview_settings
@@ -3184,6 +3192,47 @@ class HermesACPAgent(acp.Agent):
         assert result.markdown is not None
         metadata = result.projector_metadata[-1] if result.projector_metadata else None
         projector_name = metadata.projector if metadata is not None else "strict auxiliary"
+
+        if mode == "--spawn":
+            bootstrap = result.messages
+            assert bootstrap is not None
+            try:
+                parent_agent = state.agent
+                new_state = self.session_manager.create_session(
+                    cwd=state.cwd,
+                    owner=state.owner,
+                    model=state.model or None,
+                    requested_provider=getattr(parent_agent, "provider", None),
+                    base_url=getattr(parent_agent, "base_url", None),
+                    api_mode=getattr(parent_agent, "api_mode", None),
+                )
+                # Carry the parent's edit-approval mode and reasoning effort
+                # (same rationale as acp_spawn_session), record display-only
+                # fork lineage, and seed the paused four-message bootstrap.
+                new_state.mode = state.mode
+                new_state.effort = state.effort
+                _apply_effort_to_agent(new_state.agent, state.effort)
+                new_state.parent_id = state.session_id
+                new_state.history = bootstrap
+                self.session_manager.save_session(new_state.session_id)
+            except Exception:
+                logger.exception(
+                    "Continuation spawn failed for session %s", state.session_id
+                )
+                return (
+                    "Continuation checkpoint compiled, but spawning the new "
+                    "session failed. The current session is unchanged."
+                )
+            return (
+                "CONTINUATION CHECKPOINT — SPAWNED NEW SESSION\n"
+                f"New session: {new_state.session_id}\n"
+                "The current session is unchanged; open the new session and "
+                "send your next message to continue from the checkpoint.\n\n"
+                f"{result.markdown}\n\n"
+                f"Preview diagnostics: projector={projector_name}; calls={result.projector_calls}; "
+                f"source={result.source.source_digest if result.source is not None else 'unavailable'}"
+            )
+
         return (
             "CONTINUATION CHECKPOINT — PREVIEW ONLY\n"
             "Not persisted; no child session was created.\n\n"

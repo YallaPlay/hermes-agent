@@ -243,8 +243,71 @@ def test_rebase_command_requires_literal_preview_flag_and_never_calls_projector(
 
     rendered = acp_agent._handle_slash_command("/rebase", state)
 
-    assert rendered == "Usage: /rebase --preview"
+    assert rendered == "Usage: /rebase --preview | --spawn"
     assert fake.runs == []
     assert factory_calls == []
     assert state.history == before[0]
     assert db.writes == before[1]
+
+
+@pytest.mark.asyncio
+async def test_rebase_spawn_creates_seeded_session_and_leaves_parent_untouched():
+    projector = RecordingProjector([proposal()])
+    acp_agent, state, fake, db, conn, factory_calls = make_surface(
+        config=enabled_config(), projector=projector
+    )
+    before_history = copy.deepcopy(state.history)
+    manager = acp_agent.session_manager
+    before_session_ids = set(manager._sessions)
+
+    response = await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="/rebase --spawn")],
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert fake.runs == []
+    # Parent session history and runtime state are untouched.
+    assert state.history == before_history
+    assert state.is_running is False
+
+    rendered = _agent_message_text(conn)
+    assert "SPAWNED NEW SESSION" in rendered
+    new_ids = set(manager._sessions) - before_session_ids
+    assert len(new_ids) == 1
+    new_id = new_ids.pop()
+    assert new_id in rendered
+
+    new_state = manager.get_session(new_id)
+    assert new_state is not None
+    # Seeded with the canonical four-message paused bootstrap.
+    assert len(new_state.history) == 4
+    assert new_state.history[0]["role"] == "user"
+    assert "ContinuationCheckpointV1" in new_state.history[0]["content"]
+    assert new_state.history[-1]["role"] == "assistant"
+    # Display-only lineage points at the parent; the new session was persisted.
+    assert new_state.parent_id == state.session_id
+    assert "create_session" in db.writes
+
+
+@pytest.mark.asyncio
+async def test_rebase_spawn_failure_keeps_parent_unchanged():
+    projector = RecordingProjector([TimeoutError("bounded timeout")])
+    acp_agent, state, fake, db, conn, _factory_calls = make_surface(
+        config=enabled_config(), projector=projector
+    )
+    before = (copy.deepcopy(state.history), list(db.writes))
+    manager = acp_agent.session_manager
+    before_session_ids = set(manager._sessions)
+
+    await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="/rebase --spawn")],
+    )
+
+    rendered = _agent_message_text(conn)
+    assert "failed" in rendered.lower()
+    assert fake.runs == []
+    assert state.history == before[0]
+    assert db.writes == before[1]
+    assert set(manager._sessions) == before_session_ids
