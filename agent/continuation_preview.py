@@ -1134,6 +1134,8 @@ class ProjectorCallMetadataV1:
     latency_ms: int | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
+    config_digest: str | None = None
+    route_digest: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.projector, str) or not self.projector.strip():
@@ -1144,6 +1146,13 @@ class ProjectorCallMetadataV1:
                 isinstance(value, bool) or not isinstance(value, int) or value < 0
             ):
                 raise ValueError(f"projector metadata {name} must be a non-negative integer")
+        for name in ("config_digest", "route_digest"):
+            value = getattr(self, name)
+            if value is not None and (
+                not isinstance(value, str)
+                or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            ):
+                raise ValueError(f"projector metadata {name} must be a SHA-256 digest")
 
 
 @dataclass(frozen=True)

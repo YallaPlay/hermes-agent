@@ -1461,6 +1461,13 @@ DEFAULT_CONFIG = {
         },
     },
 
+    # Disabled-by-default read-only continuation checkpoint preview. This
+    # slice exposes no command/RPC surface yet; callers must also resolve the
+    # pinned strict auxiliary route before constructing a projector.
+    "continuation_checkpoint": {
+        "preview_enabled": False,
+    },
+
     "compression": {
         "enabled": True,
         "threshold": 0.50,            # compress when context usage exceeds this ratio.
@@ -1653,6 +1660,19 @@ DEFAULT_CONFIG = {
             "timeout": 120,        # seconds — compression summarises large contexts; increase for local models
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
+        },
+        # Read-only continuation projection. The strict preview resolver uses
+        # this route only when it is explicitly pinned to Bedrock; blank/auto
+        # inherits an explicitly pinned Bedrock compression route. No generic
+        # provider fallback, retries, accounting, or catalog refresh occur.
+        "continuation_checkpoint": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 600,
+            "extra_body": {},
+            "reasoning_effort": "",
         },
         # Note: session_search no longer uses an auxiliary LLM (PR #27590 —
         # single-shape tool returns DB content directly). The old
