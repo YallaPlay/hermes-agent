@@ -8,6 +8,7 @@ import re
 import sqlite3
 import asyncio
 import concurrent.futures
+import html
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -1390,6 +1391,52 @@ def _default_renderer(
     )
 
 
+def _render_visible_warnings(
+    markdown: str,
+    warnings: tuple[CheckpointWarningV1, ...],
+) -> str:
+    if not warnings:
+        return markdown
+    lines = [markdown.rstrip(), "", "## Warnings"]
+    for warning in warnings:
+        message = _warning_code_text(warning.message)
+        recovery = _warning_code_text(warning.recovery_pointer)
+        line = (
+            f"- [{warning.severity.value}] {warning.code.value}: "
+            f"<code>{message}</code>"
+        )
+        if recovery:
+            line += f" Recovery: <code>{recovery}</code>"
+        lines.append(line)
+    return "\n".join(lines) + "\n"
+
+
+def _warning_code_text(value: str) -> str:
+    escaped = html.escape(" ".join(value.split()), quote=True)
+    for character, entity in (
+        ("[", "&#91;"),
+        ("]", "&#93;"),
+        ("(", "&#40;"),
+        (")", "&#41;"),
+        ("`", "&#96;"),
+    ):
+        escaped = escaped.replace(character, entity)
+    return escaped
+
+
+def _merge_warnings(
+    *groups: tuple[CheckpointWarningV1, ...],
+) -> tuple[CheckpointWarningV1, ...]:
+    merged: list[CheckpointWarningV1] = []
+    for group in groups:
+        occurrences: dict[CheckpointWarningV1, int] = {}
+        for warning in group:
+            occurrences[warning] = occurrences.get(warning, 0) + 1
+            if merged.count(warning) < occurrences[warning]:
+                merged.append(warning)
+    return tuple(merged)
+
+
 def _failed_preview(
     code: PreviewFailureCode,
     *,
@@ -1521,7 +1568,9 @@ def compile_continuation_snapshot(
             issue.code in _NON_REPAIRABLE_ISSUES for issue in build.issues
         )
 
+    repair_warnings: tuple[CheckpointWarningV1, ...] = ()
     if repairable and repair_codes:
+        repair_warnings = primary_warnings
         try:
             repair_request = _repair_request(
                 response.raw_json,
@@ -1532,7 +1581,7 @@ def compile_continuation_snapshot(
             return _failed_preview(
                 PreviewFailureCode.INTERNAL_ERROR,
                 source=snapshot.source,
-                warnings=primary_request.warnings + primary_warnings,
+                warnings=_merge_warnings(primary_request.warnings, repair_warnings),
                 issues=(
                     ValidationIssueV1(
                         "repair_input_error",
@@ -1550,7 +1599,7 @@ def compile_continuation_snapshot(
             return _failed_preview(
                 exc.code,
                 source=snapshot.source,
-                warnings=primary_request.warnings + primary_warnings,
+                warnings=_merge_warnings(primary_request.warnings, repair_warnings),
                 issues=(exc.issue,),
                 metadata=tuple(metadata),
                 projector_calls=calls,
@@ -1561,7 +1610,7 @@ def compile_continuation_snapshot(
             return _failed_preview(
                 PreviewFailureCode.VALIDATION_FAILED,
                 source=snapshot.source,
-                warnings=primary_request.warnings,
+                warnings=_merge_warnings(primary_request.warnings, repair_warnings),
                 issues=parse_issues,
                 metadata=tuple(metadata),
                 projector_calls=calls,
@@ -1582,7 +1631,7 @@ def compile_continuation_snapshot(
             return _failed_preview(
                 PreviewFailureCode.INTERNAL_ERROR,
                 source=snapshot.source,
-                warnings=primary_request.warnings,
+                warnings=_merge_warnings(primary_request.warnings, repair_warnings),
                 issues=(
                     ValidationIssueV1(
                         "checkpoint_assembly_error",
@@ -1600,7 +1649,11 @@ def compile_continuation_snapshot(
         return _failed_preview(
             PreviewFailureCode.VALIDATION_FAILED,
             source=snapshot.source,
-            warnings=primary_request.warnings + warnings,
+            warnings=_merge_warnings(
+                primary_request.warnings,
+                repair_warnings,
+                warnings,
+            ),
             issues=issues,
             metadata=tuple(metadata),
             projector_calls=calls,
@@ -1620,7 +1673,11 @@ def compile_continuation_snapshot(
         return _failed_preview(
             PreviewFailureCode.RENDERER_FAILED,
             source=snapshot.source,
-            warnings=primary_request.warnings + build.warnings,
+            warnings=_merge_warnings(
+                primary_request.warnings,
+                repair_warnings,
+                build.warnings,
+            ),
             issues=(
                 ValidationIssueV1(
                     "renderer_error",
@@ -1635,7 +1692,11 @@ def compile_continuation_snapshot(
         return _failed_preview(
             PreviewFailureCode.RENDERER_FAILED,
             source=snapshot.source,
-            warnings=primary_request.warnings + build.warnings,
+            warnings=_merge_warnings(
+                primary_request.warnings,
+                repair_warnings,
+                build.warnings,
+            ),
             issues=(
                 ValidationIssueV1(
                     "renderer_error",
@@ -1647,14 +1708,19 @@ def compile_continuation_snapshot(
             projector_calls=calls,
         )
 
+    visible_warnings = _merge_warnings(
+        primary_request.warnings,
+        repair_warnings,
+        build.warnings,
+    )
     return ContinuationPreviewResultV1(
         status=ContinuationPreviewStatus.SUCCESS,
         failure_code=None,
         source=snapshot.source,
         checkpoint=build.checkpoint,
         _messages_bytes=rendered._messages_bytes,
-        markdown=rendered.markdown,
-        warnings=primary_request.warnings + build.warnings,
+        markdown=_render_visible_warnings(rendered.markdown, visible_warnings),
+        warnings=visible_warnings,
         issues=(),
         projector_metadata=tuple(metadata),
         projector_calls=calls,
