@@ -1413,9 +1413,17 @@ def _repair_request(
     raw_json: str,
     codes: tuple[str, ...],
     warnings: tuple[CheckpointWarningV1, ...],
+    issues: tuple[ValidationIssueV1, ...] = (),
 ) -> ProjectorRequestV1:
     clean_output, _ = _redact_projector_value(raw_json, escape_markers=True)
     bounded_output, _ = _truncate_text(str(clean_output), PROJECTOR_OUTPUT_MAX_BYTES)
+    issue_details = []
+    for issue in issues[:64]:
+        clean_message, _ = _redact_projector_value(issue.message, escape_markers=True)
+        bounded_message, _ = _truncate_text(str(clean_message), 500)
+        issue_details.append(
+            {"code": issue.code, "path": issue.path, "message": bounded_message}
+        )
     payload = {
         "kind": ProjectorRequestKind.REPAIR.value,
         "instruction": (
@@ -1423,6 +1431,7 @@ def _repair_request(
             "unsupported authority/effects, and fix only the listed validation codes."
         ),
         "validation_codes": sorted(set(codes))[:64],
+        "validation_issues": issue_details,
         "prior_output": bounded_output,
     }
     return ProjectorRequestV1(
@@ -1629,6 +1638,7 @@ def compile_continuation_snapshot(
                 response.raw_json,
                 repair_codes,
                 primary_request.warnings,
+                issues=primary_issues,
             )
         except Exception:
             return _failed_preview(

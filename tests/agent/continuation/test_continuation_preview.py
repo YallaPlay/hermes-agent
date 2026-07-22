@@ -604,9 +604,16 @@ def test_malformed_primary_gets_one_bounded_repair_with_only_codes_and_prior_out
         ProjectorRequestKind.REPAIR,
     ]
     repair = json.loads(projector.requests[1].prompt)
-    assert set(repair) == {"kind", "instruction", "validation_codes", "prior_output"}
+    assert set(repair) == {"kind", "instruction", "validation_codes", "validation_issues", "prior_output"}
     assert repair["kind"] == "repair"
     assert repair["validation_codes"] == ["malformed_json"]
+    assert repair["validation_issues"] == [
+        {
+            "code": "malformed_json",
+            "path": "$",
+            "message": "projector output is not one strict JSON value",
+        }
+    ]
     assert repair["prior_output"] == "not-json"
     assert "evidence" not in projector.requests[1].prompt
     assert "source_digest" not in projector.requests[1].prompt
