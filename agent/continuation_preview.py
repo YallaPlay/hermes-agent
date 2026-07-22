@@ -468,6 +468,7 @@ def _snapshot_from_rows(
     *,
     session_id: str,
     lineage_root_session_id: str,
+    prior_checkpoint_envelope: str | None = None,
 ) -> ContinuationEvidenceSnapshotV1:
     if not rows:
         raise EvidenceSnapshotError(
@@ -498,23 +499,13 @@ def _snapshot_from_rows(
         active_message_count=len(rows),
         last_active_message_id=rows[-1].message_id,
     )
-    prior_envelope = next(
-        (
-            row.content
-            for row in reversed(rows)
-            if row.role is MessageRole.USER
-            and isinstance(row.content, str)
-            and row.content.startswith(ENVELOPE_PREFIX + "\n\n")
-        ),
-        None,
-    )
     return ContinuationEvidenceSnapshotV1(
         parent_session_id=session_id,
         lineage_root_session_id=lineage_root_session_id,
         rows=rows,
         exact_user_event=exact_event,
         source=source,
-        prior_checkpoint_envelope=prior_envelope,
+        prior_checkpoint_envelope=prior_checkpoint_envelope,
     )
 
 
@@ -523,6 +514,7 @@ def build_continuation_evidence_snapshot(
     *,
     session_id: str,
     lineage_root_session_id: str | None = None,
+    prior_checkpoint_envelope: str | None = None,
 ) -> ContinuationEvidenceSnapshotV1:
     """Freeze a host-owned in-memory conversation without filesystem access.
 
@@ -541,6 +533,7 @@ def build_continuation_evidence_snapshot(
         rows,
         session_id=session_id,
         lineage_root_session_id=lineage_root_session_id or session_id,
+        prior_checkpoint_envelope=prior_checkpoint_envelope,
     )
 
 
@@ -691,23 +684,13 @@ def read_continuation_evidence_snapshot(
         active_message_count=len(rows),
         last_active_message_id=rows[-1].message_id,
     )
-    prior_envelope = next(
-        (
-            row.content
-            for row in reversed(rows)
-            if row.role is MessageRole.USER
-            and isinstance(row.content, str)
-            and row.content.startswith(ENVELOPE_PREFIX + "\n\n")
-        ),
-        None,
-    )
     return ContinuationEvidenceSnapshotV1(
         parent_session_id=session_id,
         lineage_root_session_id=root,
         rows=rows,
         exact_user_event=exact_event,
         source=source,
-        prior_checkpoint_envelope=prior_envelope,
+        prior_checkpoint_envelope=None,
     )
 
 
@@ -962,6 +945,13 @@ def sanitize_evidence_snapshot(
                 trust_class=trust_class,
                 content=content,
                 effect_disposition=None,
+                content_sha256=hashlib.sha256(
+                    (
+                        row.content.encode("utf-8")
+                        if isinstance(row.content, str)
+                        else canonical_json_bytes(row.content)
+                    )
+                ).hexdigest(),
             )
         )
 

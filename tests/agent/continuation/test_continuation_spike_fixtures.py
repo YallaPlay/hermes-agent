@@ -221,11 +221,18 @@ def _proposal(message_id: int, quote: str) -> dict[str, Any]:
     }
 
 
-def _snapshot(history: list[dict[str, Any]], session_id: str, *, root: str = "spike-root"):
+def _snapshot(
+    history: list[dict[str, Any]],
+    session_id: str,
+    *,
+    root: str = "spike-root",
+    prior_checkpoint_envelope: str | None = None,
+):
     return build_continuation_evidence_snapshot(
         history,
         session_id=session_id,
         lineage_root_session_id=root,
+        prior_checkpoint_envelope=prior_checkpoint_envelope,
     )
 
 
@@ -559,7 +566,11 @@ def test_005d_only_prior_host_safety_survives_three_generations(
     assert second_proposal["retry_hazards"] == []
     second_projector = FrozenProjector(second_proposal)
     second_history = [*host_messages, {"role": "user", "content": generation_two_text}]
-    second_snapshot = _snapshot(second_history, "005d-gen-2")
+    second_snapshot = _snapshot(
+        second_history,
+        "005d-gen-2",
+        prior_checkpoint_envelope=host_messages[0]["content"],
+    )
     state_before = _bind_guard_inputs(
         state,
         history=second_history,
@@ -580,7 +591,11 @@ def test_005d_only_prior_host_safety_survives_three_generations(
     assert third_proposal["retry_hazards"] == []
     third_projector = FrozenProjector(third_proposal)
     third_history = [*second.messages, {"role": "user", "content": generation_three_text}]
-    third_snapshot = _snapshot(third_history, "005d-gen-3")
+    third_snapshot = _snapshot(
+        third_history,
+        "005d-gen-3",
+        prior_checkpoint_envelope=second.messages[0]["content"],
+    )
     state_before = _bind_guard_inputs(
         state,
         history=third_history,
@@ -610,7 +625,11 @@ def test_005d_only_prior_host_safety_survives_three_generations(
         f"Additional active constraint {index}." for index in range(MAX_SAFETY_ITEMS)
     ]
     overflow_history = [*third.messages, {"role": "user", "content": overflow_text}]
-    overflow_snapshot = _snapshot(overflow_history, "005d-overflow")
+    overflow_snapshot = _snapshot(
+        overflow_history,
+        "005d-overflow",
+        prior_checkpoint_envelope=third.messages[0]["content"],
+    )
     state_before = _bind_guard_inputs(
         state,
         history=overflow_history,

@@ -357,6 +357,7 @@ class EvidenceRecordV1:
     trust_class: TrustClass
     content: str
     effect_disposition: EffectDisposition | None = None
+    content_sha256: str | None = None
 
     def __post_init__(self) -> None:
         _require_integer(self.message_id, "evidence.message_id", minimum=1)
@@ -368,6 +369,10 @@ class EvidenceRecordV1:
             raise ValueError("evidence.trust_class must be a TrustClass")
         if not isinstance(self.content, str):
             raise ValueError("evidence.content must be a string")
+        if self.content_sha256 is not None and not re.fullmatch(
+            r"[0-9a-f]{64}", self.content_sha256
+        ):
+            raise ValueError("evidence.content_sha256 must be a lowercase SHA-256 digest")
         if self.trust_class is TrustClass.TRUSTED_USER_EVENT and not (
             self.role is MessageRole.USER and self.origin is EvidenceOrigin.DIRECT_USER
         ):
@@ -1134,6 +1139,13 @@ def _ground_projection(
             "live_user_event_missing",
             "$.evidence",
             "host evidence did not contain the trusted live direct-user event",
+        )
+    live_content_sha256 = live_record.content_sha256 or _content_hash(live_record.content)
+    if live_content_sha256 != source.live_user_event_ref.content_sha256:
+        raise _ProposalError(
+            "live_user_event_mismatch",
+            "$.evidence",
+            "trusted live-user evidence bytes did not match the host source reference",
         )
     objective = live_record.content
     acceptance_criteria = (
