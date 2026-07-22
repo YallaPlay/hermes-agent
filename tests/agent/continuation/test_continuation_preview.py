@@ -613,6 +613,33 @@ def test_malformed_primary_gets_one_bounded_repair_with_only_codes_and_prior_out
     assert len(projector.requests[1].prompt.encode("utf-8")) <= PROJECTOR_INPUT_MAX_BYTES
 
 
+def test_fenced_json_proposal_is_unwrapped_without_a_repair_round(tmp_path):
+    db_path = _compile_fixture(tmp_path)
+    fenced = "```json\n" + json.dumps(_preview_proposal(), indent=2) + "\n```"
+    projector = _RecordingProjector(fenced)
+
+    result = compile_continuation_preview(db_path, "head-session", projector=projector)
+
+    assert result.success is True
+    assert result.projector_calls == 1
+    assert result.checkpoint is not None
+
+
+def test_unbalanced_or_interior_fence_still_fails_strict_parsing(tmp_path):
+    db_path = _compile_fixture(tmp_path)
+    # Opening fence with no closing fence: must NOT be unwrapped, and the
+    # remaining text is not strict JSON, so the compile consumes its one
+    # repair round and then fails.
+    unbalanced = "```json\n" + json.dumps(_preview_proposal())
+    projector = _RecordingProjector(unbalanced, unbalanced)
+
+    result = compile_continuation_preview(db_path, "head-session", projector=projector)
+
+    assert result.success is False
+    assert result.projector_calls == 2
+    assert any(issue.code == "malformed_json" for issue in result.issues)
+
+
 def test_citation_demotion_triggers_one_repair_then_full_grounding_is_rerun(tmp_path):
     db_path = _compile_fixture(tmp_path)
     hostile = _preview_proposal()

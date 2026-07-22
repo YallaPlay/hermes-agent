@@ -1274,7 +1274,30 @@ class _ProjectorCallFailure(RuntimeError):
         self.issue = ValidationIssueV1(issue_code, "$.projector", message)
 
 
+_FENCE_OPEN_RE = re.compile(r"^```[A-Za-z0-9_-]*[ \t]*$")
+
+
+def _strip_markdown_fence(raw_json: str) -> str:
+    """Deterministically unwrap one whole-output markdown code fence.
+
+    Bedrock-hosted projectors routinely wrap the required raw JSON object in
+    a ```json fence despite the instruction. Stripping exactly one balanced
+    outer fence is semantics-neutral: the inner content must still parse as
+    one strict JSON object, so this widens no authority and admits no
+    partial/fenced-prose output (an unbalanced or interior fence is returned
+    unchanged and fails strict parsing as before).
+    """
+
+    stripped = raw_json.strip()
+    lines = stripped.splitlines()
+    if len(lines) >= 3 and _FENCE_OPEN_RE.match(lines[0]) and lines[-1].strip() == "```":
+        return "\n".join(lines[1:-1])
+    return raw_json
+
+
 def _strict_json_object(raw_json: str) -> tuple[Mapping[str, Any] | None, tuple[ValidationIssueV1, ...]]:
+    raw_json = _strip_markdown_fence(raw_json)
+
     def object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, value in pairs:
