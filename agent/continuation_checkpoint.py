@@ -156,6 +156,8 @@ class WarningSeverity(str, Enum):
 class CheckpointWarningCode(str, Enum):
     AUTHORITY_DEMOTED = "authority_demoted"
     DISPOSITION_DEMOTED = "disposition_demoted"
+    POISONED_EVIDENCE = "poisoned_evidence"
+    PROJECTOR_INPUT_TRUNCATED = "projector_input_truncated"
     SAFETY_OVERFLOW = "safety_overflow"
     MALFORMED_PROPOSAL = "malformed_proposal"
     SECRET_DETECTED = "secret_detected"
