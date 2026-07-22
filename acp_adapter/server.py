@@ -12,7 +12,7 @@ import os
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Deque, Optional
+from typing import Any, Callable, Deque, Mapping, Optional
 from urllib.parse import unquote, urlparse
 
 import acp
@@ -672,7 +672,14 @@ class HermesACPAgent(acp.Agent):
         ("xhigh", "XHigh", "Maximum reasoning effort."),
     )
 
-    def __init__(self, session_manager: SessionManager | None = None):
+    def __init__(
+        self,
+        session_manager: SessionManager | None = None,
+        *,
+        continuation_preview_config: Mapping[str, Any] | None = None,
+        continuation_projector_factory: Callable[[Any, Callable[[], bool]], Any]
+        | None = None,
+    ):
         super().__init__()
         self.session_manager = session_manager or SessionManager()
         self._conn: Optional[acp.Client] = None
@@ -680,6 +687,22 @@ class HermesACPAgent(acp.Agent):
         # one derive attempt per session per process, so a failing aux model
         # doesn't get hammered on every sessions-list refresh.
         self._title_backfill_attempted: set[str] = set()
+        self._continuation_preview_settings = None
+        self._continuation_preview_config_error = False
+        self._continuation_projector_factory = continuation_projector_factory
+        preview_config = continuation_preview_config or {
+            "continuation_checkpoint": {"preview_enabled": False}
+        }
+        try:
+            from agent.continuation_projector import resolve_continuation_preview_settings
+
+            self._continuation_preview_settings = resolve_continuation_preview_settings(
+                preview_config
+            )
+        except Exception:
+            # Keep the feature inert on invalid configuration. Do not retain
+            # exception text: config/provider errors can contain sensitive data.
+            self._continuation_preview_config_error = True
 
     # ---- Connection lifecycle -----------------------------------------------
 
@@ -2251,7 +2274,17 @@ class HermesACPAgent(acp.Agent):
         # send the whole multimodal prompt to the agent instead of treating it as
         # an ACP command.
         if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/"):
-            response_text = self._handle_slash_command(user_text, state)
+            slash_name = user_text.split(maxsplit=1)[0].lstrip("/").lower()
+            if slash_name == "rebase":
+                # Projection is synchronous and bounded in a detached worker.
+                # Keep the ACP event loop responsive so cancellation can be
+                # delivered while the preview is running.
+                loop = asyncio.get_running_loop()
+                response_text = await loop.run_in_executor(
+                    _executor, self._handle_slash_command, user_text, state
+                )
+            else:
+                response_text = self._handle_slash_command(user_text, state)
             if response_text is not None:
                 if self._conn:
                     update = acp.update_agent_message_text(response_text)
@@ -2720,10 +2753,22 @@ class HermesACPAgent(acp.Agent):
 
     # ---- Slash commands (headless) -------------------------------------------
 
-    @classmethod
-    def _available_commands(cls) -> list[AvailableCommand]:
+    def _continuation_preview_enabled(self) -> bool:
+        settings = self._continuation_preview_settings
+        return bool(settings is not None and settings.preview_enabled)
+
+    def _available_commands(self) -> list[AvailableCommand]:
         commands: list[AvailableCommand] = []
-        for spec in cls._ADVERTISED_COMMANDS:
+        specs = list(self._ADVERTISED_COMMANDS)
+        if self._continuation_preview_enabled():
+            specs.append(
+                {
+                    "name": "rebase",
+                    "description": "Preview a read-only continuation checkpoint",
+                    "input_hint": "--preview",
+                }
+            )
+        for spec in specs:
             input_hint = spec.get("input_hint")
             commands.append(
                 AvailableCommand(
@@ -2785,6 +2830,9 @@ class HermesACPAgent(acp.Agent):
             "steer": self._cmd_steer,
             "queue": self._cmd_queue,
             "version": self._cmd_version,
+            # Always recognize /rebase so a disabled preview cannot fall
+            # through to the main model as an ordinary user message.
+            "rebase": self._cmd_rebase,
         }.get(cmd)
 
         if handler is None:
@@ -2800,6 +2848,8 @@ class HermesACPAgent(acp.Agent):
         lines = ["Available commands:", ""]
         for cmd, desc in self._SLASH_COMMANDS.items():
             lines.append(f"  /{cmd:10s}  {desc}")
+        if self._continuation_preview_enabled():
+            lines.append("  /rebase     Preview a read-only continuation checkpoint")
         lines.append("")
         lines.append("Unrecognized /commands are sent to the model as normal messages.")
         return "\n".join(lines)
@@ -3072,6 +3122,75 @@ class HermesACPAgent(acp.Agent):
             state.queued_prompts.append(queued_text)
             depth = len(state.queued_prompts)
         return f"Queued for the next turn. ({depth} queued)"
+
+    def _cmd_rebase(self, args: str, state: SessionState) -> str:
+        """Render a disabled-by-default checkpoint preview without persisting it."""
+
+        if args.strip() != "--preview":
+            return "Usage: /rebase --preview"
+        if self._continuation_preview_config_error:
+            return "Continuation preview unavailable: invalid strict projector configuration."
+        settings = self._continuation_preview_settings
+        if settings is None or not settings.preview_enabled:
+            return "Continuation preview is disabled."
+
+        try:
+            from agent.continuation_preview import (
+                build_continuation_evidence_snapshot,
+                compile_continuation_snapshot,
+            )
+
+            # Freeze only host-owned in-memory history. Reading active SQLite
+            # WAL state through a new connection can mutate -shm read marks;
+            # this path therefore performs no SessionDB or filesystem access.
+            with state.runtime_lock:
+                if state.is_running:
+                    return "Continuation preview unavailable while an agent turn is running."
+                snapshot = build_continuation_evidence_snapshot(
+                    state.history,
+                    session_id=state.session_id,
+                )
+
+            cancel_event = state.cancel_event
+            cancellation_requested = (
+                cancel_event.is_set if cancel_event is not None else (lambda: False)
+            )
+            if self._continuation_projector_factory is not None:
+                projector = self._continuation_projector_factory(
+                    settings, cancellation_requested
+                )
+            else:
+                from agent.continuation_projector import StrictBedrockProjectorV1
+
+                projector = StrictBedrockProjectorV1(
+                    settings,
+                    cancellation_requested=cancellation_requested,
+                )
+            result = compile_continuation_snapshot(snapshot, projector=projector)
+        except Exception as exc:
+            code = getattr(getattr(exc, "code", None), "value", None)
+            suffix = f" ({code})" if isinstance(code, str) and code else ""
+            return f"Continuation preview failed before rendering{suffix}."
+
+        if not result.success:
+            failure = result.failure_code.value if result.failure_code is not None else "unknown"
+            issue_codes = ", ".join(sorted({issue.code for issue in result.issues}))
+            details = f"\nValidation: {issue_codes}" if issue_codes else ""
+            return (
+                "Continuation preview failed (no state was changed).\n"
+                f"Failure: {failure}{details}"
+            )
+
+        assert result.markdown is not None
+        metadata = result.projector_metadata[-1] if result.projector_metadata else None
+        projector_name = metadata.projector if metadata is not None else "strict auxiliary"
+        return (
+            "CONTINUATION CHECKPOINT — PREVIEW ONLY\n"
+            "Not persisted; no child session was created.\n\n"
+            f"{result.markdown}\n\n"
+            f"Preview diagnostics: projector={projector_name}; calls={result.projector_calls}; "
+            f"source={result.source.source_digest if result.source is not None else 'unavailable'}"
+        )
 
     def _cmd_version(self, args: str, state: SessionState) -> str:
         return f"Hermes Agent v{HERMES_VERSION}"

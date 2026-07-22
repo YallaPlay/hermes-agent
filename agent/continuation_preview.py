@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Protocol
+from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
 from urllib.parse import quote
 
 from agent.continuation_checkpoint import (
@@ -517,7 +517,7 @@ def _snapshot_from_rows(
 
 
 def build_continuation_evidence_snapshot(
-    history: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
+    history: Sequence[Mapping[str, Any]],
     *,
     session_id: str,
     lineage_root_session_id: str | None = None,
