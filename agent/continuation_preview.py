@@ -10,7 +10,7 @@ import asyncio
 import concurrent.futures
 import html
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
@@ -18,6 +18,7 @@ from urllib.parse import quote
 
 from agent.continuation_checkpoint import (
     ENVELOPE_PREFIX,
+    SEMANTIC_MAX_BYTES,
     CheckpointWarningCode,
     CheckpointWarningV1,
     CheckpointSourceV1,
@@ -975,6 +976,24 @@ def sanitize_evidence_snapshot(
     )
 
 
+def _host_authority_evidence(
+    snapshot: ContinuationEvidenceSnapshotV1,
+    sanitized: SanitizedEvidenceV1,
+) -> tuple[EvidenceRecordV1, ...]:
+    rows_by_id = {row.message_id: row for row in snapshot.rows}
+    records: list[EvidenceRecordV1] = []
+    for record in sanitized.records:
+        if (
+            record.origin is EvidenceOrigin.DIRECT_USER
+            and record.trust_class is TrustClass.TRUSTED_USER_EVENT
+        ):
+            row = rows_by_id[record.message_id]
+            records.append(replace(record, content=_evidence_text(row.content)))
+        else:
+            records.append(record)
+    return tuple(records)
+
+
 def _record_payload(record: EvidenceRecordV1) -> dict[str, Any]:
     return {
         "evidence_ref": f"message:{record.message_id}",
@@ -1488,6 +1507,7 @@ def compile_continuation_snapshot(
 
     try:
         sanitized = sanitize_evidence_snapshot(snapshot)
+        authority_evidence = _host_authority_evidence(snapshot, sanitized)
         primary_request = build_primary_projector_request(
             snapshot, sanitized=sanitized
         )
@@ -1530,7 +1550,7 @@ def compile_continuation_snapshot(
                     projector=response.metadata.projector,
                     projection_attempts=1,
                 ),
-                evidence=sanitized.records,
+                evidence=authority_evidence,
                 prior_checkpoint_envelope=snapshot.prior_checkpoint_envelope,
             )
         except Exception:
@@ -1624,7 +1644,7 @@ def compile_continuation_snapshot(
                     projector=response.metadata.projector,
                     projection_attempts=2,
                 ),
-                evidence=sanitized.records,
+                evidence=authority_evidence,
                 prior_checkpoint_envelope=snapshot.prior_checkpoint_envelope,
             )
         except Exception:
@@ -1713,13 +1733,29 @@ def compile_continuation_snapshot(
         repair_warnings,
         build.warnings,
     )
+    final_markdown = _render_visible_warnings(rendered.markdown, visible_warnings)
+    if len(final_markdown.encode("utf-8")) > SEMANTIC_MAX_BYTES:
+        return _failed_preview(
+            PreviewFailureCode.RENDERER_FAILED,
+            source=snapshot.source,
+            warnings=visible_warnings,
+            issues=(
+                ValidationIssueV1(
+                    "renderer_output_too_large",
+                    "$.renderer.markdown",
+                    "warning-expanded Markdown exceeded the final UTF-8 byte cap",
+                ),
+            ),
+            metadata=tuple(metadata),
+            projector_calls=calls,
+        )
     return ContinuationPreviewResultV1(
         status=ContinuationPreviewStatus.SUCCESS,
         failure_code=None,
         source=snapshot.source,
         checkpoint=build.checkpoint,
         _messages_bytes=rendered._messages_bytes,
-        markdown=_render_visible_warnings(rendered.markdown, visible_warnings),
+        markdown=final_markdown,
         warnings=visible_warnings,
         issues=(),
         projector_metadata=tuple(metadata),

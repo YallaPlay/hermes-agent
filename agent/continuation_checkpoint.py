@@ -163,6 +163,7 @@ class CheckpointWarningCode(str, Enum):
     SECRET_DETECTED = "secret_detected"
     CHECKPOINT_TOO_LARGE = "checkpoint_too_large"
     PRIOR_CHECKPOINT_INVALID = "prior_checkpoint_invalid"
+    PROJECTED_SAFETY_IGNORED = "projected_safety_ignored"
 
 
 def _jsonable(value: Any) -> Any:
@@ -1043,10 +1044,10 @@ def _normalize_quote(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
-def _citation_matches(citation: CitationV1 | None, evidence: EvidenceRecordV1) -> bool:
+def _citation_covers_record(citation: CitationV1 | None, evidence: EvidenceRecordV1) -> bool:
     if citation is None or citation.message_id != evidence.message_id:
         return False
-    return _normalize_quote(citation.quote) in _normalize_quote(evidence.content)
+    return _normalize_quote(citation.quote) == _normalize_quote(evidence.content)
 
 
 def _recovery_pointer(source: CheckpointSourceV1) -> str:
@@ -1083,6 +1084,8 @@ def _ground_projection(
     evidence: Sequence[EvidenceRecordV1],
     source: CheckpointSourceV1,
 ) -> tuple[
+    str,
+    tuple[str, ...],
     tuple[DecisionV1, ...],
     tuple[ApprovalV1, ...],
     tuple[ExternalEffectV1, ...],
@@ -1103,32 +1106,61 @@ def _ground_projection(
     warnings: list[CheckpointWarningV1] = []
     uncertainties = list(projection.uncertainties)
 
-    def direct_user_reason(citation: CitationV1 | None) -> str | None:
+    def direct_user_record(
+        citation: CitationV1 | None,
+    ) -> tuple[EvidenceRecordV1 | None, str | None]:
         if citation is None:
-            return "no citation was supplied"
+            return None, "no citation was supplied"
         record = index.get(citation.message_id)
         if record is None:
-            return "cited message was not present in host evidence"
+            return None, "cited message was not present in host evidence"
         if not (
             record.role is MessageRole.USER
             and record.origin is EvidenceOrigin.DIRECT_USER
             and record.trust_class is TrustClass.TRUSTED_USER_EVENT
         ):
-            return "citation did not target structurally trusted direct-user evidence"
-        if not _citation_matches(citation, record):
-            return "quoted text was not an exact whitespace-normalized substring"
-        return None
+            return None, "citation did not target structurally trusted direct-user evidence"
+        if not _citation_covers_record(citation, record):
+            return record, "citation did not cover the complete trusted direct-user event"
+        return record, None
+
+    live_record = index.get(source.live_user_event_ref.message_id)
+    if live_record is None or not (
+        live_record.role is MessageRole.USER
+        and live_record.origin is EvidenceOrigin.DIRECT_USER
+        and live_record.trust_class is TrustClass.TRUSTED_USER_EVENT
+    ):
+        raise _ProposalError(
+            "live_user_event_missing",
+            "$.evidence",
+            "host evidence did not contain the trusted live direct-user event",
+        )
+    objective = live_record.content
+    acceptance_criteria = (
+        "Satisfy the exact direct-user event without widening its authority.",
+    )
 
     decisions: list[DecisionV1] = []
     for item in projection.decisions:
         if not item.user_confirmed:
             decisions.append(item)
             continue
-        reason = direct_user_reason(item.citation)
+        record, reason = direct_user_record(item.citation)
         if reason is None:
-            decisions.append(item)
-            continue
-        decisions.append(replace(item, user_confirmed=False))
+            assert record is not None
+            item = replace(
+                item,
+                decision=record.content,
+                citation=CitationV1(message_id=record.message_id, quote=record.content),
+            )
+            reason = "preview does not admit newly projected user-confirmed state"
+        decisions.append(
+            replace(
+                item,
+                decision=(record.content if record is not None else "Unverified projected decision."),
+                user_confirmed=False,
+            )
+        )
         warnings.append(
             _warning(
                 CheckpointWarningCode.AUTHORITY_DEMOTED,
@@ -1149,11 +1181,27 @@ def _ground_projection(
         if item.status is not ApprovalStatus.APPROVED:
             approvals.append(item)
             continue
-        reason = direct_user_reason(item.citation)
+        record, reason = direct_user_record(item.citation)
         if reason is None:
-            approvals.append(item)
-            continue
-        approvals.append(replace(item, status=ApprovalStatus.UNVERIFIED_BY_HOST))
+            assert record is not None
+            item = replace(
+                item,
+                scope=record.content,
+                source_ref=f"message:{record.message_id}",
+                citation=CitationV1(message_id=record.message_id, quote=record.content),
+            )
+            reason = "preview does not admit newly projected approval state"
+        approvals.append(
+            replace(
+                item,
+                scope=(
+                    record.content
+                    if record is not None
+                    else "Unverified projected approval scope."
+                ),
+                status=ApprovalStatus.UNVERIFIED_BY_HOST,
+            )
+        )
         warnings.append(
             _warning(
                 CheckpointWarningCode.AUTHORITY_DEMOTED,
@@ -1172,7 +1220,6 @@ def _ground_projection(
         if item.disposition not in (EffectDisposition.SUCCEEDED, EffectDisposition.FAILED):
             effects.append(item)
             continue
-        expected = item.disposition
         citation = item.citation
         record = index.get(citation.message_id) if citation is not None else None
         reason: str | None = None
@@ -1182,12 +1229,30 @@ def _ground_projection(
             reason = "cited receipt was not present in host evidence"
         elif record.trust_class is not TrustClass.STRUCTURED_RECEIPT:
             reason = "cited output was free-form rather than a structured receipt"
-        elif record.effect_disposition is not expected:
-            reason = "structured receipt disposition did not match the projected disposition"
-        elif not _citation_matches(citation, record):
-            reason = "quoted receipt text was not an exact whitespace-normalized substring"
+        elif not _citation_covers_record(citation, record):
+            reason = "citation did not cover the complete structured receipt"
         if reason is None:
-            effects.append(item)
+            assert record is not None and record.effect_disposition is not None
+            receipt_disposition = record.effect_disposition
+            effects.append(
+                replace(
+                    item,
+                    effect=record.content,
+                    disposition=receipt_disposition,
+                    retry_policy=(
+                        RetryPolicy.DO_NOT_RETRY
+                        if receipt_disposition is EffectDisposition.SUCCEEDED
+                        else RetryPolicy.VERIFY_FIRST
+                    ),
+                    receipt_ref=f"message:{record.message_id}",
+                    recheck_action=(
+                        None
+                        if receipt_disposition is EffectDisposition.SUCCEEDED
+                        else f"Verify the receipt in {source.parent_session_id}."
+                    ),
+                    citation=CitationV1(message_id=record.message_id, quote=record.content),
+                )
+            )
             continue
         recheck = item.recheck_action or (
             f"Verify the effect in {source.parent_session_id} or against the live system."
@@ -1213,36 +1278,41 @@ def _ground_projection(
             )
         )
 
-    gate_reason = direct_user_reason(projection.next_gate.citation)
-    if gate_reason is None:
-        gate = NextGateV1(
-            action=projection.next_gate.action,
-            verification=projection.next_gate.verification,
-            expected_observation=projection.next_gate.expected_observation,
-            admitted=True,
-            on_success=projection.next_gate.on_success,
-            on_failure=projection.next_gate.on_failure,
-            on_unknown=projection.next_gate.on_unknown,
-            citation=projection.next_gate.citation,
-        )
-    else:
-        gate = NextGateV1(
-            action="Recover the next authorized action from the parent session.",
-            verification="Inspect the trusted direct-user event in the parent session.",
-            expected_observation="A structurally trusted user instruction identifies the next action.",
-            admitted=False,
-        )
+    gate = NextGateV1(
+        action=live_record.content,
+        verification=f"Follow only the exact direct-user event in message {live_record.message_id}.",
+        expected_observation="The exact direct-user request is addressed without widened authority.",
+        admitted=True,
+        citation=CitationV1(message_id=live_record.message_id, quote=live_record.content),
+    )
+
+    if projection.constraints:
         warnings.append(
             _warning(
-                CheckpointWarningCode.AUTHORITY_DEMOTED,
-                "The projected next gate was replaced with a conservative recovery gate.",
+                CheckpointWarningCode.PROJECTED_SAFETY_IGNORED,
+                "New projector-authored active constraints were not admitted.",
                 source,
             )
         )
         uncertainties.append(
             _authority_uncertainty(
-                claim="Authority for the projected next gate",
-                reason=gate_reason,
+                claim="Projector-authored active constraints",
+                reason="new active constraints require host-owned prior state or structural binding",
+                source=source,
+            )
+        )
+    if projection.retry_hazards:
+        warnings.append(
+            _warning(
+                CheckpointWarningCode.PROJECTED_SAFETY_IGNORED,
+                "New projector-authored active retry hazards were not admitted.",
+                source,
+            )
+        )
+        uncertainties.append(
+            _authority_uncertainty(
+                claim="Projector-authored active retry hazards",
+                reason="new active retry hazards require host-owned prior state or structural binding",
                 source=source,
             )
         )
@@ -1255,6 +1325,8 @@ def _ground_projection(
         )
 
     return (
+        objective,
+        acceptance_criteria,
         tuple(decisions),
         tuple(approvals),
         tuple(effects),
@@ -1372,29 +1444,11 @@ def _parse_prior_safety_envelope(
 
 
 def _merge_safety_state(
-    projection: ProjectionV1,
     prior_constraints: Sequence[SafetyConstraintV1],
     prior_hazards: Sequence[RetryHazardV1],
 ) -> tuple[tuple[SafetyConstraintV1, ...], tuple[RetryHazardV1, ...]]:
     constraints = {item.id: item for item in prior_constraints if item.active}
-    for text in projection.constraints:
-        identifier = _constraint_id(text)
-        constraints.setdefault(identifier, SafetyConstraintV1(id=identifier, text=text, active=True))
-
     hazards = {item.id: item for item in prior_hazards if item.active}
-    for item in projection.retry_hazards:
-        identifier = _hazard_id(item)
-        hazards.setdefault(
-            identifier,
-            RetryHazardV1(
-                id=identifier,
-                operation=item.operation,
-                risk=item.risk,
-                safe_recovery=item.safe_recovery,
-                active=True,
-            ),
-        )
-
     return tuple(constraints.values()), tuple(hazards.values())
 
 
@@ -1489,9 +1543,7 @@ def assemble_checkpoint(
                 message="Prior checkpoint safety state could not be validated.",
             )
 
-    constraints, hazards = _merge_safety_state(
-        projection, prior_constraints, prior_hazards
-    )
+    constraints, hazards = _merge_safety_state(prior_constraints, prior_hazards)
     if len(constraints) > MAX_SAFETY_ITEMS or len(hazards) > MAX_SAFETY_ITEMS:
         issue = ValidationIssueV1(
             "safety_overflow",
@@ -1505,15 +1557,24 @@ def assemble_checkpoint(
             message="Active constraint or retry-hazard state overflowed; rendering is disabled.",
         )
 
-    decisions, approvals, effects, next_gate, uncertainties, warnings = grounded
+    (
+        objective,
+        acceptance_criteria,
+        decisions,
+        approvals,
+        effects,
+        next_gate,
+        uncertainties,
+        warnings,
+    ) = grounded
     checkpoint = ContinuationCheckpointV1(
         schema_version=SCHEMA_VERSION,
         checkpoint_id="",
         source=source,
         compiler=compiler,
         activation_mode=ActivationMode.PAUSED_MANUAL,
-        objective=projection.objective,
-        acceptance_criteria=projection.acceptance_criteria,
+        objective=objective,
+        acceptance_criteria=acceptance_criteria,
         constraints=constraints,
         decisions=decisions,
         blockers=projection.blockers,
