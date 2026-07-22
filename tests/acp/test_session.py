@@ -1645,6 +1645,23 @@ class TestLiveTranscriptHistory:
 
         assert [m["content"] for m in messages] == ["mid-turn flush"]
 
+    def test_live_transcript_history_forwards_repair_alternation(self, manager, monkeypatch):
+        """Callers adopting the result as live history pass repair_alternation
+        through to the store; the default stays verbatim (False)."""
+        db = manager._get_db()
+        seen = []
+
+        def record(session_id, repair_alternation=False):
+            seen.append(repair_alternation)
+            return []
+
+        monkeypatch.setattr(db, "get_messages_as_conversation", record)
+
+        manager.live_transcript_history("sid")
+        manager.live_transcript_history("sid", repair_alternation=True)
+
+        assert seen == [False, True]
+
     def test_live_transcript_history_returns_none_on_db_failure(self, manager, monkeypatch):
         db = manager._get_db()
 

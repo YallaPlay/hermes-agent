@@ -379,15 +379,20 @@ class SessionManager:
         return self._restore(session_id)
 
     def live_transcript_history(
-        self, session_id: str
+        self, session_id: str, repair_alternation: bool = False
     ) -> Optional[List[Dict[str, Any]]]:
         """Best-effort transcript of a session from the persisted message store.
 
-        Used by ACP history replay while a turn is RUNNING: the in-memory
-        ``state.history`` only extends at turn end, but ``run_agent`` flushes
-        messages to the DB continuously, so the DB is the faithful mid-turn
-        transcript. Returns None when the store is unavailable or the query
-        fails; the caller falls back to ``state.history``.
+        Used by ACP history replay: while a turn is RUNNING here, the
+        in-memory ``state.history`` only extends at turn end but ``run_agent``
+        flushes messages to the DB continuously; while IDLE here, the session
+        may have advanced in another process (Slack bot, gateway, CLI) whose
+        turns this process never observes. Either way the DB is the faithful
+        transcript. ``repair_alternation`` is for callers that adopt the
+        result as live conversation state (see
+        ``HermesState.get_messages_as_conversation``). Returns None when the
+        store is unavailable or the query fails; the caller falls back to
+        ``state.history``.
         """
         db = self._get_db()
         if db is None:
@@ -400,7 +405,9 @@ class SessionManager:
                 sid = getattr(state.agent, "session_id", None)
                 if isinstance(sid, str) and sid:
                     head_id = sid
-            return db.get_messages_as_conversation(head_id)
+            return db.get_messages_as_conversation(
+                head_id, repair_alternation=repair_alternation
+            )
         except Exception:
             logger.warning(
                 "Failed to load live transcript for ACP session %s",

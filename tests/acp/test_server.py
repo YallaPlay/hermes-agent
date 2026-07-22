@@ -1422,9 +1422,45 @@ class TestSessionOps:
         )
 
     @pytest.mark.asyncio
-    async def test_idle_session_replay_unchanged(self, agent):
-        """No turn running: memory source with index meta, and the DB is not
-        consulted at all — even if it happens to hold more rows."""
+    async def test_idle_replay_adopts_longer_db_transcript(self, agent):
+        """Idle here, but the persisted store is AHEAD: the session advanced
+        in another process (Slack bot, gateway, CLI). Replay must use the DB
+        rows and adopt them as state.history so the next prompt builds on
+        the newer transcript (2026-07-22 incident: a Slack-owned session
+        opened in VS Code froze at a pre-final-answer snapshot forever)."""
+        state, mock_conn = await self._running_replay_state(agent)
+        state.is_running = False
+        db_rows = self._db_transcript()
+        agent.session_manager.live_transcript_history = MagicMock(
+            return_value=db_rows
+        )
+
+        await agent._replay_session_history(state)
+
+        agent.session_manager.live_transcript_history.assert_called_once_with(
+            state.session_id, repair_alternation=True
+        )
+        tool_updates = [
+            call.kwargs["update"]
+            for call in mock_conn.session_update.await_args_list
+            if getattr(call.kwargs.get("update"), "session_update", None)
+            in {"tool_call", "tool_call_update"}
+        ]
+        assert len(tool_updates) == 2
+        # Unlike the mid-turn DB path, the adopted list IS state.history now,
+        # so historyIndex fork coordinates stay valid and keep flowing.
+        user_calls = [
+            call for call in mock_conn.session_update.await_args_list
+            if getattr(call.kwargs.get("update"), "session_update", None)
+            == "user_message_chunk"
+        ]
+        assert user_calls[0].kwargs["hermes"] == {"historyIndex": 0}
+        assert state.history == db_rows
+
+    @pytest.mark.asyncio
+    async def test_idle_replay_keeps_memory_at_equal_length(self, agent):
+        """Idle with DB and memory in sync: stay on the in-memory path so
+        fork coordinates (historyIndex meta) keep flowing."""
         state, mock_conn = await self._running_replay_state(
             agent,
             history=[
@@ -1434,12 +1470,14 @@ class TestSessionOps:
         )
         state.is_running = False
         agent.session_manager.live_transcript_history = MagicMock(
-            return_value=self._db_transcript()
+            return_value=[
+                {"role": "user", "content": "first question"},
+                {"role": "assistant", "content": "db copy of the answer"},
+            ]
         )
 
         await agent._replay_session_history(state)
 
-        agent.session_manager.live_transcript_history.assert_not_called()
         user_calls = [
             call for call in mock_conn.session_update.await_args_list
             if getattr(call.kwargs.get("update"), "session_update", None)
@@ -1448,6 +1486,70 @@ class TestSessionOps:
         assert len(user_calls) == 1
         assert user_calls[0].kwargs["update"].content.text == "first question"
         assert user_calls[0].kwargs["hermes"] == {"historyIndex": 0}
+        agent_calls = [
+            call for call in mock_conn.session_update.await_args_list
+            if getattr(call.kwargs.get("update"), "session_update", None)
+            == "agent_message_chunk"
+        ]
+        assert [c.kwargs["update"].content.text for c in agent_calls] == [
+            "first answer"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_idle_replay_keeps_memory_when_db_unavailable(self, agent):
+        """Idle with the store unavailable: fail open to the in-memory path,
+        with index meta, and leave state.history untouched."""
+        history = [
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": "first answer"},
+        ]
+        state, mock_conn = await self._running_replay_state(
+            agent, history=list(history)
+        )
+        state.is_running = False
+        agent.session_manager.live_transcript_history = MagicMock(return_value=None)
+
+        await agent._replay_session_history(state)
+
+        assert state.history == history
+        user_calls = [
+            call for call in mock_conn.session_update.await_args_list
+            if getattr(call.kwargs.get("update"), "session_update", None)
+            == "user_message_chunk"
+        ]
+        assert len(user_calls) == 1
+        assert user_calls[0].kwargs["hermes"] == {"historyIndex": 0}
+
+    @pytest.mark.asyncio
+    async def test_idle_replay_keeps_memory_when_db_shorter(self, agent):
+        """Idle with a shorter DB transcript (wrong lineage or compacted
+        elsewhere): distrust it — replay memory, don't adopt."""
+        history = [
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": "first answer"},
+            {"role": "user", "content": "second question"},
+        ]
+        state, mock_conn = await self._running_replay_state(
+            agent, history=list(history)
+        )
+        state.is_running = False
+        agent.session_manager.live_transcript_history = MagicMock(
+            return_value=[{"role": "user", "content": "first question"}]
+        )
+
+        await agent._replay_session_history(state)
+
+        assert state.history == history
+        user_calls = [
+            call for call in mock_conn.session_update.await_args_list
+            if getattr(call.kwargs.get("update"), "session_update", None)
+            == "user_message_chunk"
+        ]
+        assert [c.kwargs["update"].content.text for c in user_calls] == [
+            "first question",
+            "second question",
+        ]
+        assert user_calls[1].kwargs["hermes"] == {"historyIndex": 2}
 
 
 # ---------------------------------------------------------------------------

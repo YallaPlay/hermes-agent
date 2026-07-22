@@ -1436,6 +1436,32 @@ class HermesACPAgent(acp.Agent):
                 # the in-memory history below.
                 source = transcript
                 stamp_fork_indices = False
+        else:
+            transcript = self.session_manager.live_transcript_history(
+                state.session_id, repair_alternation=True
+            )
+            if transcript is not None and len(transcript) > len(state.history):
+                # The session advanced in ANOTHER process (Slack bot,
+                # gateway, CLI, delegate child): this process cached
+                # state.history at restore time and never observes turns it
+                # doesn't run, so the persisted store is ahead. Adopt it as
+                # the live history — the same source _restore feeds a fresh
+                # load — so replay shows the full conversation and the next
+                # prompt/_persist build on it instead of clobbering the
+                # newer rows. The adopted list IS state.history, so fork
+                # coordinates stay valid. A None/shorter transcript means
+                # the store is unavailable, resolved the wrong lineage, or
+                # was compacted elsewhere: fail open to the in-memory
+                # history.
+                logger.info(
+                    "Session %s advanced outside this process: adopting %d "
+                    "persisted rows over %d cached in memory",
+                    state.session_id,
+                    len(transcript),
+                    len(state.history),
+                )
+                state.history = transcript
+                source = state.history
 
         if not source:
             return
