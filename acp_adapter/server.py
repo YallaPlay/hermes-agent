@@ -2222,10 +2222,14 @@ class HermesACPAgent(acp.Agent):
         runs its first turn headless (no panel attached), so under the
         default "ask" policy every edit-approval request would be silently
         auto-denied by the client — inheriting the parent's mode makes the
-        child at least as capable as the session that spawned it.
+        child at least as capable as the session that spawned it. A caller-
+        provided title is stamped best-effort before the first turn starts,
+        with #N lineage dedup on collision.
         """
 
-        def _requester(prompt_text: str, cwd: str | None) -> str:
+        def _requester(
+            prompt_text: str, cwd: str | None, title: str | None = None
+        ) -> str:
             from agent.async_utils import safe_schedule_threadsafe
 
             spawn_cwd = cwd or parent_state.cwd
@@ -2250,6 +2254,26 @@ class HermesACPAgent(acp.Agent):
             new_state.effort = parent_state.effort
             _apply_effort_to_agent(new_state.agent, parent_state.effort)
             self.session_manager.save_session(new_state.session_id)
+            # Stamp the caller-provided title (mirrors fork_session's lineage
+            # stamp). The spawning agent knows what the work is, so its title
+            # beats the generic post-first-turn auto-title — which never
+            # clobbers an existing title (set_auto_title_if_empty). Collisions
+            # dedup with a #N suffix; any failure is logged and the spawn
+            # proceeds untitled (auto-title picks those up).
+            if title:
+                db = self.session_manager._get_db()
+                if db is not None:
+                    try:
+                        db.set_session_title(
+                            new_state.session_id,
+                            db.get_next_title_in_lineage(title),
+                        )
+                    except Exception:
+                        logger.warning(
+                            "acp_spawn_session: could not stamp title on %s",
+                            new_state.session_id,
+                            exc_info=True,
+                        )
             future = safe_schedule_threadsafe(
                 self._run_spawned_first_turn(new_state.session_id, prompt_text),
                 loop,

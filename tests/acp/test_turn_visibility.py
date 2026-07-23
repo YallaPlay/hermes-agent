@@ -227,7 +227,7 @@ class TestSpawnDispatch:
         assert "only available inside a live ACP" in payload["error"]
 
     def test_empty_prompt_rejected(self):
-        token = set_spawn_session_requester(lambda p, c: "sid")
+        token = set_spawn_session_requester(lambda p, c, t: "sid")
         try:
             payload = _loads(
                 maybe_dispatch_spawn_session(SPAWN_SESSION_TOOL_NAME, {"prompt": "  "})
@@ -239,9 +239,10 @@ class TestSpawnDispatch:
     def test_dispatch_returns_session_id(self):
         captured = {}
 
-        def _requester(prompt_text, cwd):
+        def _requester(prompt_text, cwd, title):
             captured["prompt"] = prompt_text
             captured["cwd"] = cwd
+            captured["title"] = title
             return "new-session-id"
 
         token = set_spawn_session_requester(_requester)
@@ -257,10 +258,35 @@ class TestSpawnDispatch:
 
         assert payload["success"] is True
         assert payload["session_id"] == "new-session-id"
-        assert captured == {"prompt": "continue the migration", "cwd": "/work/dir"}
+        assert captured == {
+            "prompt": "continue the migration",
+            "cwd": "/work/dir",
+            "title": None,
+        }
+
+    def test_dispatch_forwards_title(self):
+        captured = {}
+
+        def _requester(prompt_text, cwd, title):
+            captured["title"] = title
+            return "sid"
+
+        token = set_spawn_session_requester(_requester)
+        try:
+            payload = _loads(
+                maybe_dispatch_spawn_session(
+                    SPAWN_SESSION_TOOL_NAME,
+                    {"prompt": "go", "title": "  Instrument steer delivery  "},
+                )
+            )
+        finally:
+            reset_spawn_session_requester(token)
+
+        assert payload["success"] is True
+        assert captured["title"] == "Instrument steer delivery"
 
     def test_requester_failure_surfaces_as_error(self):
-        def _requester(prompt_text, cwd):
+        def _requester(prompt_text, cwd, title):
             raise RuntimeError("loop closed")
 
         token = set_spawn_session_requester(_requester)
@@ -278,7 +304,7 @@ class TestSpawnDispatch:
         guard (never the registry)."""
         from model_tools import handle_function_call
 
-        token = set_spawn_session_requester(lambda p, c: "routed-id")
+        token = set_spawn_session_requester(lambda p, c, t: "routed-id")
         try:
             payload = json.loads(
                 handle_function_call(SPAWN_SESSION_TOOL_NAME, {"prompt": "go"})
@@ -334,6 +360,80 @@ class TestServerSpawnRequester:
 
         child = agent.session_manager.get_session(new_id)
         assert child.cwd == str(tmp_path)
+
+    @pytest.mark.asyncio
+    async def test_requester_stamps_caller_title(self, agent):
+        """A caller-provided title lands on the child row before its first
+        turn, so the sidebar shows meaningful text immediately (auto-title
+        only fills empty titles, so the stamp is never clobbered)."""
+        parent_resp = await agent.new_session(cwd="/tmp")
+        parent_state = agent.session_manager.get_session(parent_resp.session_id)
+        agent._run_spawned_first_turn = AsyncMock()
+
+        loop = asyncio.get_running_loop()
+        requester = agent._make_spawn_session_requester(loop, parent_state)
+        new_id = await loop.run_in_executor(
+            None, requester, "carry on", None, "Instrument steer delivery"
+        )
+
+        db = agent.session_manager._get_db()
+        assert db.get_session_title(new_id) == "Instrument steer delivery"
+
+    @pytest.mark.asyncio
+    async def test_requester_title_collision_dedups_with_suffix(self, agent):
+        """Two spawns with the same title get '#N' lineage suffixes instead of
+        one failing on the unique-title index."""
+        parent_resp = await agent.new_session(cwd="/tmp")
+        parent_state = agent.session_manager.get_session(parent_resp.session_id)
+        agent._run_spawned_first_turn = AsyncMock()
+
+        loop = asyncio.get_running_loop()
+        requester = agent._make_spawn_session_requester(loop, parent_state)
+        first = await loop.run_in_executor(
+            None, requester, "carry on", None, "Retry sweep"
+        )
+        second = await loop.run_in_executor(
+            None, requester, "carry on", None, "Retry sweep"
+        )
+
+        db = agent.session_manager._get_db()
+        assert db.get_session_title(first) == "Retry sweep"
+        assert db.get_session_title(second) == "Retry sweep #2"
+
+    @pytest.mark.asyncio
+    async def test_requester_title_failure_never_fails_spawn(self, agent):
+        """Title stamping is best-effort: a store error leaves the child
+        untitled but the spawn still returns a live session id."""
+        parent_resp = await agent.new_session(cwd="/tmp")
+        parent_state = agent.session_manager.get_session(parent_resp.session_id)
+        agent._run_spawned_first_turn = AsyncMock()
+
+        loop = asyncio.get_running_loop()
+        requester = agent._make_spawn_session_requester(loop, parent_state)
+        db = agent.session_manager._get_db()
+        with patch.object(
+            db, "set_session_title", side_effect=ValueError("bad title")
+        ):
+            new_id = await loop.run_in_executor(
+                None, requester, "carry on", None, "x" * 500
+            )
+
+        assert agent.session_manager.get_session(new_id) is not None
+        assert db.get_session_title(new_id) is None
+
+    @pytest.mark.asyncio
+    async def test_requester_without_title_leaves_child_untitled(self, agent):
+        """No title argument → untitled child; auto-title owns it."""
+        parent_resp = await agent.new_session(cwd="/tmp")
+        parent_state = agent.session_manager.get_session(parent_resp.session_id)
+        agent._run_spawned_first_turn = AsyncMock()
+
+        loop = asyncio.get_running_loop()
+        requester = agent._make_spawn_session_requester(loop, parent_state)
+        new_id = await loop.run_in_executor(None, requester, "carry on", None)
+
+        db = agent.session_manager._get_db()
+        assert db.get_session_title(new_id) is None
 
     @pytest.mark.asyncio
     async def test_requester_inherits_parent_mode_and_effort(self, agent):

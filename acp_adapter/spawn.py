@@ -64,14 +64,25 @@ SPAWN_SESSION_TOOL_SCHEMA: dict[str, Any] = {
                         "this session's cwd."
                     ),
                 },
+                "title": {
+                    "type": "string",
+                    "description": (
+                        "Session title (max 100 chars). You know what the "
+                        "spawned work is — name it so the sessions sidebar "
+                        "shows meaningful text immediately instead of "
+                        "waiting for post-first-turn auto-titling. "
+                        "Deduplicated with a #N suffix on collision; "
+                        "stamping is best-effort and never fails the spawn."
+                    ),
+                },
             },
             "required": ["prompt"],
         },
     },
 }
 
-# (prompt_text, cwd_or_none) -> new session id. Raises on failure.
-SpawnSessionRequester = Callable[[str, Optional[str]], str]
+# (prompt_text, cwd_or_none, title_or_none) -> new session id. Raises on failure.
+SpawnSessionRequester = Callable[[str, Optional[str], Optional[str]], str]
 
 _SPAWN_SESSION_REQUESTER: ContextVar[SpawnSessionRequester | None] = ContextVar(
     "ACP_SPAWN_SESSION_REQUESTER",
@@ -162,9 +173,11 @@ def maybe_dispatch_spawn_session(
         return json.dumps({"error": "prompt is required"}, ensure_ascii=False)
     cwd = arguments.get("cwd")
     cwd = str(cwd).strip() if cwd else None
+    title = arguments.get("title")
+    title = str(title).strip() if title else None
 
     try:
-        session_id = requester(prompt_text, cwd)
+        session_id = requester(prompt_text, cwd, title)
     except Exception as exc:
         logger.warning("ACP spawn_session requester failed: %s", exc)
         return json.dumps(
