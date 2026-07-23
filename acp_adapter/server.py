@@ -108,6 +108,48 @@ _executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="acp-agent")
 # does not expose a client-side limit, so this is a fixed cap that clients
 # paginate against using `cursor` / `next_cursor`.
 _LIST_SESSIONS_PAGE_SIZE = 50
+
+
+def _group_session_families(
+    infos: list[dict[str, Any]],
+) -> list[list[dict[str, Any]]]:
+    """Group a recency-sorted session list into fork/subagent families.
+
+    A family is a root session plus every descendant reachable through
+    ``parent_id`` links WITHIN the list — a child whose parent is absent
+    (archived, filtered out) roots its own family, mirroring how clients
+    nest lineage. Families keep the order of their freshest member (first
+    appearance in the recency-sorted input) and members keep input order.
+    Used by ``list_sessions`` to paginate on family boundaries so a parent
+    and its children never land on different pages.
+    """
+    by_id = {s["session_id"]: s for s in infos}
+
+    def _root_of(s: dict[str, Any]) -> str:
+        seen: set[str] = set()
+        cur = s
+        while True:
+            sid = cur["session_id"]
+            if sid in seen:  # lineage cycle guard
+                break
+            seen.add(sid)
+            parent = cur.get("parent_id")
+            if not parent or parent == sid or parent not in by_id:
+                break
+            cur = by_id[parent]
+        return cur["session_id"]
+
+    families: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
+    for s in infos:
+        root = _root_of(s)
+        if root not in families:
+            families[root] = []
+            order.append(root)
+        families[root].append(s)
+    return [families[root] for root in order]
+
+
 _MAX_ACP_RESOURCE_BYTES = 512 * 1024
 _TEXT_RESOURCE_MIME_PREFIXES = ("text/",)
 _TEXT_RESOURCE_MIME_TYPES = {
@@ -2096,17 +2138,37 @@ class HermesACPAgent(acp.Agent):
             owner=owner,
         )
 
+        # Group rows into fork/subagent families (a root plus every descendant
+        # reachable via parent_id) and paginate on FAMILY boundaries. A naive
+        # flat cut can strand children on one page while their parent sits past
+        # the cursor; clients that nest lineage (the VS Code sidebar) then
+        # render those children ungrouped until the user pages further. Families
+        # are ordered by their freshest member (infos is recency-sorted), and a
+        # family larger than the page size is still emitted whole — pages may
+        # exceed the nominal cap rather than split a family.
+        families = _group_session_families(infos)
+
         if cursor:
-            for idx, s in enumerate(infos):
-                if s["session_id"] == cursor:
-                    infos = infos[idx + 1:]
+            # Resume after the family containing the cursor. The cursor is the
+            # last session_id of the previous page, which (with family-atomic
+            # pages) is the last member of a family — but tolerate a mid-family
+            # cursor from an older server by skipping that whole family.
+            for idx, fam in enumerate(families):
+                if any(m["session_id"] == cursor for m in fam):
+                    families = families[idx + 1:]
                     break
             else:
                 # Unknown cursor -> empty page (do not fall back to full list).
-                infos = []
+                families = []
 
-        has_more = len(infos) > _LIST_SESSIONS_PAGE_SIZE
-        infos = infos[:_LIST_SESSIONS_PAGE_SIZE]
+        infos = []
+        consumed = 0
+        for fam in families:
+            if infos and len(infos) + len(fam) > _LIST_SESSIONS_PAGE_SIZE:
+                break
+            infos.extend(fam)
+            consumed += 1
+        has_more = consumed < len(families)
 
         # Opportunistic title backfill: sessions that missed the first-exchange
         # auto-title (long/interrupted first turn, aux failure) otherwise fall

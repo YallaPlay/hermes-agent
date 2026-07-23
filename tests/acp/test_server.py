@@ -1721,6 +1721,84 @@ class TestListAndFork:
         assert resp.next_cursor is None
 
     @pytest.mark.asyncio
+    async def test_list_sessions_pagination_keeps_fork_family_on_one_page(self, agent):
+        from acp_adapter import server as acp_server
+
+        # A parent with enough children to straddle the flat page boundary,
+        # then plenty of unrelated sessions. A naive flat cut would strand
+        # some children on page 2, splitting the family in nesting clients.
+        page = acp_server._LIST_SESSIONS_PAGE_SIZE
+        family = [{"session_id": "root", "cwd": "/tmp", "title": None, "updated_at": 0.0}]
+        family += [
+            {"session_id": f"child{i}", "cwd": "/tmp", "title": None,
+             "updated_at": 0.0, "parent_id": "root"}
+            for i in range(10)
+        ]
+        fillers = [
+            {"session_id": f"solo{i}", "cwd": "/tmp", "title": None, "updated_at": 0.0}
+            for i in range(page)
+        ]
+        # Family members occupy positions page-5 .. page+5 of the flat list.
+        infos = fillers[: page - 5] + family + fillers[page - 5:]
+        with patch.object(agent.session_manager, "list_sessions", return_value=infos):
+            resp = await agent.list_sessions()
+
+        ids = [s.session_id for s in resp.sessions]
+        family_ids = {m["session_id"] for m in family}
+        on_page = family_ids & set(ids)
+        # The family is atomic: all members on this page or none.
+        assert on_page in (family_ids, set())
+        assert resp.next_cursor == ids[-1]
+
+        # The next page starts with whatever was deferred — no family member
+        # appears twice and none is lost across the two pages.
+        with patch.object(agent.session_manager, "list_sessions", return_value=infos):
+            resp2 = await agent.list_sessions(cursor=resp.next_cursor)
+        ids2 = [s.session_id for s in resp2.sessions]
+        assert set(ids) & set(ids2) == set()
+        assert family_ids <= set(ids) | set(ids2)
+        assert family_ids & set(ids2) in (family_ids, set())
+
+    @pytest.mark.asyncio
+    async def test_list_sessions_family_larger_than_page_emitted_whole(self, agent):
+        from acp_adapter import server as acp_server
+
+        page = acp_server._LIST_SESSIONS_PAGE_SIZE
+        infos = [{"session_id": "root", "cwd": "/tmp", "title": None, "updated_at": 0.0}]
+        infos += [
+            {"session_id": f"child{i}", "cwd": "/tmp", "title": None,
+             "updated_at": 0.0, "parent_id": "root"}
+            for i in range(page + 5)
+        ]
+        infos.append({"session_id": "solo", "cwd": "/tmp", "title": None, "updated_at": 0.0})
+        with patch.object(agent.session_manager, "list_sessions", return_value=infos):
+            resp = await agent.list_sessions()
+
+        ids = [s.session_id for s in resp.sessions]
+        # Oversized family is not split even though it exceeds the page cap.
+        assert len(ids) == page + 6
+        assert "solo" not in ids
+        assert resp.next_cursor == ids[-1]
+
+    @pytest.mark.asyncio
+    async def test_list_sessions_mid_family_cursor_skips_whole_family(self, agent):
+        infos = [
+            {"session_id": "root", "cwd": "/tmp", "title": None, "updated_at": 0.0},
+            {"session_id": "child1", "cwd": "/tmp", "title": None,
+             "updated_at": 0.0, "parent_id": "root"},
+            {"session_id": "child2", "cwd": "/tmp", "title": None,
+             "updated_at": 0.0, "parent_id": "root"},
+            {"session_id": "solo", "cwd": "/tmp", "title": None, "updated_at": 0.0},
+        ]
+        with patch.object(agent.session_manager, "list_sessions", return_value=infos):
+            resp = await agent.list_sessions(cursor="child1")
+
+        # Resuming inside a family (older-server cursor) skips that whole
+        # family rather than re-emitting part of it detached from its root.
+        assert [s.session_id for s in resp.sessions] == ["solo"]
+        assert resp.next_cursor is None
+
+    @pytest.mark.asyncio
     async def test_list_sessions_backfills_untitled_rows(self, agent):
         infos = [
             {"session_id": "s1", "cwd": "/tmp", "title": "prompt preview", "untitled": True,
