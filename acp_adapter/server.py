@@ -1305,7 +1305,14 @@ class HermesACPAgent(acp.Agent):
             agent_info=Implementation(name="hermes-agent", version=HERMES_VERSION),
             agent_capabilities=AgentCapabilities(
                 load_session=True,
-                prompt_capabilities=PromptCapabilities(image=True),
+                prompt_capabilities=PromptCapabilities(
+                    image=True,
+                    # _meta.hermes.keepHistory on ``session/prompt``: truncate
+                    # the session to the first N history entries before the
+                    # turn runs — in-place rewind ("edit & resend"), same
+                    # coordinate space as the fork extension below.
+                    _meta={"hermes": {"keepHistory": True}},
+                ),
                 session_capabilities=SessionCapabilities(
                     # _meta.hermes.keepHistory: this agent honors the
                     # ``_meta.hermes.keepHistory`` fork-rewind extension on
@@ -1821,18 +1828,21 @@ class HermesACPAgent(acp.Agent):
             logger.info("Cancelled session %s", session_id)
 
     @staticmethod
-    def _fork_keep_history(kwargs: dict[str, Any]) -> int | None:
-        """Extract the optional ``_meta.hermes.keepHistory`` fork rewind point.
+    def _keep_history_meta(kwargs: dict[str, Any]) -> int | None:
+        """Extract the optional ``_meta.hermes.keepHistory`` rewind point.
 
-        ``session/fork`` has no spec-level rewind parameter, so clients pass it
-        through ACP's extensibility escape hatch: ``_meta.hermes.keepHistory``
-        is the number of leading history entries to copy into the fork (in the
-        same OpenAI-message coordinate space that ``session/load`` replays).
-        The JSON-RPC router flattens ``_meta`` keys into handler kwargs, so the
-        payload arrives here as a ``hermes`` dict. Absent → ``None`` → full
-        copy (the pre-existing behavior). Invalid types/values raise
-        ``invalid_params`` rather than silently forking the whole session —
-        a client asking for a rewind must not quietly get a full copy.
+        Neither ``session/fork`` nor ``session/prompt`` has a spec-level
+        rewind parameter, so clients pass it through ACP's extensibility
+        escape hatch: ``_meta.hermes.keepHistory`` is the number of leading
+        history entries to keep (in the same OpenAI-message coordinate space
+        that ``session/load`` replays). On fork it limits the copy; on prompt
+        it truncates the session in place before the turn runs ("edit &
+        resend"). The JSON-RPC router flattens ``_meta`` keys into handler
+        kwargs, so the payload arrives here as a ``hermes`` dict. Absent →
+        ``None`` → full history (the pre-existing behavior). Invalid
+        types/values raise ``invalid_params`` rather than silently keeping
+        everything — a client asking for a rewind must not quietly get a
+        full copy.
         """
         hermes_meta = kwargs.get("hermes")
         if not isinstance(hermes_meta, dict) or "keepHistory" not in hermes_meta:
@@ -1852,7 +1862,7 @@ class HermesACPAgent(acp.Agent):
         mcp_servers: list | None = None,
         **kwargs: Any,
     ) -> ForkSessionResponse:
-        keep_history = self._fork_keep_history(kwargs)
+        keep_history = self._keep_history_meta(kwargs)
         state = self.session_manager.fork_session(
             session_id, cwd=cwd, keep_history=keep_history
         )
@@ -2347,12 +2357,47 @@ class HermesACPAgent(acp.Agent):
 
         user_text = _extract_text(prompt).strip()
         user_content = _content_blocks_to_openai_user_content(prompt)
+
+        # In-place rewind ("edit & resend"): _meta.hermes.keepHistory on
+        # session/prompt truncates the session to the first N history entries
+        # before this turn runs — the prompt-side twin of the fork extension,
+        # atomic with the submit so a cancel/truncate/send race can't lose the
+        # rewind. Refused while a turn is running (the executor thread owns
+        # state.history mid-turn); validated before the empty-content early
+        # return so an invalid rewind never silently no-ops.
+        keep_history = self._keep_history_meta(kwargs)
         text_only_prompt = all(isinstance(block, TextContentBlock) for block in prompt)
         has_content = bool(user_text) or (
             isinstance(user_content, list) and bool(user_content)
         )
         if not has_content:
+            if keep_history is not None:
+                # A truncate with nothing to resend is not a supported shape —
+                # the rewind extension is always "edit & resend". Fail loudly
+                # instead of dropping history with no replacement turn.
+                raise acp.RequestError.invalid_params(
+                    {"reason": "_meta.hermes.keepHistory requires a non-empty prompt"}
+                )
             return PromptResponse(stop_reason="end_turn")
+
+        if keep_history is not None:
+            with state.runtime_lock:
+                if state.is_running:
+                    # The executor thread owns state.history mid-turn; queueing
+                    # the text while dropping the rewind would silently keep the
+                    # turn being rewound away. Clients cancel first, then rewind.
+                    raise acp.RequestError.invalid_params(
+                        {"reason": "cannot rewind while a turn is running"}
+                    )
+                truncated = keep_history < len(state.history)
+                if truncated:
+                    state.history = state.history[:keep_history]
+            if truncated:
+                # Mirror /reset and /compact: archive the dropped rows in the
+                # message store so a mid-turn DB replay or restart can't
+                # resurrect them, then persist the new list.
+                self._reconcile_persisted_history(state, state.history)
+                self.session_manager.save_session(session_id)
 
         # /steer on an idle session has no in-flight tool call to inject into.
         # Rewrite it so the payload runs as a normal user prompt, matching the

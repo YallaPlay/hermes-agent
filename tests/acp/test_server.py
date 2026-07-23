@@ -3105,6 +3105,183 @@ class TestPrompt:
 
 
 # ---------------------------------------------------------------------------
+# prompt rewind (_meta.hermes.keepHistory on session/prompt)
+# ---------------------------------------------------------------------------
+
+
+class TestPromptRewind:
+    """In-place rewind: session/prompt with _meta.hermes.keepHistory truncates
+    the session history to the first N entries before the turn runs."""
+
+    @staticmethod
+    def _seed_history(state):
+        state.history.extend(
+            [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "reply"},
+                {"role": "user", "content": "mistake"},
+                {"role": "assistant", "content": "partial answer"},
+            ]
+        )
+
+    @staticmethod
+    def _wire_agent(agent, state, response="done"):
+        captured = {}
+
+        def _run(**kwargs):
+            captured.update(kwargs)
+            history = kwargs["conversation_history"]
+            return {
+                "final_response": response,
+                "messages": history
+                + [
+                    {"role": "user", "content": kwargs["user_message"]},
+                    {"role": "assistant", "content": response},
+                ],
+            }
+
+        state.agent.run_conversation = MagicMock(side_effect=_run)
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+        return captured
+
+    @pytest.mark.asyncio
+    async def test_prompt_keep_history_truncates_before_turn(self, agent):
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        self._seed_history(state)
+        captured = self._wire_agent(agent, state)
+
+        resp = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="corrected prompt")],
+            session_id=new_resp.session_id,
+            hermes={"keepHistory": 2},
+        )
+
+        assert resp.stop_reason == "end_turn"
+        # The turn ran on the truncated prefix — the mistaken turn is gone.
+        assert captured["conversation_history"][:2] == [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "reply"},
+        ]
+        assert all(m.get("content") != "mistake" for m in state.history)
+        assert state.history[-1] == {"role": "assistant", "content": "done"}
+
+    @pytest.mark.asyncio
+    async def test_prompt_keep_history_router_wire_shape(self, agent):
+        """End-to-end through the JSON-RPC router: _meta survives the wire."""
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        self._seed_history(state)
+        captured = self._wire_agent(agent, state)
+        router = build_agent_router(agent, use_unstable_protocol=True)
+
+        result = await router(
+            "session/prompt",
+            {
+                "sessionId": new_resp.session_id,
+                "prompt": [{"type": "text", "text": "corrected"}],
+                "_meta": {"hermes": {"keepHistory": 2}},
+            },
+            False,
+        )
+
+        assert result.stop_reason == "end_turn"
+        assert len(captured["conversation_history"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_prompt_keep_history_invalid_raises(self, agent):
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        self._seed_history(state)
+
+        for bad in ("2", -1, True, 1.5):
+            with pytest.raises(acp.RequestError):
+                await agent.prompt(
+                    prompt=[TextContentBlock(type="text", text="x")],
+                    session_id=new_resp.session_id,
+                    hermes={"keepHistory": bad},
+                )
+        assert len(state.history) == 4  # untouched
+
+    @pytest.mark.asyncio
+    async def test_prompt_keep_history_empty_prompt_raises(self, agent):
+        """Truncate-without-resend is not a supported shape."""
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        self._seed_history(state)
+
+        with pytest.raises(acp.RequestError):
+            await agent.prompt(
+                prompt=[TextContentBlock(type="text", text="   ")],
+                session_id=new_resp.session_id,
+                hermes={"keepHistory": 2},
+            )
+        assert len(state.history) == 4
+
+    @pytest.mark.asyncio
+    async def test_prompt_keep_history_refused_while_running(self, agent):
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        self._seed_history(state)
+        state.is_running = True
+
+        with pytest.raises(acp.RequestError):
+            await agent.prompt(
+                prompt=[TextContentBlock(type="text", text="corrected")],
+                session_id=new_resp.session_id,
+                hermes={"keepHistory": 2},
+            )
+        assert len(state.history) == 4
+
+    @pytest.mark.asyncio
+    async def test_prompt_keep_history_beyond_length_is_noop(self, agent):
+        """keepHistory >= len(history) keeps everything (no reconcile write)."""
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        self._seed_history(state)
+        captured = self._wire_agent(agent, state)
+
+        with patch.object(agent, "_reconcile_persisted_history") as reconcile:
+            resp = await agent.prompt(
+                prompt=[TextContentBlock(type="text", text="follow-up")],
+                session_id=new_resp.session_id,
+                hermes={"keepHistory": 10},
+            )
+
+        assert resp.stop_reason == "end_turn"
+        assert len(captured["conversation_history"]) == 4
+        reconcile.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_prompt_keep_history_reconciles_persisted_rows(self, agent):
+        """A real truncation mirrors the rewrite into the message store so a
+        DB replay or restart can't resurrect the dropped turn."""
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        self._seed_history(state)
+        self._wire_agent(agent, state)
+
+        with patch.object(agent, "_reconcile_persisted_history") as reconcile:
+            await agent.prompt(
+                prompt=[TextContentBlock(type="text", text="corrected")],
+                session_id=new_resp.session_id,
+                hermes={"keepHistory": 2},
+            )
+
+        reconcile.assert_called_once()
+        _, messages = reconcile.call_args[0]
+        assert len(messages) == 2
+
+    @pytest.mark.asyncio
+    async def test_initialize_advertises_prompt_keep_history_extension(self, agent):
+        resp = await agent.initialize(protocol_version=1)
+        prompt_caps = resp.agent_capabilities.prompt_capabilities
+        assert prompt_caps.field_meta == {"hermes": {"keepHistory": True}}
+
+
+# ---------------------------------------------------------------------------
 # on_connect
 # ---------------------------------------------------------------------------
 
