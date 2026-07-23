@@ -104,10 +104,13 @@ except Exception:
 # sessions — the Claudio Slack bot multiplexes many threads over one process.
 _executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="acp-agent")
 
-# Server-side page size for list_sessions. The ACP ListSessionsRequest schema
-# does not expose a client-side limit, so this is a fixed cap that clients
-# paginate against using `cursor` / `next_cursor`.
-_LIST_SESSIONS_PAGE_SIZE = 50
+# Server-side page size for list_sessions, counted in FAMILIES (a fork/subagent
+# group is one unit — see _group_session_families), not raw rows. Clients render
+# a family as a single grouped card, so paging by rows made pages carrying large
+# families look nearly empty. The ACP ListSessionsRequest schema does not expose
+# a client-side limit, so this is a fixed cap that clients paginate against
+# using `cursor` / `next_cursor`.
+_LIST_SESSIONS_PAGE_SIZE = 40
 
 
 def _group_session_families(
@@ -2164,7 +2167,10 @@ class HermesACPAgent(acp.Agent):
         infos = []
         consumed = 0
         for fam in families:
-            if infos and len(infos) + len(fam) > _LIST_SESSIONS_PAGE_SIZE:
+            # The cap counts FAMILIES (grouped units), not rows: a page always
+            # carries up to _LIST_SESSIONS_PAGE_SIZE groups regardless of how
+            # many fork/subagent children each group contains.
+            if consumed >= _LIST_SESSIONS_PAGE_SIZE:
                 break
             infos.extend(fam)
             consumed += 1

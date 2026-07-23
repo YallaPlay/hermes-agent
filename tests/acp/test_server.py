@@ -1760,25 +1760,37 @@ class TestListAndFork:
         assert family_ids & set(ids2) in (family_ids, set())
 
     @pytest.mark.asyncio
-    async def test_list_sessions_family_larger_than_page_emitted_whole(self, agent):
+    async def test_list_sessions_page_counts_families_not_rows(self, agent):
         from acp_adapter import server as acp_server
 
+        # The page cap counts grouped units: a family with many children is ONE
+        # unit, so a page still carries _LIST_SESSIONS_PAGE_SIZE groups even
+        # when one group alone exceeds the cap in raw rows.
         page = acp_server._LIST_SESSIONS_PAGE_SIZE
-        infos = [{"session_id": "root", "cwd": "/tmp", "title": None, "updated_at": 0.0}]
-        infos += [
+        family = [{"session_id": "root", "cwd": "/tmp", "title": None, "updated_at": 0.0}]
+        family += [
             {"session_id": f"child{i}", "cwd": "/tmp", "title": None,
              "updated_at": 0.0, "parent_id": "root"}
             for i in range(page + 5)
         ]
-        infos.append({"session_id": "solo", "cwd": "/tmp", "title": None, "updated_at": 0.0})
+        solos = [
+            {"session_id": f"solo{i}", "cwd": "/tmp", "title": None, "updated_at": 0.0}
+            for i in range(page)
+        ]
+        infos = family + solos
         with patch.object(agent.session_manager, "list_sessions", return_value=infos):
             resp = await agent.list_sessions()
 
         ids = [s.session_id for s in resp.sessions]
-        # Oversized family is not split even though it exceeds the page cap.
-        assert len(ids) == page + 6
-        assert "solo" not in ids
+        # Whole family (page+6 rows) + (page-1) solos = page groups on page 1.
+        assert {m["session_id"] for m in family} <= set(ids)
+        assert len(ids) == (page + 6) + (page - 1)
         assert resp.next_cursor == ids[-1]
+
+        with patch.object(agent.session_manager, "list_sessions", return_value=infos):
+            resp2 = await agent.list_sessions(cursor=resp.next_cursor)
+        assert [s.session_id for s in resp2.sessions] == [f"solo{page - 1}"]
+        assert resp2.next_cursor is None
 
     @pytest.mark.asyncio
     async def test_list_sessions_mid_family_cursor_skips_whole_family(self, agent):
