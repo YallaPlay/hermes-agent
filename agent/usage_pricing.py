@@ -1137,8 +1137,17 @@ def normalize_usage(
         output_tokens = _to_int(getattr(response_usage, "output_tokens", 0))
         details = getattr(response_usage, "input_tokens_details", None)
         cache_read_tokens = _to_int(getattr(details, "cached_tokens", 0) if details else 0)
+        # OpenAI Responses reports cache writes as cache_write_tokens
+        # (GPT-5.6+ bills them at 1.25x the uncached input rate, so dropping
+        # them undercounts cost). cache_creation_tokens is kept as a fallback
+        # for relays that use the Anthropic-style field name.
         cache_write_tokens = _to_int(
-            getattr(details, "cache_creation_tokens", 0) if details else 0
+            (
+                getattr(details, "cache_write_tokens", 0)
+                or getattr(details, "cache_creation_tokens", 0)
+            )
+            if details
+            else 0
         )
         input_tokens = max(0, input_total - cache_read_tokens - cache_write_tokens)
     else:
