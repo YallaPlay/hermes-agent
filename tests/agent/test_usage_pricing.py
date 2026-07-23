@@ -615,3 +615,41 @@ def test_deepseek_v4_flash_estimate_usage_cost():
     assert result.amount_usd is not None
     # 1M input × $0.14/M + 500K output × $0.28/M = $0.14 + $0.14 = $0.28
     assert float(result.amount_usd) == 0.28
+
+
+def test_codex_responses_reads_cache_write_tokens_field():
+    """codex_responses usage carries cache_write_tokens (OpenAI Responses
+    naming, live-verified on GPT-5.6 via an OpenAI-compatible relay), not
+    Anthropic-style cache_creation_tokens. Adapted from upstream PR #10006."""
+    usage = SimpleNamespace(
+        input_tokens=5000,
+        output_tokens=800,
+        input_tokens_details=SimpleNamespace(
+            cached_tokens=2000,
+            cache_write_tokens=1500,
+        ),
+    )
+
+    normalized = normalize_usage(usage, provider="openai", api_mode="codex_responses")
+
+    assert normalized.cache_read_tokens == 2000
+    assert normalized.cache_write_tokens == 1500
+    # Uncached input excludes both cache buckets.
+    assert normalized.input_tokens == 1500
+
+
+def test_codex_responses_falls_back_to_cache_creation_tokens():
+    """Relays using the Anthropic-style field name keep working."""
+    usage = SimpleNamespace(
+        input_tokens=5000,
+        output_tokens=800,
+        input_tokens_details=SimpleNamespace(
+            cached_tokens=2000,
+            cache_creation_tokens=1500,
+        ),
+    )
+
+    normalized = normalize_usage(usage, provider="openai", api_mode="codex_responses")
+
+    assert normalized.cache_write_tokens == 1500
+    assert normalized.input_tokens == 1500
