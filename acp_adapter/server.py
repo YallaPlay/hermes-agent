@@ -129,6 +129,111 @@ _PROVIDER_CATALOGS_TTL_SECONDS = 300.0
 _provider_catalogs_cache: tuple[float, list[tuple[str, str, list[tuple[str, str]]]]] | None = None
 
 
+def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, str]]]]:
+    """Return catalogs for user-defined named endpoints from config.
+
+    Covers both the v12 ``providers:`` mapping and the legacy
+    ``custom_providers:`` list.  These endpoints never appear in
+    ``list_available_providers()`` (it walks only canonical providers), so
+    without this the ACP model selector hides every named endpoint that the
+    TUI ``/model`` picker already renders (upstream #47039 implemented named
+    endpoints for the TUI surface only).
+
+    Model lists come from the entry's declared models (``default_model`` +
+    ``models``), refreshed from the endpoint's live ``/models`` listing when a
+    credential is available and ``discover_models`` is not disabled.  Declared
+    models are kept even when live discovery fails — endpoints like Bedrock
+    Mantle expose no ``/models`` route at all (404) yet serve the declared
+    models fine.
+
+    Catalog ids use the ``custom:<name>`` slug shape that
+    ``resolve_runtime_provider`` / ``parse_model_input`` already resolve, so
+    ``_encode_model_choice`` produces ``custom:<name>:<model>`` choice ids
+    that round-trip through ``set_session_model`` unchanged.
+    """
+    try:
+        from hermes_cli.config import (
+            get_compatible_custom_providers,
+            is_provider_enabled,
+            load_config,
+        )
+        from hermes_cli.models import fetch_api_models
+    except ImportError:
+        return []
+
+    try:
+        cfg = load_config()
+        entries = get_compatible_custom_providers(cfg)
+    except Exception:
+        logger.debug("Could not load named custom providers", exc_info=True)
+        return []
+
+    # ``get_compatible_custom_providers`` drops the ``enabled`` flag during
+    # normalization, so collect explicitly disabled provider keys from the
+    # raw config and skip their entries below.
+    disabled_keys: set[str] = set()
+    raw_providers = cfg.get("providers") if isinstance(cfg, dict) else None
+    if isinstance(raw_providers, dict):
+        for raw_key, raw_entry in raw_providers.items():
+            if isinstance(raw_entry, dict) and not is_provider_enabled(raw_entry):
+                disabled_keys.add(str(raw_key).strip().lower())
+
+    catalogs: list[tuple[str, str, list[tuple[str, str]]]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        provider_key = str(entry.get("provider_key", "") or "").strip()
+        if provider_key.lower() in disabled_keys:
+            continue
+        name = str(entry.get("name", "") or "").strip()
+        base_url = str(entry.get("base_url", "") or "").strip()
+        if not name or not base_url:
+            continue
+        slug_source = provider_key or name
+        slug = "custom:" + slug_source.strip().lower().replace(" ", "-")
+
+        api_key = str(entry.get("api_key", "") or "").strip()
+        if not api_key:
+            key_env = str(entry.get("key_env", "") or "").strip()
+            api_key = os.environ.get(key_env, "").strip() if key_env else ""
+
+        declared: list[str] = []
+        default_model = str(entry.get("model", "") or "").strip()
+        if default_model:
+            declared.append(default_model)
+        models_cfg = entry.get("models")
+        if isinstance(models_cfg, dict):
+            for mid in models_cfg:
+                mid = str(mid or "").strip()
+                if mid and mid not in declared:
+                    declared.append(mid)
+
+        if not api_key and not declared:
+            # No credential to discover with and nothing declared:
+            # not addressable from the selector.
+            continue
+
+        model_ids = list(declared)
+        discover = entry.get("discover_models", True)
+        if isinstance(discover, str):
+            discover = discover.lower() not in {"false", "no", "0"}
+        if discover and api_key:
+            try:
+                live = fetch_api_models(
+                    api_key, base_url, api_mode=entry.get("api_mode")
+                )
+            except Exception:
+                live = None
+            if live:
+                model_ids = declared + [m for m in live if m not in declared]
+
+        if not model_ids:
+            continue
+        catalogs.append((slug, name, [(mid, "") for mid in model_ids]))
+
+    return catalogs
+
+
 def _authenticated_provider_catalogs(
     current_provider: str,
     force_refresh: bool = False,
@@ -179,6 +284,18 @@ def _authenticated_provider_catalogs(
                 continue
             if catalog:
                 catalogs.append((pid, str(info.get("label") or pid), catalog))
+
+        # Named user-defined endpoints (providers: / custom_providers:) are
+        # invisible to list_available_providers — append them explicitly.
+        try:
+            for slug, label, catalog in _named_custom_provider_catalogs():
+                if slug in seen_providers:
+                    continue
+                seen_providers.add(slug)
+                catalogs.append((slug, label, catalog))
+        except Exception:
+            logger.debug("Could not list named custom providers", exc_info=True)
+
         _provider_catalogs_cache = (now, catalogs)
 
     # Current provider first, preserving relative order for the rest.
