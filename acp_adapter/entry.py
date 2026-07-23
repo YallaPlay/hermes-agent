@@ -257,18 +257,7 @@ def main(argv: list[str] | None = None) -> None:
     except Exception:
         logger.debug("MCP tool discovery failed at ACP startup", exc_info=True)
 
-    try:
-        from hermes_cli.config import load_config
-
-        continuation_preview_config = load_config()
-    except Exception:
-        logger.warning(
-            "Continuation preview configuration could not be loaded; keeping it disabled",
-            exc_info=True,
-        )
-        continuation_preview_config = None
-
-    agent = HermesACPAgent(continuation_preview_config=continuation_preview_config)
+    agent = HermesACPAgent()
     try:
         asyncio.run(acp.run_agent(agent, use_unstable_protocol=True))
     except KeyboardInterrupt:
