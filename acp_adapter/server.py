@@ -2346,10 +2346,19 @@ class HermesACPAgent(acp.Agent):
           skipped when no client is attached; the turn still runs and its
           transcript persists for reattach).
 
-        Benign TOCTOU window: between releasing ``runtime_lock`` and
-        ``prompt()``'s own ``is_running`` re-check, a user prompt could
-        start a turn. ``prompt()`` re-checks under the lock and queues our
-        text; worst case the client sees a "Queued" ack for it.
+        The prompt is submitted in ``prompt()``'s internal notification
+        mode (``_synthetic_notification=True``): no slash/steer parsing,
+        no ``interrupted_prompt_text`` merge (a notification must not
+        resurrect a user-cancelled prompt), and — critically — the busy
+        branch queues SILENTLY instead of redirecting. That makes the
+        TOCTOU window between releasing ``runtime_lock`` and ``prompt()``'s
+        own ``is_running`` re-check genuinely benign: if a user prompt
+        starts a turn in that window, the worst case is the notification
+        text landing in ``queued_prompts`` with no client ack — it can
+        never abort or steer the user's turn. As belt-and-braces, a
+        leading "/" in the text is neutralized with a framing prefix so
+        the queued copy can't be command-parsed when the post-turn drain
+        replays it as a normal follow-up prompt.
 
         Never raises: unknown session ids log-and-return, and any failure
         in the echo/prompt path is logged — the caller (the watcher loop)
@@ -2362,6 +2371,14 @@ class HermesACPAgent(acp.Agent):
                 session_id,
             )
             return
+        # Neutralize a leading "/" so the text can never be intercepted as a
+        # slash command — not here (notification mode already skips parsing)
+        # but by the queued-prompt drain, which replays queued text through
+        # prompt() as a NORMAL user turn. A plain leading space would not
+        # survive prompt()'s user_text.strip(), so use a visible framing
+        # prefix instead; the original text is preserved verbatim after it.
+        if text.lstrip().startswith("/"):
+            text = "[notification] " + text
         with state.runtime_lock:
             if state.is_running:
                 state.queued_prompts.append(text)
@@ -2374,6 +2391,7 @@ class HermesACPAgent(acp.Agent):
             await self.prompt(
                 prompt=[TextContentBlock(type="text", text=text)],
                 session_id=session_id,
+                _synthetic_notification=True,
             )
         except Exception:
             logger.exception("ACP notify: delivery turn failed for %s", session_id)
@@ -2510,7 +2528,34 @@ class HermesACPAgent(acp.Agent):
         session_id: str,
         **kwargs: Any,
     ) -> PromptResponse:
-        """Run Hermes on the user's prompt and stream events back to the editor."""
+        """Run Hermes on the user's prompt and stream events back to the editor.
+
+        ``_synthetic_notification`` (read from ``**kwargs``, never part of
+        the method signature) is a PRIVATE, internal-only flag set by
+        ``_deliver_notification`` when the "prompt" is a synthetic
+        background-completion notification rather than typed user input.
+        Passing it through ``**kwargs`` keeps the override signature
+        identical to ``acp.Agent.prompt`` — the framework's dispatch
+        (``build_agent_router`` → ``func(**model_to_kwargs(PromptRequest))``)
+        only ever passes ``prompt``/``session_id``/``message_id`` plus
+        ``_meta`` keys, so it can never set the flag accidentally. A client
+        could only reach it by sending a literal
+        ``_meta._synthetic_notification`` key — which merely opts its OWN
+        prompt out of slash parsing and interrupt-merge, no privilege
+        gained. When True:
+
+        - the busy branch NEVER redirects/steers the running turn — the
+          text is appended to ``queued_prompts`` silently (no "Queued for
+          the next turn" client ack) and the call returns. Synthetic
+          events must never interrupt a running turn, in any interleaving.
+        - the ``interrupted_prompt_text`` merge is skipped (and the field
+          left intact): a background notification must not resurrect a
+          prompt the user deliberately cancelled.
+        - slash-command / ``/steer`` interception does not apply —
+          notification text is payload, never a command (belt-and-braces
+          with the "/" neutralization in ``_deliver_notification``).
+        """
+        synthetic_notification = bool(kwargs.pop("_synthetic_notification", False))
         state = self.session_manager.get_session(session_id)
         if state is None:
             logger.error("prompt: session %s not found", session_id)
@@ -2572,7 +2617,17 @@ class HermesACPAgent(acp.Agent):
         #      silently append to state.queued_prompts and respond with
         #      "No active turn — queued for the next turn", which looks like
         #      /queue even though the user never typed /queue.
-        if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/steer"):
+        # Both rewrites are USER-INPUT semantics: a synthetic notification is
+        # neither a steer nor a correction, so the whole block is skipped in
+        # notification mode (see the docstring — B2: a background completion
+        # must not resurrect a prompt the user deliberately cancelled;
+        # interrupted_prompt_text stays intact for the next REAL prompt).
+        if (
+            text_only_prompt
+            and isinstance(user_content, str)
+            and user_text.startswith("/steer")
+            and not synthetic_notification
+        ):
             steer_text = user_text.split(maxsplit=1)[1].strip() if len(user_text.split(maxsplit=1)) > 1 else ""
             interrupted_prompt = ""
             rewrite_idle = False
@@ -2596,6 +2651,7 @@ class HermesACPAgent(acp.Agent):
             text_only_prompt
             and isinstance(user_content, str)
             and not user_text.startswith("/")
+            and not synthetic_notification
         ):
             # Some ACP clients implement "stop and send" as two protocol calls:
             # cancel the active prompt, then submit plain correction text. Keep
@@ -2616,8 +2672,15 @@ class HermesACPAgent(acp.Agent):
         # Intercept slash commands — handle locally without calling the LLM.
         # Slash commands are text-only; if the client included images/resources,
         # send the whole multimodal prompt to the agent instead of treating it as
-        # an ACP command.
-        if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/"):
+        # an ACP command. Synthetic notifications are payload, never commands —
+        # skipped in notification mode (belt-and-braces with the leading-"/"
+        # neutralization in _deliver_notification).
+        if (
+            text_only_prompt
+            and isinstance(user_content, str)
+            and user_text.startswith("/")
+            and not synthetic_notification
+        ):
             response_text = self._handle_slash_command(user_text, state)
             if response_text is not None:
                 if self._conn:
@@ -2629,6 +2692,10 @@ class HermesACPAgent(acp.Agent):
         # If the client sends another regular text prompt while this ACP session
         # is running, route it through the core active-turn redirect. Rich media
         # and older runtimes retain the proven next-turn queue fallback.
+        # Synthetic notifications must NEVER redirect (abort/steer) a running
+        # turn — in any interleaving, including the TOCTOU window where a user
+        # prompt starts a turn between _deliver_notification's idle check and
+        # this re-check — so notification mode always takes the queue branch.
         redirected = False
         queued_depth: int | None = None
         with state.runtime_lock:
@@ -2636,6 +2703,7 @@ class HermesACPAgent(acp.Agent):
                 if (
                     text_only_prompt
                     and isinstance(user_content, str)
+                    and not synthetic_notification
                     and getattr(
                         state.agent,
                         "_supports_active_turn_redirect",
@@ -2668,7 +2736,11 @@ class HermesACPAgent(acp.Agent):
                 await self._conn.session_update(session_id, update)
             return PromptResponse(stop_reason="end_turn")
         if queued_depth is not None:
-            if self._conn:
+            # Synthetic notifications queue SILENTLY: the "Queued for the next
+            # turn" ack is a response to typed user input, and a background
+            # event must not masquerade as one (matches _deliver_notification's
+            # own busy fast path).
+            if self._conn and not synthetic_notification:
                 update = acp.update_agent_message_text(
                     f"Queued for the next turn. ({queued_depth} queued)"
                 )

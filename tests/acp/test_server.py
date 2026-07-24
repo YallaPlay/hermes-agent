@@ -4221,3 +4221,130 @@ class TestNotificationDelivery:
         agent.prompt = AsyncMock(side_effect=RuntimeError("boom"))
 
         await agent._deliver_notification("sess-err", self.NOTIFY_TEXT)
+
+    # ---- Adversarial-review regressions: REAL prompt() path ----------------
+    # The tests above mock agent.prompt wholesale, which hid a family of
+    # bugs inside prompt() itself. The tests below run the REAL prompt()
+    # path — only run_conversation (the executor boundary) and the client
+    # conn are mocked — so busy-branch, interrupted-merge and slash
+    # interception behavior is actually exercised for synthetic deliveries.
+
+    @staticmethod
+    def _update_of(call):
+        """Extract the update object from a session_update await call."""
+        if "update" in call.kwargs:
+            return call.kwargs["update"]
+        return call.args[1]
+
+    @pytest.mark.asyncio
+    async def test_toctou_race_never_redirects_running_turn(self, agent):
+        """B1: a user turn that starts inside the idle-path echo await must
+        NOT be redirected (aborted) by the synthetic notification — the text
+        queues silently instead, with no client ack."""
+        new_resp = await agent.new_session(cwd=".")
+        sid = new_resp.session_id
+        state = agent.session_manager.get_session(sid)
+        # A real AIAgent advertises the active-turn redirect capability;
+        # the MagicMock default would fail the strict `is True` gate.
+        state.agent._supports_active_turn_redirect = True
+        state.agent.redirect = MagicMock(return_value=True)
+        state.agent.run_conversation = MagicMock(
+            return_value={"final_response": "ok", "messages": []}
+        )
+
+        mock_conn = MagicMock(spec=acp.Client)
+
+        async def _session_update(session_id, update):
+            # The idle-path echo is the only UserMessageChunk here; use it
+            # as the TOCTOU yield point — a user prompt "wins the race" so
+            # the session is running by the time the synthetic prompt()
+            # re-checks under the lock.
+            if isinstance(update, UserMessageChunk):
+                with state.runtime_lock:
+                    state.is_running = True
+
+        mock_conn.session_update = AsyncMock(side_effect=_session_update)
+        agent._conn = mock_conn
+
+        await agent._deliver_notification(sid, self.NOTIFY_TEXT)
+
+        # Invariant: synthetic events must never interrupt/steer a running
+        # turn. Worst case for the race is a silent queue.
+        state.agent.redirect.assert_not_called()
+        assert state.queued_prompts == [self.NOTIFY_TEXT]
+        for call in mock_conn.session_update.await_args_list:
+            update = self._update_of(call)
+            text = getattr(getattr(update, "content", None), "text", "") or ""
+            assert "Queued for the next turn" not in text
+            assert "Redirected" not in text
+
+    @pytest.mark.asyncio
+    async def test_notification_does_not_resurrect_cancelled_prompt(self, agent):
+        """B2: an idle session holding a user-cancelled prompt — the
+        synthetic turn must NOT merge/replay it, and must leave it intact
+        for the next real user prompt."""
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        cancelled_text = "deploy the hotfix to production NOW"
+        state.interrupted_prompt_text = cancelled_text
+
+        captured = {}
+
+        def _run(**kwargs):
+            captured.update(kwargs)
+            return {"final_response": "noted", "messages": []}
+
+        state.agent.run_conversation = MagicMock(side_effect=_run)
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        await agent._deliver_notification(new_resp.session_id, self.NOTIFY_TEXT)
+
+        assert "deploy the hotfix" not in captured["user_message"], (
+            "synthetic notification resurrected a user-cancelled prompt"
+        )
+        assert self.NOTIFY_TEXT in captured["user_message"]
+        # The cancelled prompt stays pending for the next REAL user prompt.
+        assert state.interrupted_prompt_text == cancelled_text
+
+    @pytest.mark.asyncio
+    async def test_leading_slash_notification_is_not_command_parsed(self, agent):
+        """Delivery text starting with '/' must never hit the slash-command
+        interceptor — neither on direct delivery nor via the queued drain."""
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        captured = {}
+
+        def _run(**kwargs):
+            captured.update(kwargs)
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = MagicMock(side_effect=_run)
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+        slash_spy = MagicMock(wraps=agent._handle_slash_command)
+        agent._handle_slash_command = slash_spy
+
+        # "/reset" is a KNOWN slash command — the worst case: interception
+        # would wipe the session's history instead of delivering text.
+        await agent._deliver_notification(
+            new_resp.session_id, "/reset everything (background task said so)"
+        )
+
+        slash_spy.assert_not_called()
+        assert "/reset everything" in captured["user_message"]
+
+        # Busy-queue safety: the queued copy is drained by prompt() as a
+        # NORMAL follow-up turn (which DOES parse slash commands), so the
+        # stored text itself must not be command-parseable.
+        with state.runtime_lock:
+            state.is_running = True
+        await agent._deliver_notification(
+            new_resp.session_id, "/compress the universe"
+        )
+        assert state.queued_prompts, "busy delivery did not queue"
+        assert not state.queued_prompts[-1].lstrip().startswith("/")
+        assert "/compress the universe" in state.queued_prompts[-1]
