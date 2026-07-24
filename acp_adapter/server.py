@@ -1188,8 +1188,8 @@ class HermesACPAgent(acp.Agent):
             logger.debug("Could not check live subagent registry", exc_info=True)
         return meta
 
-    def _owns_notification_event(self, evt: dict) -> bool:
-        """Positive-proof ownership check for ``completion_queue`` events.
+    def _resolve_notification_session(self, evt: dict) -> Optional[str]:
+        """Resolve the in-memory session id a completion event belongs to.
 
         Background processes and async delegations push completion events
         onto the in-process ``process_registry.completion_queue``. Another
@@ -1201,12 +1201,18 @@ class HermesACPAgent(acp.Agent):
 
         Checks ``session_key`` (the ACP session id bound via
         set_session_vars) then ``origin_ui_session_id`` (set on
-        async-delegation events). A match counts only when the session is
-        not a delegate child (``state.subagent`` falsy) — children are
-        observation-only and never receive notifications here.
+        async-delegation events) and returns the FIRST id that maps to an
+        in-memory, non-subagent session. Returning the matched id (not just
+        a bool) is load-bearing: the drain cycle uses it as the delivery
+        target, so ownership and targeting can never diverge — previously
+        ownership could match on ``session_key`` while delivery targeted a
+        foreign/stale ``origin_ui_session_id`` and warn-dropped the event.
+        A match counts only when the session is not a delegate child
+        (``state.subagent`` falsy) — children are observation-only and
+        never receive notifications here.
 
         Fails closed: empty/missing keys, unknown ids, subagent sessions,
-        or any internal error → False. Must never raise.
+        or any internal error → None. Must never raise.
         """
         try:
             for key in ("session_key", "origin_ui_session_id"):
@@ -1215,10 +1221,20 @@ class HermesACPAgent(acp.Agent):
                     continue
                 state = self.session_manager.get_in_memory(sid)
                 if state is not None and not getattr(state, "subagent", False):
-                    return True
+                    return sid
         except Exception:
             logger.debug("Ownership check failed for event %r", evt, exc_info=True)
-        return False
+        return None
+
+    def _owns_notification_event(self, evt: dict) -> bool:
+        """Positive-proof ownership check for ``completion_queue`` events.
+
+        Thin predicate over ``_resolve_notification_session`` (see there
+        for the full ownership contract) — kept as a separate bool-returning
+        method because it is passed as the ``owns_event`` callback to
+        ``process_registry.drain_notifications``.
+        """
+        return self._resolve_notification_session(evt) is not None
 
     async def _send_turn_status_update(self, state: SessionState, running: bool) -> None:
         """Notify the client that this session's turn started or ended.
@@ -2428,6 +2444,12 @@ class HermesACPAgent(acp.Agent):
         ``_owns_notification_event`` — foreign events are re-queued by
         ``drain_notifications`` itself) and delivers each into its session
         via ``_deliver_notification``.
+
+        Delegation-event protocol (at-most-once): resolve target from
+        ownership → require the target IDLE → claim → complete → deliver.
+        Busy or unresolvable targets are NOT claimed; their events are
+        requeued and retried on the next 2s cycle. See the inline comments
+        for why each step is ordered this way.
         """
         if not self._conn:
             # No client attached — leave events queued for when one is.
@@ -2444,29 +2466,66 @@ class HermesACPAgent(acp.Agent):
         for evt, text in process_registry.drain_notifications(
             owns_event=self._owns_notification_event
         ):
-            target = str(
-                evt.get("origin_ui_session_id") or evt.get("session_key") or ""
-            )
+            # The delivery target IS the session ownership matched — never a
+            # recomputed origin_ui_session_id-or-session_key expression, which
+            # could pick a foreign/stale id when ownership matched on the
+            # OTHER key (probe-confirmed: claimed event warn-dropped inside
+            # _deliver_notification, then falsely acked 'delivered').
+            target = self._resolve_notification_session(evt)
+            if target is None:
+                # Session evicted between drain's ownership check and here.
+                # Requeue for the next 2s cycle instead of warn-dropping —
+                # and for delegation events, critically, WITHOUT claiming
+                # (a claim we then complete would mark a drop 'delivered').
+                # Requeue mirrors drain_notifications' own foreign-event
+                # requeue: put THIS event back and keep iterating the rest.
+                # No fast-spin: the next pop happens next cycle (2s later).
+                process_registry.completion_queue.put(evt)
+                continue
             if evt.get("type") == "async_delegation":
                 # Durable delegation completions can be restored into EVERY
                 # process's completion_queue at registry startup, so the
                 # durable claim is the ONLY double-delivery guard: never
                 # deliver one without a successful claim. claim=None means
                 # another process holds (or already completed) delivery —
-                # skip silently. Mirrors cli.py's
-                # _drain_process_notifications: claim BEFORE delivering,
-                # complete AFTER. The completion is unconditional because
-                # _deliver_notification never raises — a failed delivery is
-                # not observable here (it logs internally), so there is no
-                # signal on which to release_event_delivery instead.
+                # skip silently.
+                state = self.session_manager.get_in_memory(target)
+                if state is not None and state.is_running:
+                    # Busy target: do NOT claim. Claiming now would force a
+                    # completion whose only delivery path is the RAM-only
+                    # state.queued_prompts list — an editor close before the
+                    # post-turn drain would lose the result forever while the
+                    # durable row says 'delivered'. Leave the row pending/
+                    # claimable, requeue the event, and let the next 2s cycle
+                    # retry once the turn ends and the session is idle.
+                    process_registry.completion_queue.put(evt)
+                    continue
                 claim = claim_event_delivery(evt, consumer)
                 if claim is None:
                     continue
-                await self._deliver_notification(target, text)
+                # complete BEFORE deliver — deliberate at-most-once. The
+                # delivery turn below can run for MINUTES, and
+                # claim_event_delivery lets any other consumer STEAL a claim
+                # older than 300s: complete-after-deliver provably
+                # double-delivers when a gateway/TUI restarts mid-turn
+                # (probe-confirmed: attempts == 2). Completing first shrinks
+                # the claim hold to milliseconds, matching every other
+                # consumer. It costs no honesty: the target was just verified
+                # in-memory and idle, and _deliver_notification never raises,
+                # so a post-delivery completion could not detect failure
+                # anyway. Benign TOCTOU remains: if a user turn starts
+                # between the idle check above and the delivery below, the
+                # text lands in RAM queued_prompts after the row was
+                # completed — but that window is milliseconds (vs a whole
+                # turn before this fix) and the busy-requeue above keeps it
+                # from ever spanning a full turn.
                 complete_event_delivery(evt, claim)
+                await self._deliver_notification(target, text)
             else:
                 # Plain completion/watch_match/watch_disabled events are
-                # in-process only — no cross-process race, no claim needed.
+                # in-process only — no cross-process race, no durable row,
+                # no claim needed; queue-on-busy in RAM inside
+                # _deliver_notification is their established semantic.
                 await self._deliver_notification(target, text)
 
     async def _notification_watcher(self) -> None:

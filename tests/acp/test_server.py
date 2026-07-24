@@ -4478,9 +4478,49 @@ class TestNotificationWatcher:
         agent._conn = mock_conn
         return mock_conn
 
+    def _insert_state(self, manager, session_id, is_running=False):
+        """Insert a SessionState directly into the manager's in-memory map."""
+        from acp_adapter.session import SessionState
+
+        state = SessionState(
+            session_id=session_id,
+            agent=MagicMock(name="MockAIAgent"),
+            cwd="/tmp",
+            is_running=is_running,
+        )
+        with manager._lock:
+            manager._sessions[session_id] = state
+        return state
+
+    @staticmethod
+    def _pop_requeued(evt):
+        """True iff evt sits on the real completion_queue; removes it.
+
+        Drains the shared registry queue, restores every foreign item so
+        other tests are unaffected, and reports whether OUR event was
+        requeued by the drain cycle under test.
+        """
+        from tools.process_registry import process_registry
+
+        found = False
+        others = []
+        while not process_registry.completion_queue.empty():
+            try:
+                item = process_registry.completion_queue.get_nowait()
+            except Exception:
+                break
+            if item is evt:
+                found = True
+            else:
+                others.append(item)
+        for item in others:
+            process_registry.completion_queue.put(item)
+        return found
+
     @pytest.mark.asyncio
     async def test_drain_cycle_delivers_owned_completion(self, agent):
         self._attach_conn(agent)
+        self._insert_state(agent.session_manager, "sess-abc")
         evt = {"type": "completion", "session_key": "sess-abc"}
         agent._deliver_notification = AsyncMock()
         from tools.process_registry import process_registry
@@ -4505,6 +4545,9 @@ class TestNotificationWatcher:
         the event must be skipped silently (the durable claim is the ONLY
         double-delivery guard for delegation events)."""
         self._attach_conn(agent)
+        # The session must exist in-memory and be idle — the cycle only
+        # attempts a claim after resolving an idle in-memory target.
+        self._insert_state(agent.session_manager, "sess-del")
         evt = {"type": "async_delegation", "origin_ui_session_id": "sess-del"}
         agent._deliver_notification = AsyncMock()
         from tools.process_registry import process_registry
@@ -4529,6 +4572,8 @@ class TestNotificationWatcher:
     @pytest.mark.asyncio
     async def test_delegation_event_claimed_delivers_and_completes(self, agent):
         self._attach_conn(agent)
+        # Idle in-memory session — required before the cycle claims.
+        self._insert_state(agent.session_manager, "sess-del")
         evt = {"type": "async_delegation", "origin_ui_session_id": "sess-del"}
         agent._deliver_notification = AsyncMock()
         from tools.process_registry import process_registry
@@ -4549,6 +4594,159 @@ class TestNotificationWatcher:
             "sess-del", "[IMPORTANT: delegation done]"
         )
         mock_complete.assert_called_once_with(evt, "claim-token-1")
+
+    # ---- Claim/ack protocol regressions (adversarial-review MAJORs) --------
+    # MAJOR-1: holding the durable claim across a delivery turn (minutes)
+    # exceeds the 300s claim-steal window → double delivery.
+    # MAJOR-2: completing a claim after a warn-drop marks a DROPPED event
+    # 'delivered' (target/ownership key mismatch) → silent permanent loss.
+    # MAJOR-3: acking the durable row while the payload only sits in the
+    # RAM-only queued_prompts list → lost forever if the process dies.
+
+    @pytest.mark.asyncio
+    async def test_delegation_targets_ownership_matched_session(self, agent):
+        """MAJOR-2: ownership can match on session_key while
+        origin_ui_session_id is foreign/stale. The delivery target must be
+        the session ownership ACTUALLY matched — never the foreign id —
+        and the durable row must be completed only for that real delivery."""
+        self._attach_conn(agent)
+        self._insert_state(agent.session_manager, "sess-real")
+        evt = {
+            "type": "async_delegation",
+            "session_key": "sess-real",
+            # Stale id from another editor window / previous process.
+            "origin_ui_session_id": "foreign-ui-77",
+        }
+        agent._deliver_notification = AsyncMock()
+        from tools.process_registry import process_registry
+
+        with patch.object(
+            process_registry,
+            "drain_notifications",
+            return_value=[(evt, "[IMPORTANT: delegation done]")],
+        ), patch(
+            "tools.async_delegation.claim_event_delivery",
+            return_value="claim-token-1",
+        ), patch(
+            "tools.async_delegation.complete_event_delivery"
+        ) as mock_complete:
+            await agent._drain_notification_cycle()
+
+        agent._deliver_notification.assert_awaited_once_with(
+            "sess-real", "[IMPORTANT: delegation done]"
+        )
+        mock_complete.assert_called_once_with(evt, "claim-token-1")
+
+    @pytest.mark.asyncio
+    async def test_delegation_busy_session_requeues_without_claim(self, agent):
+        """MAJOR-3: a busy target must NOT be claimed — the durable row
+        stays pending/claimable and the event is requeued for the next
+        2s cycle, instead of being acked 'delivered' into the RAM-only
+        queued_prompts list (lost forever if the process dies)."""
+        self._attach_conn(agent)
+        self._insert_state(
+            agent.session_manager, "sess-busy-del", is_running=True
+        )
+        evt = {"type": "async_delegation", "session_key": "sess-busy-del"}
+        agent._deliver_notification = AsyncMock()
+        from tools.process_registry import process_registry
+
+        with patch.object(
+            process_registry,
+            "drain_notifications",
+            return_value=[(evt, "[IMPORTANT: delegation done]")],
+        ), patch(
+            "tools.async_delegation.claim_event_delivery"
+        ) as mock_claim, patch(
+            "tools.async_delegation.complete_event_delivery"
+        ) as mock_complete:
+            await agent._drain_notification_cycle()
+
+        mock_claim.assert_not_called()
+        mock_complete.assert_not_called()
+        agent._deliver_notification.assert_not_awaited()
+        assert self._pop_requeued(evt), "busy-target event was not requeued"
+
+    @pytest.mark.asyncio
+    async def test_delegation_completes_claim_before_delivery_turn(self, agent):
+        """MAJOR-1: the durable claim must be held for milliseconds — claim,
+        complete, THEN run the (potentially minutes-long) delivery turn.
+        complete-after-deliver provably double-delivers: any other consumer
+        steals a claim older than 300s and delivers again."""
+        self._attach_conn(agent)
+        self._insert_state(agent.session_manager, "sess-order")
+        evt = {"type": "async_delegation", "session_key": "sess-order"}
+        order = []
+
+        async def _deliver(session_id, text):
+            order.append("deliver")
+
+        agent._deliver_notification = AsyncMock(side_effect=_deliver)
+        from tools.process_registry import process_registry
+
+        with patch.object(
+            process_registry,
+            "drain_notifications",
+            return_value=[(evt, "[IMPORTANT: delegation done]")],
+        ), patch(
+            "tools.async_delegation.claim_event_delivery",
+            side_effect=lambda *a: order.append("claim") or "claim-token-1",
+        ), patch(
+            "tools.async_delegation.complete_event_delivery",
+            side_effect=lambda *a: order.append("complete"),
+        ):
+            await agent._drain_notification_cycle()
+
+        assert order == ["claim", "complete", "deliver"]
+
+    @pytest.mark.asyncio
+    async def test_delegation_unresolvable_target_requeues_without_claim(
+        self, agent
+    ):
+        """Session evicted between ownership check and delivery (or a
+        drain-mock bypasses ownership): no in-memory match → do NOT claim
+        (completing would mark a drop 'delivered'), requeue instead."""
+        self._attach_conn(agent)
+        evt = {"type": "async_delegation", "origin_ui_session_id": "gone-sess"}
+        agent._deliver_notification = AsyncMock()
+        from tools.process_registry import process_registry
+
+        with patch.object(
+            process_registry,
+            "drain_notifications",
+            return_value=[(evt, "[IMPORTANT: delegation done]")],
+        ), patch(
+            "tools.async_delegation.claim_event_delivery"
+        ) as mock_claim, patch(
+            "tools.async_delegation.complete_event_delivery"
+        ) as mock_complete:
+            await agent._drain_notification_cycle()
+
+        mock_claim.assert_not_called()
+        mock_complete.assert_not_called()
+        agent._deliver_notification.assert_not_awaited()
+        assert self._pop_requeued(evt), "unresolvable event was not requeued"
+
+    @pytest.mark.asyncio
+    async def test_plain_event_unresolvable_target_requeues(self, agent):
+        """Plain (non-delegation) events with no in-memory match must be
+        requeued for the next cycle rather than warn-dropped inside
+        _deliver_notification (cheap consistency win — no durable row to
+        protect, but dropping is still worse than retrying)."""
+        self._attach_conn(agent)
+        evt = {"type": "completion", "session_key": "gone-sess"}
+        agent._deliver_notification = AsyncMock()
+        from tools.process_registry import process_registry
+
+        with patch.object(
+            process_registry,
+            "drain_notifications",
+            return_value=[(evt, "[IMPORTANT: done]")],
+        ):
+            await agent._drain_notification_cycle()
+
+        agent._deliver_notification.assert_not_awaited()
+        assert self._pop_requeued(evt), "plain event was not requeued"
 
     @pytest.mark.asyncio
     async def test_no_conn_skips_drain(self, agent):
