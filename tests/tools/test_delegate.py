@@ -155,6 +155,19 @@ class TestChildSystemPrompt(unittest.TestCase):
         prompt = _build_child_system_prompt("Do something", "  ")
         self.assertNotIn("CONTEXT", prompt)
 
+    def test_iteration_budget_with_explicit_max(self):
+        prompt = _build_child_system_prompt("Fix the tests", max_iterations=80)
+        self.assertIn("Iteration Budget", prompt)
+        self.assertIn("budget of 80 tool-calling iterations", prompt)
+        self.assertIn("ONE iteration together", prompt)
+        self.assertIn("execute_code", prompt)
+
+    def test_iteration_budget_without_max_stays_generic(self):
+        prompt = _build_child_system_prompt("Fix the tests")
+        self.assertIn("Iteration Budget", prompt)
+        self.assertIn("limited budget of tool-calling iterations", prompt)
+        self.assertNotIn("budget of None", prompt)
+
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):

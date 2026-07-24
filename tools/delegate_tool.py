@@ -666,6 +666,7 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    max_iterations: Optional[int] = None,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -701,6 +702,28 @@ def _build_child_system_prompt(
         "points over paragraphs, and don't replay your whole process. Your "
         "response is returned to the parent agent as a summary, and overlong "
         "summaries crowd out the parent's context window."
+    )
+    budget_line = (
+        f"You have a budget of {max_iterations} tool-calling iterations "
+        if max_iterations
+        else "You have a limited budget of tool-calling iterations "
+    )
+    parts.append(
+        "\n## Iteration Budget (work in batches)\n"
+        + budget_line
+        + "before you are forced to stop and summarize partial work. "
+        "An iteration is one model round-trip, NOT one tool call: all tool "
+        "calls you issue in a single response execute concurrently and cost "
+        "ONE iteration together. To finish within budget:\n"
+        "- Batch independent reads/searches/commands into one response "
+        "instead of issuing them one at a time.\n"
+        "- Serialize only when a call truly depends on a prior call's "
+        "result.\n"
+        "- For bulk fan-out work (many files, pagination, filter-then-read "
+        "loops), use execute_code with hermes_tools when available — it runs "
+        "many tool calls inside a single iteration.\n"
+        "- If the budget is running low, stop starting new threads of work "
+        "and write your final summary while you still can."
     )
     if role == "orchestrator":
         child_note = (
@@ -1204,6 +1227,7 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        max_iterations=max_iterations,
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
