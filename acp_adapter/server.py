@@ -819,6 +819,10 @@ class HermesACPAgent(acp.Agent):
         value: key for key, value in _MODE_TO_EDIT_APPROVAL_POLICY.items()
     }
 
+    # Seconds between notification-watcher drain passes over the process
+    # registry's completion queue (background process / delegation events).
+    _NOTIFY_DRAIN_INTERVAL_SEC = 2.0
+
     # Session-scoped reasoning effort, exposed as an ACP select config option.
     # "default" means no override (provider/profile default); the rest mirror
     # tools/reasoning_effort_tool.VALID_LEVELS and the /reasoning command.
@@ -838,6 +842,10 @@ class HermesACPAgent(acp.Agent):
         super().__init__()
         self.session_manager = session_manager or SessionManager()
         self._conn: Optional[acp.Client] = None
+        # Background watcher draining process/delegation completion events
+        # into sessions; started lazily from a running-loop context (see
+        # _ensure_notification_watcher).
+        self._notification_watcher_task: Optional[asyncio.Task] = None
         # Session ids already sent through the background title backfill —
         # one derive attempt per session per process, so a failing aux model
         # doesn't get hammered on every sessions-list refresh.
@@ -848,6 +856,11 @@ class HermesACPAgent(acp.Agent):
     def on_connect(self, conn: acp.Client) -> None:
         """Store the client connection for sending session updates."""
         self._conn = conn
+        # Sync method, but in production it runs inside acp.run_agent's event
+        # loop (AgentSideConnection.__init__ is constructed in a coroutine),
+        # so create_task works; with no running loop (sync tests) the starter
+        # skips and prompt()'s defensive call brings the watcher up instead.
+        self._ensure_notification_watcher()
         logger.info("ACP client connected")
 
 
@@ -2408,6 +2421,87 @@ class HermesACPAgent(acp.Agent):
         except Exception:
             logger.exception("ACP notify: delivery turn failed for %s", session_id)
 
+    async def _drain_notification_cycle(self) -> None:
+        """One drain pass over the process registry's completion queue.
+
+        Pops every event this server can positively prove it owns (see
+        ``_owns_notification_event`` — foreign events are re-queued by
+        ``drain_notifications`` itself) and delivers each into its session
+        via ``_deliver_notification``.
+        """
+        if not self._conn:
+            # No client attached — leave events queued for when one is.
+            return
+        # Local imports match the codebase style and keep the registry /
+        # delegation-store import cost off module load.
+        from tools.process_registry import process_registry
+        from tools.async_delegation import (
+            claim_event_delivery,
+            complete_event_delivery,
+        )
+
+        consumer = f"acp:{os.getpid()}"
+        for evt, text in process_registry.drain_notifications(
+            owns_event=self._owns_notification_event
+        ):
+            target = str(
+                evt.get("origin_ui_session_id") or evt.get("session_key") or ""
+            )
+            if evt.get("type") == "async_delegation":
+                # Durable delegation completions can be restored into EVERY
+                # process's completion_queue at registry startup, so the
+                # durable claim is the ONLY double-delivery guard: never
+                # deliver one without a successful claim. claim=None means
+                # another process holds (or already completed) delivery —
+                # skip silently. Mirrors cli.py's
+                # _drain_process_notifications: claim BEFORE delivering,
+                # complete AFTER. The completion is unconditional because
+                # _deliver_notification never raises — a failed delivery is
+                # not observable here (it logs internally), so there is no
+                # signal on which to release_event_delivery instead.
+                claim = claim_event_delivery(evt, consumer)
+                if claim is None:
+                    continue
+                await self._deliver_notification(target, text)
+                complete_event_delivery(evt, claim)
+            else:
+                # Plain completion/watch_match/watch_disabled events are
+                # in-process only — no cross-process race, no claim needed.
+                await self._deliver_notification(target, text)
+
+    async def _notification_watcher(self) -> None:
+        """Poll loop: drain completion events into sessions every interval.
+
+        One failing cycle must never kill the loop — everything except
+        cancellation is logged and the loop keeps going.
+        """
+        while True:
+            try:
+                await self._drain_notification_cycle()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("ACP notification watcher cycle failed")
+            await asyncio.sleep(self._NOTIFY_DRAIN_INTERVAL_SEC)
+
+    def _ensure_notification_watcher(self) -> None:
+        """Idempotently start (or resurrect) the notification watcher task.
+
+        Safe to call from sync, no-loop contexts (e.g. on_connect in sync
+        tests): with no running loop the start is skipped — prompt() calls
+        this again from loop context, so the watcher still comes up.
+        """
+        task = self._notification_watcher_task
+        if task is not None and not task.done():
+            return
+        try:
+            self._notification_watcher_task = asyncio.get_running_loop().create_task(
+                self._notification_watcher()
+            )
+        except RuntimeError:
+            # No running event loop — defer to the next loop-context call.
+            pass
+
     def _make_spawn_session_requester(
         self, loop: asyncio.AbstractEventLoop, parent_state: SessionState
     ):
@@ -2568,6 +2662,9 @@ class HermesACPAgent(acp.Agent):
           with the "/" neutralization in ``_deliver_notification``).
         """
         synthetic_notification = bool(kwargs.pop("_synthetic_notification", False))
+        # Defensive resurrection: if the watcher task ever died (or on_connect
+        # ran without a loop), the first prompt from loop context restarts it.
+        self._ensure_notification_watcher()
         state = self.session_manager.get_session(session_id)
         if state is None:
             logger.error("prompt: session %s not found", session_id)

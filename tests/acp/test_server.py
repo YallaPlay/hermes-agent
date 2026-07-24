@@ -1,5 +1,6 @@
 """Tests for acp_adapter.server — HermesACPAgent ACP server."""
 
+import contextlib
 import asyncio
 import base64
 import os
@@ -4458,3 +4459,183 @@ class TestNotificationDelivery:
 
         state.agent.run_conversation.assert_called_once()
         assert self.NOTIFY_TEXT in captured["user_message"]
+
+
+# ---------------------------------------------------------------------------
+# Notification watcher — background drain loop for completion_queue events
+# ---------------------------------------------------------------------------
+
+
+class TestNotificationWatcher:
+    """Background watcher that drains process/delegation completion events
+    from the in-process ``process_registry.completion_queue`` and delivers
+    them into owned sessions via ``_deliver_notification``.
+    """
+
+    def _attach_conn(self, agent):
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+        return mock_conn
+
+    @pytest.mark.asyncio
+    async def test_drain_cycle_delivers_owned_completion(self, agent):
+        self._attach_conn(agent)
+        evt = {"type": "completion", "session_key": "sess-abc"}
+        agent._deliver_notification = AsyncMock()
+        from tools.process_registry import process_registry
+
+        with patch.object(
+            process_registry,
+            "drain_notifications",
+            return_value=[(evt, "[IMPORTANT: done]")],
+        ) as mock_drain:
+            await agent._drain_notification_cycle()
+
+        mock_drain.assert_called_once_with(
+            owns_event=agent._owns_notification_event
+        )
+        agent._deliver_notification.assert_awaited_once_with(
+            "sess-abc", "[IMPORTANT: done]"
+        )
+
+    @pytest.mark.asyncio
+    async def test_delegation_event_claim_denied_skips_delivery(self, agent):
+        """claim_event_delivery → None means another process owns delivery;
+        the event must be skipped silently (the durable claim is the ONLY
+        double-delivery guard for delegation events)."""
+        self._attach_conn(agent)
+        evt = {"type": "async_delegation", "origin_ui_session_id": "sess-del"}
+        agent._deliver_notification = AsyncMock()
+        from tools.process_registry import process_registry
+
+        with patch.object(
+            process_registry,
+            "drain_notifications",
+            return_value=[(evt, "[IMPORTANT: delegation done]")],
+        ), patch(
+            "tools.async_delegation.claim_event_delivery", return_value=None
+        ) as mock_claim, patch(
+            "tools.async_delegation.complete_event_delivery"
+        ) as mock_complete:
+            await agent._drain_notification_cycle()
+
+        mock_claim.assert_called_once()
+        assert mock_claim.call_args.args[0] is evt
+        assert mock_claim.call_args.args[1].startswith("acp:")
+        agent._deliver_notification.assert_not_awaited()
+        mock_complete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_delegation_event_claimed_delivers_and_completes(self, agent):
+        self._attach_conn(agent)
+        evt = {"type": "async_delegation", "origin_ui_session_id": "sess-del"}
+        agent._deliver_notification = AsyncMock()
+        from tools.process_registry import process_registry
+
+        with patch.object(
+            process_registry,
+            "drain_notifications",
+            return_value=[(evt, "[IMPORTANT: delegation done]")],
+        ), patch(
+            "tools.async_delegation.claim_event_delivery",
+            return_value="claim-token-1",
+        ), patch(
+            "tools.async_delegation.complete_event_delivery"
+        ) as mock_complete:
+            await agent._drain_notification_cycle()
+
+        agent._deliver_notification.assert_awaited_once_with(
+            "sess-del", "[IMPORTANT: delegation done]"
+        )
+        mock_complete.assert_called_once_with(evt, "claim-token-1")
+
+    @pytest.mark.asyncio
+    async def test_no_conn_skips_drain(self, agent):
+        """No client attached → leave events queued; drain not even called."""
+        agent._conn = None
+        agent._deliver_notification = AsyncMock()
+        from tools.process_registry import process_registry
+
+        with patch.object(
+            process_registry, "drain_notifications", return_value=[]
+        ) as mock_drain:
+            await agent._drain_notification_cycle()
+
+        mock_drain.assert_not_called()
+        agent._deliver_notification.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_watcher_task_started_and_idempotent(self, agent):
+        agent._drain_notification_cycle = AsyncMock()
+        try:
+            agent._ensure_notification_watcher()
+            task1 = agent._notification_watcher_task
+            assert task1 is not None and not task1.done()
+
+            # Second call while alive → same task object (idempotent).
+            agent._ensure_notification_watcher()
+            assert agent._notification_watcher_task is task1
+
+            # After cancellation, a new call must create a fresh task.
+            task1.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task1, timeout=5)
+            agent._ensure_notification_watcher()
+            task2 = agent._notification_watcher_task
+            assert task2 is not task1 and not task2.done()
+        finally:
+            task = agent._notification_watcher_task
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_watcher_cycle_exception_does_not_kill_loop(
+        self, agent, monkeypatch
+    ):
+        """A raising cycle must be logged and the loop must reach the next
+        cycle — only CancelledError stops the watcher."""
+        monkeypatch.setattr(
+            type(agent), "_NOTIFY_DRAIN_INTERVAL_SEC", 0.01, raising=True
+        )
+        second_cycle_reached = asyncio.Event()
+        calls = {"n": 0}
+
+        async def flaky_cycle():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("boom")
+            second_cycle_reached.set()
+
+        agent._drain_notification_cycle = flaky_cycle
+        agent._ensure_notification_watcher()
+        task = agent._notification_watcher_task
+        try:
+            await asyncio.wait_for(second_cycle_reached.wait(), timeout=5)
+            assert not task.done(), "watcher died after one failing cycle"
+            assert calls["n"] >= 2
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=5)
+
+    def test_on_connect_starts_watcher(self, agent):
+        """on_connect must attempt the watcher start (no-loop → deferred)."""
+        agent._ensure_notification_watcher = MagicMock()
+        agent.on_connect(MagicMock(spec=acp.Client))
+        agent._ensure_notification_watcher.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_prompt_resurrects_dead_watcher(self, agent):
+        """prompt() defensively restarts the watcher even for unknown sessions."""
+        agent._ensure_notification_watcher = MagicMock()
+        await asyncio.wait_for(
+            agent.prompt(
+                prompt=[TextContentBlock(type="text", text="hi")],
+                session_id="no-such-session",
+            ),
+            timeout=5,
+        )
+        agent._ensure_notification_watcher.assert_called_once()
