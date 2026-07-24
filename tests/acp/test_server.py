@@ -4837,3 +4837,109 @@ class TestNotificationWatcher:
             timeout=5,
         )
         agent._ensure_notification_watcher.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Notification pipeline — end-to-end
+# ---------------------------------------------------------------------------
+
+
+class TestNotificationE2E:
+    """End-to-end: a REAL completion event on the REAL registry queue flows
+    through the REAL drain cycle (ownership routing + formatting) into a
+    REAL synthetic prompt turn. Only ``run_conversation`` — the executor
+    boundary — is mocked, matching the file's established pattern.
+    """
+
+    @pytest.mark.asyncio
+    async def test_completion_event_drains_into_synthetic_turn(self, agent):
+        import time
+
+        from tools.process_registry import process_registry
+
+        proc_sid = "proc_test123"  # unique — drain skip-state can't collide
+
+        # HYGIENE: completion_queue is process-global shared state. Stash
+        # everything currently queued (ours or leaked from parallel tests)
+        # and restore it in teardown so no foreign event is consumed.
+        stashed = []
+        while not process_registry.completion_queue.empty():
+            try:
+                stashed.append(process_registry.completion_queue.get_nowait())
+            except Exception:
+                break
+        # Clean consumed/observed skip-state for our unique proc id so the
+        # real drain's _drain_should_skip cannot spuriously eat the event.
+        process_registry._completion_consumed.discard(proc_sid)
+        process_registry._poll_observed.discard(proc_sid)
+
+        try:
+            # Real agent + real in-memory idle session.
+            new_resp = await agent.new_session(cwd=".")
+            state = agent.session_manager.get_session(new_resp.session_id)
+
+            captured = {}
+
+            def _run(**kwargs):
+                captured.update(kwargs)
+                return {"final_response": "ok", "messages": []}
+
+            state.agent.run_conversation = MagicMock(side_effect=_run)
+
+            mock_conn = MagicMock(spec=acp.Client)
+            mock_conn.session_update = AsyncMock()
+            agent._conn = mock_conn
+
+            # A REAL completion event, shaped exactly like
+            # ProcessRegistry._move_to_finished produces (no drain mock —
+            # the real registry drain + formatter run below).
+            evt = {
+                "type": "completion",
+                "session_id": proc_sid,
+                "session_key": new_resp.session_id,
+                "command": "echo hello world",
+                "exit_code": 0,
+                "completion_reason": "exited",
+                "termination_source": "",
+                "output": "hello world",
+                "started_at": time.time(),
+            }
+            process_registry.completion_queue.put(evt)
+
+            await asyncio.wait_for(
+                agent._drain_notification_cycle(), timeout=10
+            )
+
+            # The chain ran end-to-end: event → drain → ownership →
+            # format → synthetic turn on OUR session.
+            state.agent.run_conversation.assert_called_once()
+            user_text = captured["user_message"]
+            assert "[IMPORTANT:" in user_text
+            assert proc_sid in user_text
+            assert "hello world" in user_text
+            # The synthetic turn fully completed — session idle again.
+            assert state.is_running is False
+        finally:
+            # The delivery turn goes through prompt(), which may start the
+            # real watcher task — never leak it into other tests.
+            task = getattr(agent, "_notification_watcher_task", None)
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=5)
+            # Drop any leftover copies of OUR event, then restore every
+            # stashed foreign event for the tests that own them.
+            while not process_registry.completion_queue.empty():
+                try:
+                    item = process_registry.completion_queue.get_nowait()
+                except Exception:
+                    break
+                if not (
+                    isinstance(item, dict)
+                    and item.get("session_id") == proc_sid
+                ):
+                    stashed.append(item)
+            for item in stashed:
+                process_registry.completion_queue.put(item)
+            process_registry._completion_consumed.discard(proc_sid)
+            process_registry._poll_observed.discard(proc_sid)
