@@ -4059,3 +4059,68 @@ class TestResourceLinkPathDisclosure:
         assert len(parts) == 1 and parts[0]["type"] == "text"
         assert "too large to inline" in parts[0]["text"]
         assert f"File is at {f}" in parts[0]["text"]
+
+
+# ---------------------------------------------------------------------------
+# _owns_notification_event — background-notification ownership predicate
+# ---------------------------------------------------------------------------
+
+
+class TestNotificationOwnership:
+    """Fail-closed ownership check for completion_queue events.
+
+    The predicate decides whether a background/delegation completion event
+    belongs to a session hosted by THIS ACP server process. Only positive
+    proof (the event's session id maps to an in-memory, non-subagent
+    session) counts; everything else must be rejected.
+    """
+
+    def _insert_state(self, manager, session_id, subagent=False):
+        """Insert a SessionState directly into the manager's in-memory map."""
+        from acp_adapter.session import SessionState
+
+        state = SessionState(
+            session_id=session_id,
+            agent=MagicMock(name="MockAIAgent"),
+            cwd="/tmp",
+            subagent=subagent,
+        )
+        with manager._lock:
+            manager._sessions[session_id] = state
+        return state
+
+    def test_owns_event_with_matching_session_key(self, agent):
+        self._insert_state(agent.session_manager, "sess-owned-1")
+        evt = {"session_key": "sess-owned-1"}
+        assert agent._owns_notification_event(evt) is True
+
+    def test_rejects_unknown_session_key(self, agent):
+        self._insert_state(agent.session_manager, "sess-owned-1")
+        evt = {"session_key": "some-other-process-session"}
+        assert agent._owns_notification_event(evt) is False
+
+    def test_rejects_event_with_no_keys(self, agent):
+        self._insert_state(agent.session_manager, "sess-owned-1")
+        assert agent._owns_notification_event({}) is False
+
+    def test_rejects_subagent_session_match(self, agent):
+        self._insert_state(agent.session_manager, "child-1", subagent=True)
+        evt = {"session_key": "child-1"}
+        assert agent._owns_notification_event(evt) is False
+
+    def test_delegation_event_matches_via_origin_ui_session_id(self, agent):
+        self._insert_state(agent.session_manager, "ui-sess-1")
+        evt = {
+            "type": "async_delegation",
+            "session_key": "",
+            "origin_ui_session_id": "ui-sess-1",
+        }
+        assert agent._owns_notification_event(evt) is True
+
+    def test_does_not_raise_on_garbage_input(self, agent):
+        # None values, wrong types — must return False, never raise.
+        assert agent._owns_notification_event({"session_key": None}) is False
+        assert agent._owns_notification_event(
+            {"session_key": None, "origin_ui_session_id": None}
+        ) is False
+        assert agent._owns_notification_event({"session_key": 12345}) is False

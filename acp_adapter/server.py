@@ -1175,6 +1175,38 @@ class HermesACPAgent(acp.Agent):
             logger.debug("Could not check live subagent registry", exc_info=True)
         return meta
 
+    def _owns_notification_event(self, evt: dict) -> bool:
+        """Positive-proof ownership check for ``completion_queue`` events.
+
+        Background processes and async delegations push completion events
+        onto the in-process ``process_registry.completion_queue``. Another
+        editor window is a separate ACP process with its OWN queue, so an
+        event on OUR queue belongs to us only if it names a session this
+        process currently hosts — in-memory membership in
+        ``self.session_manager`` is the ownership boundary (never the DB,
+        which is shared across processes and would claim foreign sessions).
+
+        Checks ``session_key`` (the ACP session id bound via
+        set_session_vars) then ``origin_ui_session_id`` (set on
+        async-delegation events). A match counts only when the session is
+        not a delegate child (``state.subagent`` falsy) — children are
+        observation-only and never receive notifications here.
+
+        Fails closed: empty/missing keys, unknown ids, subagent sessions,
+        or any internal error → False. Must never raise.
+        """
+        try:
+            for key in ("session_key", "origin_ui_session_id"):
+                sid = str(evt.get(key) or "").strip()
+                if not sid:
+                    continue
+                state = self.session_manager.get_in_memory(sid)
+                if state is not None and not getattr(state, "subagent", False):
+                    return True
+        except Exception:
+            logger.debug("Ownership check failed for event %r", evt, exc_info=True)
+        return False
+
     async def _send_turn_status_update(self, state: SessionState, running: bool) -> None:
         """Notify the client that this session's turn started or ended.
 

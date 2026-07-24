@@ -378,6 +378,19 @@ class SessionManager:
         # Attempt to restore from database.
         return self._restore(session_id)
 
+    def get_in_memory(self, session_id: str) -> Optional[SessionState]:
+        """Return the in-memory session for *session_id*, or ``None``.
+
+        Unlike ``get_session``, this NEVER restores from the database — it
+        answers only "does this process currently host that session?".
+        Callers that use in-memory membership as an ownership boundary
+        (e.g. deciding whether a completion_queue event belongs to this
+        ACP server process) must use this so a lookup can't side-effect a
+        DB restore and claim sessions owned by another process.
+        """
+        with self._lock:
+            return self._sessions.get(session_id)
+
     def live_transcript_history(
         self, session_id: str, repair_alternation: bool = False
     ) -> Optional[List[Dict[str, Any]]]:
