@@ -4395,3 +4395,66 @@ class TestNotificationDelivery:
         assert state.queued_prompts, "busy delivery did not queue"
         assert not state.queued_prompts[-1].lstrip().startswith("/")
         assert "/compress the universe" in state.queued_prompts[-1]
+    @pytest.mark.asyncio
+    async def test_queued_notification_survives_drain_echo_failure(self, agent):
+        """M1: a client disconnect during the post-turn drain's user-message
+        echo must not lose the queued text — the queued turn still runs."""
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        queued_text = "[IMPORTANT: Background process finished (session xyz)]"
+
+        calls = []
+
+        def _run(**kwargs):
+            calls.append(kwargs["user_message"])
+            if len(calls) == 1:
+                # A notification lands mid-turn: the busy path queues it.
+                with state.runtime_lock:
+                    state.queued_prompts.append(queued_text)
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = MagicMock(side_effect=_run)
+
+        mock_conn = MagicMock(spec=acp.Client)
+
+        async def _session_update(session_id, update):
+            # The drain echo is the only UserMessageChunk this turn sends.
+            if isinstance(update, UserMessageChunk):
+                raise ConnectionResetError("client went away")
+
+        mock_conn.session_update = AsyncMock(side_effect=_session_update)
+        agent._conn = mock_conn
+
+        await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="kick off")],
+            session_id=new_resp.session_id,
+        )
+
+        assert len(calls) == 2, "queued text was LOST when the drain echo raised"
+        assert queued_text in calls[1]
+        assert state.queued_prompts == []
+
+    @pytest.mark.asyncio
+    async def test_idle_echo_failure_still_runs_delivery_turn(self, agent):
+        """M2: an attached-but-dying conn raising in the idle-path echo must
+        not skip the delivery turn — the echo is best-effort."""
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        captured = {}
+
+        def _run(**kwargs):
+            captured.update(kwargs)
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = MagicMock(side_effect=_run)
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock(
+            side_effect=ConnectionResetError("gone")
+        )
+        agent._conn = mock_conn
+
+        await agent._deliver_notification(new_resp.session_id, self.NOTIFY_TEXT)
+
+        state.agent.run_conversation.assert_called_once()
+        assert self.NOTIFY_TEXT in captured["user_message"]

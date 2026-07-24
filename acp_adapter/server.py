@@ -2384,10 +2384,22 @@ class HermesACPAgent(acp.Agent):
                 state.queued_prompts.append(text)
                 return
         try:
+            # The echo is best-effort on its own: an attached-but-dying conn
+            # raising here must not skip the delivery turn (the notification
+            # would be silently lost). The prompt below still runs; the turn's
+            # transcript persists either way.
             if self._conn:
-                await self._conn.session_update(
-                    session_id, acp.update_user_message_text(text)
-                )
+                try:
+                    await self._conn.session_update(
+                        session_id, acp.update_user_message_text(text)
+                    )
+                except Exception:
+                    logger.debug(
+                        "ACP notify: idle-path echo failed for %s; running the "
+                        "delivery turn anyway",
+                        session_id,
+                        exc_info=True,
+                    )
             await self.prompt(
                 prompt=[TextContentBlock(type="text", text=text)],
                 session_id=session_id,
@@ -3182,11 +3194,24 @@ class HermesACPAgent(acp.Agent):
                 if not state.queued_prompts:
                     break
                 next_prompt = state.queued_prompts.pop(0)
+            # The echo is best-effort: the text was already popped from the
+            # queue, so a raise here (e.g. ConnectionResetError from a client
+            # that disconnected mid-turn) escaping prompt() would LOSE it —
+            # neither run nor re-queued. Echo failure must never prevent the
+            # queued turn from running.
             if conn:
-                await conn.session_update(
-                    session_id,
-                    acp.update_user_message_text(next_prompt),
-                )
+                try:
+                    await conn.session_update(
+                        session_id,
+                        acp.update_user_message_text(next_prompt),
+                    )
+                except Exception:
+                    logger.debug(
+                        "Queued-prompt drain echo failed for %s; running the "
+                        "queued turn anyway",
+                        session_id,
+                        exc_info=True,
+                    )
             await self.prompt(
                 prompt=[TextContentBlock(type="text", text=next_prompt)],
                 session_id=session_id,
