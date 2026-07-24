@@ -324,61 +324,80 @@ class TestTerminalNotifyGate:
 
 
 # ---------------------------------------------------------------------------
-# ACP adapter: stateless request/response channel -> no async delivery
+# ACP adapter: persistent notification watcher -> async delivery supported
 # ---------------------------------------------------------------------------
 
 class TestACPAsyncDelivery:
-    """ACP (the VS Code / code-server surface, ``HermesACPAgent``) is a
-    stateless request/response channel: it tears down its outbound channel when
-    the turn ends and runs no persistent watcher/drain loop, so a background
-    completion that finishes AFTER the turn has nowhere to route. It therefore
-    must bind ``async_delivery=False`` — like the API server — so
-    ``async_delivery_supported()`` is False and ``delegate_task`` /
-    ``terminal`` run the work inline instead of stranding it (#10760).
+    """ACP (the VS Code / code-server surface, ``HermesACPAgent``) runs a
+    persistent notification watcher (``_notification_watcher``) that drains
+    ``tools.process_registry.completion_queue`` every ~2s and injects owned
+    background-process / delegation completions into sessions as synthetic
+    turns (queue-on-busy, at-most-once durable claims). A background
+    completion that finishes AFTER the turn ends therefore DOES have a route
+    back to the user, so ACP binds ``async_delivery=True`` and
+    ``async_delivery_supported()`` reports True — letting ``terminal``
+    notify_on_complete / watch_patterns and ``delegate_task`` background=True
+    hand out real promises instead of stripping them / running inline.
 
-    Unlike the API server, ``HermesACPAgent`` subclasses the third-party
+    Historical note: before the watcher existed, ACP was a stateless
+    request/response channel that dropped async completions, so it bound
+    ``async_delivery=False`` like the API server (#10760). The watcher
+    obsoleted that defensive bind.
+
+    Unlike gateway platforms, ``HermesACPAgent`` subclasses the third-party
     ``acp.Agent`` directly and never inherits the platform-adapter
     ``supports_async_delivery`` convention, so the bind site itself must pass
     the flag explicitly.
     """
 
-    def test_acp_binds_no_async_delivery(self):
+    def test_acp_binds_async_delivery_supported(self):
         """The contract ACP now binds: session context with
-        async_delivery=False reports unsupported."""
-        tokens = set_session_vars(session_key="acp-sess-1", async_delivery=False)
+        async_delivery=True reports supported."""
+        tokens = set_session_vars(session_key="acp-sess-1", async_delivery=True)
         try:
-            assert async_delivery_supported() is False
+            assert async_delivery_supported() is True
         finally:
             clear_session_vars(tokens)
 
-    def test_acp_server_source_passes_async_delivery_false(self):
-        """Guard against a future edit dropping the flag: the ACP server's
-        set_session_vars call must pass async_delivery=False, otherwise it
-        inherits the optimistic default (True) and re-introduces the silent
-        no-op. Assert the source keeps the wiring."""
+    def test_acp_server_source_passes_async_delivery_true(self):
+        """Guard against a future edit regressing the flag: the ACP server's
+        set_session_vars call must pass async_delivery=True (the watcher makes
+        delivery real), and the old defensive async_delivery=False bind must
+        be gone — otherwise notify_on_complete / background delegation get
+        silently stripped again. Assert the source keeps the wiring.
+
+        (The bind lives inside a closure in ``prompt()``, so source inspection
+        is the only unit-testable seam without spinning up a full ACP turn.)"""
         import inspect
 
         from acp_adapter import server as acp_server
 
         src = inspect.getsource(acp_server)
-        assert "async_delivery=False" in src, (
-            "ACP server must bind async_delivery=False so background "
-            "delegations run inline instead of being silently dropped (#10760)"
+        assert "async_delivery=True" in src, (
+            "ACP server must bind async_delivery=True: the persistent "
+            "_notification_watcher delivers background completions as "
+            "synthetic turns, so tools may hand out real async promises"
+        )
+        assert "async_delivery=False" not in src, (
+            "Stale defensive async_delivery=False bind found in the ACP "
+            "server — it pre-dates the notification watcher and would strip "
+            "notify_on_complete / force background delegation inline"
         )
 
     def test_acp_binding_does_not_outlive_turn(self):
-        """The no-delivery decision is request-scoped. After clear, the same
-        session resumed on a delivering interface (CLI/gateway) re-binds fresh
-        and is NOT blocked."""
-        tokens = set_session_vars(session_key="acp-shared", async_delivery=False)
-        assert async_delivery_supported() is False
+        """The delivery decision is request-scoped. After clear, an unbound
+        context falls back to the optimistic default, and a later re-bind on
+        another interface takes its own value — no leakage across turns."""
+        tokens = set_session_vars(session_key="acp-shared", async_delivery=True)
+        assert async_delivery_supported() is True
         clear_session_vars(tokens)
 
-        # Same session_key later on a delivering interface -> supported again.
+        # Same session_key later on a stateless interface -> its own (False)
+        # bind wins; the earlier ACP True bind must not leak through.
         tokens = set_session_vars(
-            platform="telegram", session_key="acp-shared", async_delivery=True
+            platform="api_server", session_key="acp-shared", async_delivery=False
         )
         try:
-            assert async_delivery_supported() is True
+            assert async_delivery_supported() is False
         finally:
             clear_session_vars(tokens)
