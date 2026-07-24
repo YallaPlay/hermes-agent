@@ -341,7 +341,7 @@ class TestSessionOps:
             "tools",
             "context",
             "reset",
-            "compact",
+            "compress",
             "steer",
             "queue",
             "version",
@@ -3446,7 +3446,7 @@ class TestSlashCommands:
 
         assert "Context usage: ~25,000 / 100,000 tokens (25.0%)" in result
         assert "Compression: ~55,000 tokens until threshold (~80,000, 80%)" in result
-        assert "Tip: run /compact" in result
+        assert "Tip: run /compress" in result
 
     def test_context_says_compression_due_when_past_threshold(self, agent, mock_manager):
         state = self._make_state(mock_manager)
@@ -3463,7 +3463,7 @@ class TestSlashCommands:
             result = agent._handle_slash_command("/context", state)
 
         assert "Context usage: ~82,000 / 100,000 tokens (82.0%)" in result
-        assert "Compression: due now (threshold ~80,000, 80%). Run /compact." in result
+        assert "Compression: due now (threshold ~80,000, 80%). Run /compress." in result
 
     def test_reset_clears_history(self, agent, mock_manager):
         state = self._make_state(mock_manager)
@@ -3522,12 +3522,13 @@ class TestSlashCommands:
         original_session_db = object()
         state.agent._session_db = original_session_db
 
-        def _compress_context(messages, system_prompt, *, approx_tokens, task_id):
+        def _compress_context(messages, system_prompt, *, approx_tokens, task_id, force):
             assert state.agent._session_db is None
             assert messages == state.history
             assert system_prompt == "system"
             assert approx_tokens == 40
             assert task_id == state.session_id
+            assert force is True
             return [{"role": "user", "content": "summary"}], "new-system"
 
         state.agent._compress_context = MagicMock(side_effect=_compress_context)
@@ -3539,7 +3540,7 @@ class TestSlashCommands:
                 side_effect=[40, 12],
             ),
         ):
-            result = agent._handle_slash_command("/compact", state)
+            result = agent._handle_slash_command("/compress", state)
 
         assert "Context compressed: 4 -> 1 messages" in result
         assert "~40 -> ~12 tokens" in result
@@ -3555,8 +3556,42 @@ class TestSlashCommands:
             "system",
             approx_tokens=40,
             task_id=state.session_id,
+            force=True,
         )
         mock_save.assert_called_once_with(state.session_id)
+
+    def test_compress_works_when_auto_compaction_disabled(self, agent, mock_manager):
+        """compression.enabled: false disables *automatic* compaction only —
+        manual /compress must still compress (matches CLI /compress and the
+        gateway handler)."""
+        state = self._make_state(mock_manager)
+        state.history = [
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "two"},
+            {"role": "user", "content": "three"},
+            {"role": "assistant", "content": "four"},
+        ]
+        state.agent.compression_enabled = False
+        state.agent._cached_system_prompt = "system"
+        state.agent.tools = None
+        state.agent._session_db = None
+        state.agent._compress_context = MagicMock(
+            return_value=([{"role": "user", "content": "summary"}], "new-system")
+        )
+
+        with (
+            patch.object(agent.session_manager, "save_session"),
+            patch(
+                "agent.model_metadata.estimate_request_tokens_rough",
+                side_effect=[40, 12],
+            ),
+        ):
+            result = agent._handle_slash_command("/compress", state)
+
+        assert "disabled" not in result.lower()
+        assert "Context compressed: 4 -> 1 messages" in result
+        state.agent._compress_context.assert_called_once()
+        assert state.agent._compress_context.call_args.kwargs.get("force") is True
 
     def test_unknown_command_returns_none(self, agent, mock_manager):
         state = self._make_state(mock_manager)
@@ -3593,8 +3628,8 @@ class TestSlashCommands:
         ]
         return acp_agent, state, db
 
-    def test_cmd_compact_reconciles_persisted_history(self, tmp_path):
-        """/compact must mirror the in-memory rewrite into the message store:
+    def test_cmd_compress_reconciles_persisted_history(self, tmp_path):
+        """/compress must mirror the in-memory rewrite into the message store:
         active rows become the compacted set, pre-compact rows are archived
         (not deleted) — otherwise mid-turn replay and post-restart restore
         resurrect the uncompacted transcript without the summary."""
@@ -3606,7 +3641,7 @@ class TestSlashCommands:
             return_value=([{"role": "user", "content": "compacted summary"}], "sys")
         )
 
-        result = acp_agent._handle_slash_command("/compact", state)
+        result = acp_agent._handle_slash_command("/compress", state)
 
         assert "Context compressed" in result
         # Active DB rows must now equal the compacted in-memory history.

@@ -44,6 +44,11 @@ class _FakeAgent:
         self.api_key = ""
         self.api_mode = ""
 
+    def _conversation_root_id(self):
+        # Upstream's run_conversation forwarder publishes the conversation id
+        # for ambient Nous Portal tagging; the fake has no session lineage.
+        return None
+
 
 class TestRuntimeMainTeardown:
     """clear_runtime_main must fire at run_conversation teardown."""
