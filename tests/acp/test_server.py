@@ -4124,3 +4124,100 @@ class TestNotificationOwnership:
             {"session_key": None, "origin_ui_session_id": None}
         ) is False
         assert agent._owns_notification_event({"session_key": 12345}) is False
+
+
+# ---------------------------------------------------------------------------
+# _deliver_notification — synthetic-turn delivery primitive
+# ---------------------------------------------------------------------------
+
+
+class TestNotificationDelivery:
+    """Delivery primitive for background-completion notifications.
+
+    Given an owned session id and pre-formatted notification text, the
+    method must inject it WITHOUT ever interrupting a running turn:
+    busy → queue silently on ``state.queued_prompts``; idle → echo a
+    user-message update then run a normal prompt turn (mirroring
+    ``_run_spawned_first_turn``). Never raises.
+    """
+
+    NOTIFY_TEXT = "[IMPORTANT: Background process finished (session abc)]"
+
+    def _insert_state(self, manager, session_id, is_running=False):
+        """Insert a SessionState directly into the manager's in-memory map."""
+        from acp_adapter.session import SessionState
+
+        state = SessionState(
+            session_id=session_id,
+            agent=MagicMock(name="MockAIAgent"),
+            cwd="/tmp",
+            is_running=is_running,
+        )
+        with manager._lock:
+            manager._sessions[session_id] = state
+        return state
+
+    def _attach_conn(self, agent):
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+        return mock_conn
+
+    @pytest.mark.asyncio
+    async def test_busy_session_queues_silently(self, agent):
+        # Running turn → append to queued_prompts; NO client ack, NO prompt.
+        state = self._insert_state(agent.session_manager, "sess-busy", is_running=True)
+        mock_conn = self._attach_conn(agent)
+        agent.prompt = AsyncMock()
+
+        await agent._deliver_notification("sess-busy", self.NOTIFY_TEXT)
+
+        assert state.queued_prompts == [self.NOTIFY_TEXT]
+        mock_conn.session_update.assert_not_awaited()
+        agent.prompt.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_idle_session_echoes_and_prompts(self, agent):
+        # Idle → user-message echo, then a normal prompt turn with the text.
+        self._insert_state(agent.session_manager, "sess-idle")
+        mock_conn = self._attach_conn(agent)
+        agent.prompt = AsyncMock()
+
+        await agent._deliver_notification("sess-idle", self.NOTIFY_TEXT)
+
+        agent.prompt.assert_awaited_once()
+        kwargs = agent.prompt.await_args.kwargs
+        assert kwargs["session_id"] == "sess-idle"
+        blocks = kwargs["prompt"]
+        assert self.NOTIFY_TEXT in blocks[0].text
+        assert mock_conn.session_update.await_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_unknown_session_id_is_a_noop(self, agent):
+        # No in-memory session → log-and-return, never raise.
+        agent.prompt = AsyncMock()
+
+        await agent._deliver_notification("no-such-session", self.NOTIFY_TEXT)
+
+        agent.prompt.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_idle_without_conn_still_prompts(self, agent):
+        # Client detached → skip the echo, still run the turn, no raise.
+        self._insert_state(agent.session_manager, "sess-noconn")
+        agent._conn = None
+        agent.prompt = AsyncMock()
+
+        await agent._deliver_notification("sess-noconn", self.NOTIFY_TEXT)
+
+        agent.prompt.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_prompt_failure_does_not_propagate(self, agent):
+        # A failing delivery turn is logged, never raised to the caller
+        # (the watcher loop must survive any single delivery).
+        self._insert_state(agent.session_manager, "sess-err")
+        self._attach_conn(agent)
+        agent.prompt = AsyncMock(side_effect=RuntimeError("boom"))
+
+        await agent._deliver_notification("sess-err", self.NOTIFY_TEXT)

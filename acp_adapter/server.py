@@ -2324,6 +2324,60 @@ class HermesACPAgent(acp.Agent):
         except Exception:
             logger.exception("Spawned ACP session %s first turn failed", session_id)
 
+    async def _deliver_notification(self, session_id: str, text: str) -> None:
+        """Deliver a background-completion notification to a session.
+
+        The delivery primitive behind async delivery under ACP: given an
+        owned session id and an already-formatted notification text (e.g.
+        "[IMPORTANT: Background process finished ...]"), inject it as a
+        synthetic turn. Two paths:
+
+        - **Busy** (``state.is_running`` under ``runtime_lock``): append to
+          ``state.queued_prompts`` and return SILENTLY — no client
+          session_update ack, because synthetic events must not masquerade
+          as user input or trigger the "Queued for the next turn" ack. The
+          post-turn queued-prompt drain in ``prompt()`` will run it.
+          Internal synthetic events must never interrupt/steer a running
+          turn (explicit gateway precedent: gateway/run.py's completion
+          drain queues instead of steering).
+        - **Idle**: echo the text as a user-message update so the
+          transcript shows why a turn started, then run a normal prompt
+          turn — mirroring ``_run_spawned_first_turn`` exactly (echo is
+          skipped when no client is attached; the turn still runs and its
+          transcript persists for reattach).
+
+        Benign TOCTOU window: between releasing ``runtime_lock`` and
+        ``prompt()``'s own ``is_running`` re-check, a user prompt could
+        start a turn. ``prompt()`` re-checks under the lock and queues our
+        text; worst case the client sees a "Queued" ack for it.
+
+        Never raises: unknown session ids log-and-return, and any failure
+        in the echo/prompt path is logged — the caller (the watcher loop)
+        must survive any single delivery.
+        """
+        state = self.session_manager.get_in_memory(session_id)
+        if state is None:
+            logger.warning(
+                "ACP notify: no in-memory session %s; dropping notification",
+                session_id,
+            )
+            return
+        with state.runtime_lock:
+            if state.is_running:
+                state.queued_prompts.append(text)
+                return
+        try:
+            if self._conn:
+                await self._conn.session_update(
+                    session_id, acp.update_user_message_text(text)
+                )
+            await self.prompt(
+                prompt=[TextContentBlock(type="text", text=text)],
+                session_id=session_id,
+            )
+        except Exception:
+            logger.exception("ACP notify: delivery turn failed for %s", session_id)
+
     def _make_spawn_session_requester(
         self, loop: asyncio.AbstractEventLoop, parent_state: SessionState
     ):
