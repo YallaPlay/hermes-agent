@@ -232,6 +232,26 @@ class TestPersistedRefImageReplay:
         ]
 
     @pytest.mark.asyncio
+    async def test_legacy_flat_cache_ref_still_replays(self, agent, image_cache, tmp_path):
+        """Refs written before the history/ subdir existed point at the flat
+        cache root. Reads must still accept it, or shipping the retention
+        change would blank images already recorded in transcripts."""
+        legacy = tmp_path / "images" / "img_legacy.png"
+        legacy.write_bytes(PNG_BYTES)
+        row = {
+            "role": "user",
+            "content": "old turn\n[screenshot]",
+            "display_metadata": {
+                DISPLAY_METADATA_KEY: [{"path": str(legacy), "mimeType": "image/png"}]
+            },
+        }
+        calls = await _replay(agent, [], is_running=True, db_rows=[row])
+        assert any(
+            isinstance(getattr(call.kwargs.get("update"), "content", None), ImageContentBlock)
+            for call in calls
+        )
+
+    @pytest.mark.asyncio
     async def test_inline_parts_win_over_refs(self, agent, image_cache):
         """When both sources are present (in-memory turn already flushed), use
         the in-memory bytes once — never emit the same image twice."""

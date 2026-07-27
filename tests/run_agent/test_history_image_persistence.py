@@ -96,7 +96,8 @@ def test_flush_persists_image_reference_in_display_metadata(agent, image_cache_d
     refs = kwargs["display_metadata"][DISPLAY_METADATA_KEY]
     assert len(refs) == 1
     assert refs[0]["mimeType"] == "image/png"
-    cached = image_cache_dir / refs[0]["path"].rsplit("/", 1)[-1]
+    # history/ subdir — session-retention lifetime, not the 24h media sweep.
+    cached = image_cache_dir / "history" / refs[0]["path"].rsplit("/", 1)[-1]
     assert cached.read_bytes() == PNG_BYTES
 
 
@@ -128,7 +129,7 @@ def test_flush_survives_image_cache_failure(agent, monkeypatch):
     _flush_messages_to_session_db swallowing the exception would silently
     drop the whole row."""
     monkeypatch.setattr(
-        "gateway.platforms.base.cache_image_from_bytes",
+        "gateway.platforms.base.cache_history_image_from_bytes",
         MagicMock(side_effect=RuntimeError("disk full")),
     )
     _msg, kwargs = _flush_user_image_turn(

@@ -113,16 +113,20 @@ def _extension_for_mime(mime_type: str) -> str:
 
 
 def _cache_image_bytes(data: bytes, mime_type: str) -> str | None:
-    """Write image bytes to the shared image cache; return the path or None.
+    """Write image bytes to the history image cache; return the path or None.
+
+    Uses the ``history/`` cache (session-retention lifetime), NOT the flat
+    inbound-media cache — a transcript reference must outlive the 24h sweep
+    that transient platform attachments get.
 
     Imported lazily (the gateway module pulls in platform config) and never
     allowed to fail the caller: persistence of a display-only reference must
     not be able to break a turn's transcript flush.
     """
     try:
-        from gateway.platforms.base import cache_image_from_bytes
+        from gateway.platforms.base import cache_history_image_from_bytes
 
-        return cache_image_from_bytes(data, _extension_for_mime(mime_type))
+        return cache_history_image_from_bytes(data, _extension_for_mime(mime_type))
     except Exception:
         logger.debug("Could not cache history image (%s)", mime_type, exc_info=True)
         return None
@@ -215,6 +219,7 @@ def _safe_image_roots() -> list[Any]:
     try:
         from gateway.platforms.base import (
             MEDIA_DELIVERY_SAFE_ROOTS,
+            get_history_image_cache_dir,
             get_image_cache_dir,
         )
     except Exception:
@@ -222,7 +227,9 @@ def _safe_image_roots() -> list[Any]:
     # get_image_cache_dir() resolves against the ACTIVE profile (and honors a
     # test monkeypatch of the module constant); MEDIA_DELIVERY_SAFE_ROOTS is a
     # frozen import-time tuple covering the legacy/canonical cache layouts.
-    roots = [get_image_cache_dir()]
+    # The history/ subdir is covered by its parent, but name it explicitly so
+    # a future layout change can't silently drop transcript images.
+    roots = [get_image_cache_dir(), get_history_image_cache_dir()]
     roots.extend(MEDIA_DELIVERY_SAFE_ROOTS)
     return roots
 

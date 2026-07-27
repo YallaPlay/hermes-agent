@@ -810,12 +810,120 @@ def cleanup_image_cache(max_age_hours: int = 24) -> int:
     """
     Delete cached images older than *max_age_hours*.
 
+    Only sweeps FILES directly in the cache root, so the ``history/``
+    subdirectory (transcript-referenced images, retained on the session
+    schedule — see :func:`cleanup_history_image_cache`) is untouched.
+
     Returns the number of files removed.
     """
     import time
 
     cache_dir = get_image_cache_dir()
     cutoff = time.time() - (max_age_hours * 3600)
+    removed = 0
+    for f in cache_dir.iterdir():
+        if f.is_file() and f.stat().st_mtime < cutoff:
+            try:
+                f.unlink()
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+# ---------------------------------------------------------------------------
+# History image cache (transcript-referenced images)
+#
+# Inbound platform media (Discord/Slack/Matrix attachments, downloaded URLs)
+# is transient: the model consumes it during the turn and a 24h sweep is
+# right. Images referenced by a PERSISTED transcript are not — a session
+# reload rebuilds its bubbles from those files, so their lifetime has to
+# track SESSION retention (``sessions.retention_days``, default 90 days, and
+# by default sessions are never pruned at all) or the transcript decays into
+# dead `[screenshot]` placeholders while the session is still live.
+#
+# They live in a ``history/`` subdirectory rather than sharing the flat cache
+# so the two retention policies can't collide: ``cleanup_image_cache``
+# iterates files only, and this sweep owns the subdirectory.
+# ---------------------------------------------------------------------------
+
+HISTORY_IMAGE_SUBDIR = "history"
+
+
+def get_history_image_cache_dir() -> Path:
+    """Return the transcript-image cache directory, creating it if needed."""
+    d = get_image_cache_dir() / HISTORY_IMAGE_SUBDIR
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def cache_history_image_from_bytes(data: bytes, ext: str = ".png") -> str:
+    """Save a transcript-referenced image and return its absolute path.
+
+    Same validation as :func:`cache_image_from_bytes` (size cap + magic-byte
+    sniff) but writes under ``history/`` so the short inbound-media sweep
+    can't delete an image a live session's transcript still points at.
+    """
+    validate_inbound_media_size(len(data), media_type="image")
+    if not _looks_like_image(data):
+        snippet = data[:80].decode("utf-8", errors="replace")
+        raise ValueError(
+            f"Refusing to cache non-image data as {ext} "
+            f"(starts with: {snippet!r})"
+        )
+    cache_dir = get_history_image_cache_dir()
+    filepath = cache_dir / f"img_{uuid.uuid4().hex[:12]}{ext}"
+    filepath.write_bytes(data)
+    return str(filepath)
+
+
+def get_history_image_retention_days() -> Optional[int]:
+    """Resolve how long transcript-referenced images should be kept.
+
+    Mirrors the session-history policy exactly, because these files ARE part
+    of session history:
+
+    * ``sessions.auto_prune`` false (the default) → ``None``, meaning keep
+      forever. Sessions themselves are never pruned in that configuration,
+      so deleting their images would be a silent, asymmetric data loss.
+    * otherwise → ``sessions.retention_days`` (default 90).
+
+    Never raises: an unreadable/malformed config falls back to ``None``
+    (keep), because the failure mode of over-retaining is disk, and the
+    failure mode of under-retaining is a corrupted transcript.
+    """
+    try:
+        from hermes_cli.config import load_config as _load_config
+
+        cfg = _load_config()
+    except Exception:
+        return None
+    sessions = cfg.get("sessions", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(sessions, dict) or not sessions.get("auto_prune"):
+        return None
+    try:
+        days = int(sessions.get("retention_days", 90))
+    except (TypeError, ValueError):
+        return None
+    return days if days > 0 else None
+
+
+def cleanup_history_image_cache(max_age_days: Optional[int] = None) -> int:
+    """Delete transcript-referenced images older than *max_age_days*.
+
+    ``max_age_days=None`` resolves the policy from config via
+    :func:`get_history_image_retention_days`; a resolved ``None`` means
+    "keep forever" and this is a no-op. Returns the number of files removed.
+    """
+    import time
+
+    if max_age_days is None:
+        max_age_days = get_history_image_retention_days()
+    if not max_age_days or max_age_days <= 0:
+        return 0
+
+    cache_dir = get_history_image_cache_dir()
+    cutoff = time.time() - (max_age_days * 86400)
     removed = 0
     for f in cache_dir.iterdir():
         if f.is_file() and f.stat().st_mtime < cutoff:

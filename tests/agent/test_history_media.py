@@ -88,7 +88,9 @@ class TestContentPartsToTextAndImageRefs:
         ref = refs[0]
         assert ref["mimeType"] == "image/png"
         assert ref["bytes"] == len(PNG_BYTES)
-        cached = image_cache_dir / ref["path"].rsplit("/", 1)[-1]
+        # Written under history/, whose retention tracks session retention —
+        # NOT the flat cache root, which is swept after 24h.
+        cached = image_cache_dir / "history" / ref["path"].rsplit("/", 1)[-1]
         assert cached.read_bytes() == PNG_BYTES
 
     def test_remote_image_keeps_url_without_caching(self):
@@ -131,7 +133,7 @@ class TestContentPartsToTextAndImageRefs:
             raise RuntimeError("disk full")
 
         monkeypatch.setattr(
-            "gateway.platforms.base.cache_image_from_bytes", boom
+            "gateway.platforms.base.cache_history_image_from_bytes", boom
         )
         text, refs = content_parts_to_text_and_image_refs(
             [

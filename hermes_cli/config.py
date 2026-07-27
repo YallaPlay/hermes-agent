@@ -3228,7 +3228,10 @@ DEFAULT_CONFIG = {
         # silently deleting it could surprise users.  Opt in explicitly.
         "auto_prune": False,
         # How many days of ended-session history to keep.  Matches the
-        # default of ``hermes sessions prune``.
+        # default of ``hermes sessions prune``.  Also governs how long
+        # transcript-referenced images (``<image cache>/history/``, written
+        # when a chat turn carries an attachment) are kept — they are part of
+        # session history, so they must not expire before the session does.
         "retention_days": 90,
         # VACUUM after a prune that actually deleted rows.  SQLite does not
         # reclaim disk space on DELETE — freed pages are just reused on
