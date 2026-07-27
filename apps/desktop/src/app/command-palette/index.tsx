@@ -71,6 +71,7 @@ import {
   COMMAND_CENTER_ROUTE,
   CRON_ROUTE,
   MESSAGING_ROUTE,
+  navigateToWorkspacePage,
   NEW_CHAT_ROUTE,
   PROFILES_ROUTE,
   sessionRoute,
@@ -245,7 +246,7 @@ const NON_CONFIG_SETTINGS: ReadonlyArray<{
   },
   {
     icon: KeyRound,
-    keywords: ['providers', 'api key', 'keys', 'secrets', 'tokens'],
+    keywords: ['providers', 'api key', 'keys', 'secrets', 'tokens', 'egress', 'iron proxy', 'sandbox proxy'],
     labelKey: 'providerApiKeys',
     tab: 'providers&pview=keys'
   },
@@ -258,7 +259,7 @@ const NON_CONFIG_SETTINGS: ReadonlyArray<{
   },
   {
     icon: Settings2,
-    keywords: ['gateway', 'proxy', 'server', 'webhook', 'env'],
+    keywords: ['gateway', 'proxy', 'server', 'webhook', 'env', 'egress proxy', 'iron proxy'],
     labelKey: 'keysSettings',
     tab: 'keys&kview=settings'
   },
@@ -351,7 +352,7 @@ export function CommandPalette() {
     }
   }, [open, pendingPage])
 
-  const go = useCallback((path: string) => () => navigate(path), [navigate])
+  const go = useCallback((path: string) => () => navigateToWorkspacePage(navigate, path), [navigate])
 
   // Step up one nested page (or back to the root list), clearing the filter so
   // the parent page doesn't reopen mid-search.

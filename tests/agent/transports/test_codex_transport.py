@@ -243,25 +243,73 @@ class TestCodexBuildKwargs:
         message_item = next(item for item in kw["input"] if item.get("type") == "message")
         assert message_item["id"] == "msg_short_id"
 
-    def test_gpt55_sets_prompt_cache_retention(self, transport):
+    @pytest.mark.parametrize("model", [
+        "gpt-5.5",
+        "gpt-5.5-pro",
+        "gpt-5.4",
+        "gpt-5.2",
+        "gpt-5.1-codex-max",
+        "gpt-5.1",
+        "gpt-5.1-codex",
+        "gpt-5.1-codex-mini",
+        "gpt-5.1-chat-latest",
+        "gpt-5",
+        "gpt-5-codex",
+        "gpt-4.1",
+        "openai.gpt-5.5-pro",
+        "openai/gpt-5.1-codex-2026-01-01",
+    ])
+    def test_extended_cache_models_set_24h_prompt_cache_retention(self, transport, model):
         messages = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(
-            model="openai.gpt-5.5", messages=messages, tools=[],
+            model=model, messages=messages, tools=[],
             session_id="test-session",
+            base_url="https://bedrock-mantle.us-west-2.api.aws/v1",
         )
         assert kw["prompt_cache_retention"] == "24h"
 
-    def test_gpt55_prompt_cache_retention_skipped_for_known_incompatible_backends(self, transport):
+    @pytest.mark.parametrize("model", ["gpt-5.6", "gpt-4o", "o3"])
+    def test_prompt_cache_retention_omitted_for_other_model_families(self, transport, model):
+        kw = transport.build_kwargs(
+            model=model,
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            session_id="test-session",
+            base_url="https://bedrock-mantle.us-west-2.api.aws/v1",
+        )
+        assert "prompt_cache_retention" not in kw
+
+    @pytest.mark.parametrize("base_url", [
+        "https://api.openai.com/v1",
+        "https://example.openai.azure.com/openai/v1",
+        "https://api.x.ai/v1",
+        "https://models.github.ai/inference",
+        "https://api.githubcopilot.com",
+        "https://chatgpt.com/backend-api/codex",
+        "https://responses.example.com/v1",
+        "https://bedrock-mantle.us-west-2.api.aws.example/v1",
+        "https://example.com/bedrock-mantle.us-west-2.api.aws/v1",
+    ])
+    def test_prompt_cache_retention_omitted_for_non_mantle_endpoints(self, transport, base_url):
+        kw = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            base_url=base_url,
+        )
+        assert "prompt_cache_retention" not in kw
+
+    def test_prompt_cache_retention_skipped_for_known_incompatible_backends(self, transport):
+        """Fork guard (#retention-backends): even on an endpoint whose model
+        family qualifies for 24h retention, backends that reject the field must
+        not receive it."""
         messages = [{"role": "user", "content": "Hi"}]
-        assert "prompt_cache_retention" not in transport.build_kwargs(
-            model="gpt-5.5", messages=messages, tools=[], is_xai_responses=True
-        )
-        assert "prompt_cache_retention" not in transport.build_kwargs(
-            model="gpt-5.5", messages=messages, tools=[], is_github_responses=True
-        )
-        assert "prompt_cache_retention" not in transport.build_kwargs(
-            model="gpt-5.5", messages=messages, tools=[], is_codex_backend=True
-        )
+        mantle = "https://bedrock-mantle.us-west-2.api.aws/v1"
+        for flag in ("is_xai_responses", "is_github_responses", "is_codex_backend"):
+            assert "prompt_cache_retention" not in transport.build_kwargs(
+                model="gpt-5.5", messages=messages, tools=[],
+                base_url=mantle, **{flag: True},
+            )
 
     def test_xai_responses_sends_cache_key_via_extra_body(self, transport):
         """xAI's Responses API documents ``prompt_cache_key`` as the

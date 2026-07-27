@@ -65,8 +65,8 @@ def _preview_text(content: Any, limit: int = 60) -> str:
     Multimodal user messages (e.g. a prompt with a screenshot) hold ``content``
     as a list of parts (``[{"type": "text", ...}, {"type": "image_url", ...}]``).
     A naive ``str()`` leaks the list repr into the sessions-list title —
-    mirror SessionDB._preview_from_raw: flatten the text parts, fall back to a
-    ``[multimodal content]`` placeholder for image-only messages.
+    mirror hermes_state._flatten_preview_raw: flatten the text parts, fall back
+    to a ``[multimodal content]`` placeholder for image-only messages.
     """
     if isinstance(content, list):
         parts = [

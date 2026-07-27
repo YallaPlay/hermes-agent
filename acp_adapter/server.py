@@ -94,107 +94,27 @@ from tools.approval import (
 
 logger = logging.getLogger(__name__)
 
-try:
-    from hermes_cli import __version__ as HERMES_VERSION
-except Exception:
-    HERMES_VERSION = "0.0.0"
-
-# Thread pool for running AIAgent (synchronous) in parallel. Bumped from the
-# upstream default of 4 to 16 so a single ACP process can serve more concurrent
-# sessions — the Claudio Slack bot multiplexes many threads over one process.
-_executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="acp-agent")
-
-# Server-side page size for list_sessions, counted in FAMILIES (a fork/subagent
-# group is one unit — see _group_session_families), not raw rows. Clients render
-# a family as a single grouped card, so paging by rows made pages carrying large
-# families look nearly empty. The ACP ListSessionsRequest schema does not expose
-# a client-side limit, so this is a fixed cap that clients paginate against
-# using `cursor` / `next_cursor`.
-_LIST_SESSIONS_PAGE_SIZE = 40
-
-
-def _group_session_families(
-    infos: list[dict[str, Any]],
-) -> list[list[dict[str, Any]]]:
-    """Group a recency-sorted session list into fork/subagent families.
-
-    A family is a root session plus every descendant reachable through
-    ``parent_id`` links WITHIN the list — a child whose parent is absent
-    (archived, filtered out) roots its own family, mirroring how clients
-    nest lineage. Families keep the order of their freshest member (first
-    appearance in the recency-sorted input) and members keep input order.
-    Used by ``list_sessions`` to paginate on family boundaries so a parent
-    and its children never land on different pages.
-    """
-    by_id = {s["session_id"]: s for s in infos}
-
-    def _root_of(s: dict[str, Any]) -> str:
-        seen: set[str] = set()
-        cur = s
-        while True:
-            sid = cur["session_id"]
-            if sid in seen:  # lineage cycle guard
-                break
-            seen.add(sid)
-            parent = cur.get("parent_id")
-            if not parent or parent == sid or parent not in by_id:
-                break
-            cur = by_id[parent]
-        return cur["session_id"]
-
-    families: dict[str, list[dict[str, Any]]] = {}
-    order: list[str] = []
-    for s in infos:
-        root = _root_of(s)
-        if root not in families:
-            families[root] = []
-            order.append(root)
-        families[root].append(s)
-    return [families[root] for root in order]
-
-
-_MAX_ACP_RESOURCE_BYTES = 512 * 1024
-_TEXT_RESOURCE_MIME_PREFIXES = ("text/",)
-_TEXT_RESOURCE_MIME_TYPES = {
-    "application/json",
-    "application/javascript",
-    "application/typescript",
-    "application/xml",
-    "application/x-yaml",
-    "application/yaml",
-    "application/toml",
-    "application/sql",
-}
-
-# Cache for the cross-provider model catalog list. Building it hits every
-# authenticated provider's live /models endpoint (Codex OAuth, Copilot,
-# Bedrock, ...), which can take seconds — far too slow to run on every
-# session/new / session/load. Entries: (monotonic_ts, catalogs).
-_PROVIDER_CATALOGS_TTL_SECONDS = 300.0
-_provider_catalogs_cache: tuple[float, list[tuple[str, str, list[tuple[str, str]]]]] | None = None
-
 
 def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, str]]]]:
-    """Return catalogs for user-defined named endpoints from config.
+    """Return ``(slug, label, [(model_id, description), ...])`` for named endpoints.
 
     Covers both the v12 ``providers:`` mapping and the legacy
-    ``custom_providers:`` list.  These endpoints never appear in
-    ``list_available_providers()`` (it walks only canonical providers), so
-    without this the ACP model selector hides every named endpoint that the
-    TUI ``/model`` picker already renders (upstream #47039 implemented named
-    endpoints for the TUI surface only).
+    ``custom_providers:`` list.  These endpoints never appear in canonical
+    provider enumeration, so without this the ACP model selector hides every
+    named endpoint that the TUI ``/model`` picker already renders (#47039
+    implemented named-endpoint rows for the TUI surface only).
 
     Model lists come from the entry's declared models (``default_model`` +
     ``models``), refreshed from the endpoint's live ``/models`` listing when a
     credential is available and ``discover_models`` is not disabled.  Declared
-    models are kept even when live discovery fails — endpoints like Bedrock
-    Mantle expose no ``/models`` route at all (404) yet serve the declared
-    models fine.
+    models are kept even when live discovery fails — some OpenAI-compatible
+    endpoints (e.g. Bedrock Mantle Responses) expose no ``/models`` route at
+    all yet serve the declared models fine.
 
-    Catalog ids use the ``custom:<name>`` slug shape that
-    ``resolve_runtime_provider`` / ``parse_model_input`` already resolve, so
-    ``_encode_model_choice`` produces ``custom:<name>:<model>`` choice ids
-    that round-trip through ``set_session_model`` unchanged.
+    Slugs use the ``custom:<name>`` shape that ``parse_model_input`` and
+    ``resolve_runtime_provider`` already resolve, so encoded choice ids
+    (``custom:<name>:<model>``) round-trip through ``set_session_model``
+    unchanged.
     """
     try:
         from hermes_cli.config import (
@@ -278,74 +198,84 @@ def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, st
 
     return catalogs
 
+try:
+    from hermes_cli import __version__ as HERMES_VERSION
+except Exception:
+    HERMES_VERSION = "0.0.0"
 
-def _authenticated_provider_catalogs(
-    current_provider: str,
-    force_refresh: bool = False,
-) -> list[tuple[str, str, list[tuple[str, str]]]]:
-    """Return ``(provider_id, label, [(model_id, description), ...])`` per provider.
+# Thread pool for running AIAgent (synchronous) in parallel. Bumped from the
+# upstream default of 4 to 16 so a single ACP process can serve more concurrent
+# sessions — the Claudio Slack bot multiplexes many threads over one process.
+_executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="acp-agent")
 
-    Only providers with usable credentials AND at least one addressable model
-    are included. The current provider's catalog is moved to the front so the
-    selector's first entries match the session's own provider. Results are
-    cached for a few minutes because live catalog fetches are slow.
-    ``force_refresh`` bypasses the cache (and repopulates it) so newly added
-    credentials show up without waiting out the TTL.
+# Server-side page size for list_sessions, counted in FAMILIES (a fork/subagent
+# group is one unit — see _group_session_families), not raw rows. Clients render
+# a family as a single grouped card, so paging by rows made pages carrying large
+# families look nearly empty. The ACP ListSessionsRequest schema does not expose
+# a client-side limit, so this is a fixed cap that clients paginate against
+# using `cursor` / `next_cursor`.
+_LIST_SESSIONS_PAGE_SIZE = 40
+
+
+def _group_session_families(
+    infos: list[dict[str, Any]],
+) -> list[list[dict[str, Any]]]:
+    """Group a recency-sorted session list into fork/subagent families.
+
+    A family is a root session plus every descendant reachable through
+    ``parent_id`` links WITHIN the list — a child whose parent is absent
+    (archived, filtered out) roots its own family, mirroring how clients
+    nest lineage. Families keep the order of their freshest member (first
+    appearance in the recency-sorted input) and members keep input order.
+    Used by ``list_sessions`` to paginate on family boundaries so a parent
+    and its children never land on different pages.
     """
-    global _provider_catalogs_cache
-    import time as _time
+    by_id = {s["session_id"]: s for s in infos}
 
-    now = _time.monotonic()
-    if (
-        not force_refresh
-        and _provider_catalogs_cache
-        and now - _provider_catalogs_cache[0] < _PROVIDER_CATALOGS_TTL_SECONDS
-    ):
-        catalogs = _provider_catalogs_cache[1]
-    else:
-        from hermes_cli.models import (
-            curated_models_for_provider,
-            list_available_providers,
-            normalize_provider,
-        )
+    def _root_of(s: dict[str, Any]) -> str:
+        seen: set[str] = set()
+        cur = s
+        while True:
+            sid = cur["session_id"]
+            if sid in seen:  # lineage cycle guard
+                break
+            seen.add(sid)
+            parent = cur.get("parent_id")
+            if not parent or parent == sid or parent not in by_id:
+                break
+            cur = by_id[parent]
+        return cur["session_id"]
 
-        catalogs = []
-        seen_providers: set[str] = set()
-        for info in list_available_providers():
-            if not info.get("authenticated"):
-                continue
-            pid = normalize_provider(info.get("id"))
-            if pid in seen_providers:
-                continue
-            seen_providers.add(pid)
-            try:
-                catalog = [
-                    (str(mid or "").strip(), desc)
-                    for mid, desc in curated_models_for_provider(pid)
-                    if str(mid or "").strip()
-                ]
-            except Exception:
-                logger.debug("Could not list models for provider %s", pid, exc_info=True)
-                continue
-            if catalog:
-                catalogs.append((pid, str(info.get("label") or pid), catalog))
+    families: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
+    for s in infos:
+        root = _root_of(s)
+        if root not in families:
+            families[root] = []
+            order.append(root)
+        families[root].append(s)
+    return [families[root] for root in order]
 
-        # Named user-defined endpoints (providers: / custom_providers:) are
-        # invisible to list_available_providers — append them explicitly.
-        try:
-            for slug, label, catalog in _named_custom_provider_catalogs():
-                if slug in seen_providers:
-                    continue
-                seen_providers.add(slug)
-                catalogs.append((slug, label, catalog))
-        except Exception:
-            logger.debug("Could not list named custom providers", exc_info=True)
 
-        _provider_catalogs_cache = (now, catalogs)
-
-    # Current provider first, preserving relative order for the rest.
-    return sorted(catalogs, key=lambda entry: 0 if entry[0] == current_provider else 1)
-
+# Per-provider cap for the ACP model selector. ACP clients (Zed, Buzz) render
+# the whole `availableModels` array in one dropdown, so an unbounded
+# cross-provider catalog degrades the picker. Mirrors the cap the MoA picker
+# already uses (`hermes_cli/moa_cmd.py`). This bounds each provider's row, not
+# the total; aggregator providers stay intentionally uncapped inside the shared
+# inventory, and the current model is always kept via the fallback insert below.
+ACP_MAX_MODELS_PER_PROVIDER = 200
+_MAX_ACP_RESOURCE_BYTES = 512 * 1024
+_TEXT_RESOURCE_MIME_PREFIXES = ("text/",)
+_TEXT_RESOURCE_MIME_TYPES = {
+    "application/json",
+    "application/javascript",
+    "application/typescript",
+    "application/xml",
+    "application/x-yaml",
+    "application/yaml",
+    "application/toml",
+    "application/sql",
+}
 
 def _apply_session_effort(agent: Any, level: str) -> None:
     """Apply a reasoning-effort level to the LIVE agent.
@@ -936,57 +866,115 @@ class HermesACPAgent(acp.Agent):
     def _build_model_state(
         self, state: SessionState, force_refresh: bool = False
     ) -> SessionModelState | None:
-        """Return the ACP model selector payload for editors like Zed.
+        """Return authenticated providers and their models for ACP clients.
 
-        Lists models from EVERY authenticated provider (not just the current
-        one) so clients can switch cross-provider — ``set_model`` already
-        resolves ``provider:model`` ids via ``parse_model_input``. The current
-        provider's catalog is listed first; providers with no addressable
-        models are skipped. ``force_refresh`` bypasses the catalog cache so a
-        just-authenticated provider appears without waiting out the TTL.
+        The shared Hermes inventory is also used by ``hermes model``, the TUI,
+        and the dashboard. Keeping ACP on that substrate prevents its selector
+        from silently collapsing to the current provider's curated list.
+
+        ``force_refresh`` busts the inventory's per-provider model-id cache and
+        re-probes custom endpoints, so a provider authenticated after session
+        creation appears without waiting out the cache TTL (the ``refreshModels``
+        RPC below). Normal session/new / session/load leave every probe off —
+        probing endpoints takes seconds and would block session creation.
         """
         model = str(state.model or getattr(state.agent, "model", "") or "").strip()
         provider = getattr(state.agent, "provider", None) or detect_provider() or "openrouter"
 
         try:
+            from hermes_cli.inventory import build_models_payload, load_picker_context
             from hermes_cli.models import normalize_provider, provider_label
 
             normalized_provider = normalize_provider(provider)
+            context = load_picker_context().with_overrides(
+                current_provider=normalized_provider,
+                current_model=model,
+                current_base_url=str(getattr(state.agent, "base_url", "") or ""),
+            )
+            payload = build_models_payload(
+                context,
+                explicit_only=True,
+                include_unconfigured=False,
+                picker_hints=False,
+                canonical_order=True,
+                pricing=False,
+                capabilities=False,
+                refresh=force_refresh,
+                probe_custom_providers=force_refresh,
+                probe_current_custom_provider=False,
+                max_models=ACP_MAX_MODELS_PER_PROVIDER,
+            )
+
             available_models: list[ModelInfo] = []
             seen_ids: set[str] = set()
-
-            for prov, prov_name, catalog in _authenticated_provider_catalogs(
-                normalized_provider, force_refresh=force_refresh
-            ):
-                for model_id, description in catalog:
-                    rendered_model = str(model_id or "").strip()
+            for row in payload.get("providers") or []:
+                row_provider = normalize_provider(str(row.get("slug") or "").strip())
+                if not row_provider:
+                    continue
+                provider_name = str(row.get("name") or "").strip() or provider_label(
+                    row_provider
+                )
+                for model_entry in row.get("models") or []:
+                    if isinstance(model_entry, dict):
+                        rendered_model = str(
+                            model_entry.get("id")
+                            or model_entry.get("model")
+                            or model_entry.get("name")
+                            or ""
+                        ).strip()
+                    else:
+                        rendered_model = str(model_entry or "").strip()
                     if not rendered_model:
                         continue
-                    choice_id = self._encode_model_choice(prov, rendered_model)
+                    choice_id = self._encode_model_choice(row_provider, rendered_model)
                     if choice_id in seen_ids:
                         continue
-                    desc_parts = [f"Provider: {prov_name}"]
-                    if description:
-                        desc_parts.append(str(description).strip())
-                    if prov == normalized_provider and rendered_model == model:
-                        desc_parts.append("current")
+                    is_current = (
+                        row_provider == normalized_provider and rendered_model == model
+                    )
+                    description = f"Provider: {provider_name}"
+                    if is_current:
+                        description += " • current"
                     available_models.append(
                         ModelInfo(
                             model_id=choice_id,
-                            name=rendered_model,
-                            description=" • ".join(part for part in desc_parts if part),
+                            name=f"{provider_name} · {rendered_model}",
+                            description=description,
                         )
                     )
                     seen_ids.add(choice_id)
 
+            # Named user-defined endpoints (providers: / custom_providers:)
+            # are invisible to canonical provider enumeration — append them
+            # so editor clients can select them like the TUI /model picker.
+            for named_slug, named_label, named_catalog in _named_custom_provider_catalogs():
+                for named_model, named_desc in named_catalog:
+                    named_choice = self._encode_model_choice(named_slug, named_model)
+                    if not named_choice or named_choice in seen_ids:
+                        continue
+                    named_parts = [f"Provider: {named_label}"]
+                    if named_desc:
+                        named_parts.append(str(named_desc).strip())
+                    if named_slug == normalized_provider and named_model == model:
+                        named_parts.append("current")
+                    available_models.append(
+                        ModelInfo(
+                            model_id=named_choice,
+                            name=named_model,
+                            description=" • ".join(part for part in named_parts if part),
+                        )
+                    )
+                    seen_ids.add(named_choice)
+
             current_model_id = self._encode_model_choice(normalized_provider, model)
             if current_model_id and current_model_id not in seen_ids:
+                provider_name = provider_label(normalized_provider)
                 available_models.insert(
                     0,
                     ModelInfo(
                         model_id=current_model_id,
-                        name=model,
-                        description=f"Provider: {provider_label(normalized_provider)} • current",
+                        name=f"{provider_name} · {model}",
+                        description=f"Provider: {provider_name} • current",
                     ),
                 )
 
@@ -3092,8 +3080,16 @@ class HermesACPAgent(acp.Agent):
                     # goes through the platform-adapter supports_async_delivery
                     # convention — keeping the capability decision visible and
                     # guarded at the bind site.
+                    # ``cwd`` pins the logical working directory for this
+                    # context, which is what the system prompt's "Current
+                    # working directory" line reports (agent/prompt_builder.py
+                    # -> resolve_agent_cwd). Without it the prompt advertises
+                    # the global Hermes workspace while the tools are rooted at
+                    # the client's project, so the model emits absolute paths
+                    # under ~/.hermes/workspace and the edit silently lands
+                    # outside the editor's workspace.
                     session_tokens = set_session_vars(
-                        session_key=session_id, async_delivery=True
+                        session_key=session_id, cwd=state.cwd, async_delivery=True
                     )
                 except Exception:
                     session_tokens = None
@@ -3474,8 +3470,26 @@ class HermesACPAgent(acp.Agent):
         if handler is None:
             return None  # not a known command — let the LLM handle it
 
-        try:
+        # Slash handlers run on the event-loop thread, OUTSIDE the per-turn
+        # contextvars.copy_context() that pins the session cwd for the agent
+        # call. ``/compress`` and ``/model`` reach code that REBUILDS the
+        # system prompt (agent._build_system_prompt -> resolve_agent_cwd), so
+        # an unpinned handler bakes the Hermes install tree into the session's
+        # cached prompt — persisted, and therefore poisoning every later turn
+        # even though the turn itself is pinned. Pin inside a fresh context so
+        # the write can't leak into other concurrent ACP sessions and needs no
+        # teardown.
+        def _dispatch() -> str | None:
+            try:
+                from agent.runtime_cwd import set_session_cwd
+
+                set_session_cwd(state.cwd)
+            except Exception:
+                logger.debug("Could not pin ACP session cwd for slash command", exc_info=True)
             return handler(args, state)
+
+        try:
+            return contextvars.copy_context().run(_dispatch)
         except Exception as e:
             logger.error("Slash command /%s error: %s", cmd, e, exc_info=True)
             return f"Error executing /{cmd}: {e}"

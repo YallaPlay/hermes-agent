@@ -1,20 +1,20 @@
-"""Tests for named user-defined provider catalogs in the ACP model selector.
+"""Tests for named user-defined provider entries in the ACP model selector.
 
 Named endpoints from the ``providers:`` mapping (and legacy
-``custom_providers:`` list) are invisible to ``list_available_providers()``,
-so ``_authenticated_provider_catalogs`` must append them explicitly for the
-ACP model selector to offer them (the TUI ``/model`` picker already does).
+``custom_providers:`` list) are invisible to canonical provider enumeration,
+so ``_build_model_state`` must append them explicitly for ACP clients to
+offer them — the TUI ``/model`` picker already renders these entries
+(#47039 implemented named endpoints for the TUI surface only).
 """
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
-import acp_adapter.server as server_mod
-from acp_adapter.server import (
-    _authenticated_provider_catalogs,
-    _named_custom_provider_catalogs,
-)
+from acp_adapter.server import HermesACPAgent, _named_custom_provider_catalogs
+from acp_adapter.session import SessionManager
+from acp.schema import SessionModelState
 
 
 MANTLE_URL = "https://bedrock-mantle.us-east-1.api.aws/openai/v1"
@@ -29,17 +29,9 @@ def _cfg(providers=None, custom_providers=None):
     return cfg
 
 
-@pytest.fixture(autouse=True)
-def _reset_catalog_cache():
-    """The module-level catalog cache must not leak between tests."""
-    server_mod._provider_catalogs_cache = None
-    yield
-    server_mod._provider_catalogs_cache = None
-
-
 class TestNamedCustomProviderCatalogs:
     def test_declared_default_model_survives_failed_discovery(self, monkeypatch):
-        """Endpoints without a /models route (Bedrock Mantle 404s) keep declared models."""
+        """Endpoints without a /models route keep their declared models."""
         monkeypatch.setenv("BEDROCK_MANTLE_API_KEY", "test-key")
         cfg = _cfg(
             providers={
@@ -164,67 +156,42 @@ class TestNamedCustomProviderCatalogs:
         ]
 
 
-class TestAuthenticatedProviderCatalogsNamedEntries:
-    def test_named_providers_appended_to_selector_catalogs(self, monkeypatch):
-        monkeypatch.setenv("BEDROCK_MANTLE_API_KEY", "test-key")
-        cfg = _cfg(
-            providers={
-                "bedrock-mantle": {
-                    "name": "AWS Bedrock Mantle",
-                    "base_url": MANTLE_URL,
-                    "key_env": "BEDROCK_MANTLE_API_KEY",
-                    "default_model": "openai.gpt-5.5",
-                }
-            }
+class TestModelStateIncludesNamedProviders:
+    @pytest.mark.asyncio
+    async def test_named_provider_models_appear_in_model_state(self):
+        manager = SessionManager(
+            agent_factory=lambda: SimpleNamespace(
+                model="gpt-5.4", provider="openai-codex"
+            )
         )
+        acp_agent = HermesACPAgent(session_manager=manager)
+
         with patch(
-            "hermes_cli.models.list_available_providers",
-            return_value=[
-                {"id": "bedrock", "label": "AWS Bedrock", "authenticated": True}
-            ],
-        ), patch(
             "hermes_cli.models.curated_models_for_provider",
-            return_value=[("global.anthropic.claude-fable-5", "")],
+            return_value=[("gpt-5.4", "recommended")],
         ), patch(
-            "hermes_cli.config.load_config", return_value=cfg
-        ), patch(
-            "hermes_cli.models.fetch_api_models", return_value=None
+            "acp_adapter.server._named_custom_provider_catalogs",
+            return_value=[
+                (
+                    "custom:bedrock-mantle",
+                    "AWS Bedrock Mantle",
+                    [("openai.gpt-5.5", "")],
+                )
+            ],
         ):
-            catalogs = _authenticated_provider_catalogs("bedrock")
+            resp = await acp_agent.new_session(cwd="/tmp")
 
-        slugs = [slug for slug, _, _ in catalogs]
-        assert slugs == ["bedrock", "custom:bedrock-mantle"]
-        named = dict((s, m) for s, _, m in catalogs)["custom:bedrock-mantle"]
-        assert named == [("openai.gpt-5.5", "")]
-
-    def test_named_provider_current_sorts_first(self, monkeypatch):
-        monkeypatch.setenv("BEDROCK_MANTLE_API_KEY", "test-key")
-        cfg = _cfg(
-            providers={
-                "bedrock-mantle": {
-                    "name": "AWS Bedrock Mantle",
-                    "base_url": MANTLE_URL,
-                    "key_env": "BEDROCK_MANTLE_API_KEY",
-                    "default_model": "openai.gpt-5.5",
-                }
-            }
+        assert isinstance(resp.models, SessionModelState)
+        ids = [m.model_id for m in resp.models.available_models]
+        # Current provider's models come first, named endpoints after.
+        assert ids[0] == "openai-codex:gpt-5.4"
+        assert "custom:bedrock-mantle:openai.gpt-5.5" in ids
+        named = next(
+            m
+            for m in resp.models.available_models
+            if m.model_id == "custom:bedrock-mantle:openai.gpt-5.5"
         )
-        with patch(
-            "hermes_cli.models.list_available_providers",
-            return_value=[
-                {"id": "bedrock", "label": "AWS Bedrock", "authenticated": True}
-            ],
-        ), patch(
-            "hermes_cli.models.curated_models_for_provider",
-            return_value=[("global.anthropic.claude-fable-5", "")],
-        ), patch(
-            "hermes_cli.config.load_config", return_value=cfg
-        ), patch(
-            "hermes_cli.models.fetch_api_models", return_value=None
-        ):
-            catalogs = _authenticated_provider_catalogs("custom:bedrock-mantle")
-
-        assert catalogs[0][0] == "custom:bedrock-mantle"
+        assert "AWS Bedrock Mantle" in (named.description or "")
 
     def test_selector_choice_id_round_trips_through_parse_model_input(self):
         """The encoded choice id must resolve back to the named provider."""

@@ -17,7 +17,6 @@ import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } 
 import { DecodeText } from '@/components/ui/decode-text'
 import { DROP_SHEET_BLUR_CLASS, DROP_SHEET_CLASS } from '@/components/ui/drop-affordance'
 import {
-  PANE_TAB_STRIP_LINE,
   PANE_TAB_STRIP_LINE_LEFT,
   PANE_TAB_STRIP_LINE_RIGHT,
   PaneTab,
@@ -30,6 +29,7 @@ import { cn } from '@/lib/utils'
 
 import { $layoutEditMode } from '../../edit-mode'
 import { useWindowControlsOverlap } from '../../geometry'
+import { hiddenPaneProps, PaneVisibleContext } from '../../pane-visibility'
 import type { DropPosition, GroupNode, RootEdge } from '../model'
 import { adjacentGroup } from '../model'
 import {
@@ -88,7 +88,11 @@ function ZoneMenu({
   /** False for the zone hosting the uncloseable workspace — collapsing the
    *  MAIN pane strands the app behind a strip. */
   minimizable?: boolean
-  directions: ZoneMenuDirection[]
+  /** Called when the menu renders, not on every zone re-render: resolving the
+   *  neighbor zones has to read the layout tree, and subscribing every zone to
+   *  it made a sash drag re-render every mounted pane. Same lazy shape as
+   *  `closable`. */
+  directions: () => ZoneMenuDirection[]
   headerHidden?: boolean
   minimized?: boolean
   nodeId: string
@@ -99,7 +103,7 @@ function ZoneMenu({
     <ContextMenu>
       <ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
       <ContextMenuContent>
-        {directions.map(direction => (
+        {directions().map(direction => (
           <ContextMenuItem key={direction.side} onSelect={direction.run}>
             {direction.label}
           </ContextMenuItem>
@@ -254,30 +258,43 @@ export function TreeGroup({
   //  - a single pane -> "Move <dir>": join the zone visually adjacent on that
   //    side (splitting here would only make an invisible empty zone). Sides
   //    with no visible neighbor are omitted entirely.
-  const tree = useStore($layoutTree)
+  // NOT `useStore($layoutTree)`: this subscribes every zone — and therefore
+  // every mounted pane and its whole transcript — to the entire layout tree.
+  // A sash drag rewrites the tree once per frame, so dragging the sidebar
+  // re-rendered all five tiles' message lists on every pointermove (measured:
+  // TreeGroup 180 renders cascading into ChatView/Thread/TileChat at ~4.5s
+  // each, holding the drag at ~3fps).
+  //
+  // The tree is only read to build the zone context menu's move/split
+  // directions, which are consumed when the menu OPENS — so read it at that
+  // moment with `.get()` instead of subscribing to every intermediate frame.
+  const menuDirections = (): ZoneMenuDirection[] => {
+    if (shown.length > 1) {
+      return DIRECTION_ORDER.map(side => ({
+        side,
+        label: `${t.zones.split(dirWord[side])} ${DIRECTION_ARROW[side]}`,
+        run: () => splitTreeZone(node.id, side, menuPane ?? activeId)
+      }))
+    }
 
-  const menuDirections: ZoneMenuDirection[] =
-    shown.length > 1
-      ? DIRECTION_ORDER.map(side => ({
+    const tree = $layoutTree.get()
+
+    return DIRECTION_ORDER.flatMap(side => {
+      const neighbor = tree ? adjacentGroup(tree, node.id, side, g => g.panes.some(paneShown)) : null
+
+      if (!neighbor || neighbor.id === node.id) {
+        return []
+      }
+
+      return [
+        {
           side,
-          label: `${t.zones.split(dirWord[side])} ${DIRECTION_ARROW[side]}`,
-          run: () => splitTreeZone(node.id, side, menuPane ?? activeId)
-        }))
-      : DIRECTION_ORDER.flatMap(side => {
-          const neighbor = tree ? adjacentGroup(tree, node.id, side, g => g.panes.some(paneShown)) : null
-
-          if (!neighbor || neighbor.id === node.id) {
-            return []
-          }
-
-          return [
-            {
-              side,
-              label: `${t.zones.move(dirWord[side])} ${DIRECTION_ARROW[side]}`,
-              run: () => moveTreePane(activeId, { groupId: neighbor.id, pos: 'center' })
-            }
-          ]
-        })
+          label: `${t.zones.move(dirWord[side])} ${DIRECTION_ARROW[side]}`,
+          run: () => moveTreePane(activeId, { groupId: neighbor.id, pos: 'center' })
+        }
+      ]
+    })
+  }
 
   // Close targets the right-clicked chip (falling back to the active pane);
   // only panes that declare `uncloseable` (the main workspace) are exempt.
@@ -386,13 +403,10 @@ export function TreeGroup({
         <ZoneMenu {...zoneMenu}>
           <div
             // Active = sidebar surface (merges into body). Strip =
-            // `--theme-card-seed` (VS Code `tab.inactiveBackground`). Line =
-            // PANE_TAB_STRIP_LINE; active tab cuts through it.
+            // `--theme-card-seed` (VS Code `tab.inactiveBackground`). No bottom
+            // rule — the active tab's primary underline is the only seam.
             // data-zone-tabstrip: a drop over here STACKS (drag-session reads it).
-            className={cn(
-              'group/pane-header relative flex h-7 shrink-0 select-none bg-(--pane-tab-strip-bg) [-webkit-app-region:no-drag] [--pane-tab-active-bg:var(--ui-sidebar-surface-background)] [--pane-tab-strip-bg:var(--theme-card-seed)]',
-              PANE_TAB_STRIP_LINE
-            )}
+            className="group/pane-header relative flex h-7 shrink-0 select-none bg-(--pane-tab-strip-bg) [-webkit-app-region:no-drag] [--pane-tab-active-bg:var(--ui-sidebar-surface-background)] [--pane-tab-strip-bg:var(--theme-card-seed)]"
             data-zone-tabstrip={node.id}
             onContextMenu={e => {
               setMenuPane(
@@ -520,7 +534,9 @@ export function TreeGroup({
       {/* Body: the zone's pane content — every kept (ever-active) pane stays
           mounted in an absolute layer; only the active one is visible.
           `visibility` (not display) keeps the hidden pane's layout box, so
-          scroll positions and measurements survive the round-trip. */}
+          scroll positions and measurements survive the round-trip — which also
+          makes a hidden layer's rect identical to the visible one's, hence the
+          marker document-wide lookups filter on (see pane-visibility.ts). */}
       {!node.minimized && (
         <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
           {isEmpty ? (
@@ -538,9 +554,14 @@ export function TreeGroup({
                   aria-hidden={!isActive || undefined}
                   className={cn('absolute inset-0 overflow-auto', !isActive && 'pointer-events-none invisible')}
                   key={paneId}
+                  {...hiddenPaneProps(!isActive)}
                 >
                   {pane?.render ? (
-                    <ContribBoundary id={pane.id}>{pane.render()}</ContribBoundary>
+                    // Visibility flows to the pane so a kept-alive chat surface
+                    // can gate its hot (per-token) subscriptions while hidden.
+                    <PaneVisibleContext.Provider value={isActive}>
+                      <ContribBoundary id={pane.id}>{pane.render()}</ContribBoundary>
+                    </PaneVisibleContext.Provider>
                   ) : (
                     isActive && (
                       <div className="p-3 font-mono text-[11px] text-(--ui-text-quaternary)">

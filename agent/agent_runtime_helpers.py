@@ -851,6 +851,25 @@ def strip_think_blocks(agent, content: str) -> str:
 
 
 
+def sync_credential_pool_entry_id(agent) -> None:
+    """Rebind ``agent._credential_pool_entry_id`` from the current pool + key.
+
+    OAuth refreshes can replace the runtime token before a failed request is
+    recovered, so the mutable API-key value alone cannot reliably attribute
+    the failure to its source entry.  This resolves the stable pool-entry ID
+    for the agent's current ``api_key`` and clears it when no pool is bound.
+    """
+    pool = getattr(agent, "_credential_pool", None)
+    try:
+        agent._credential_pool_entry_id = (
+            pool.entry_id_for_api_key(getattr(agent, "api_key", None))
+            if pool is not None
+            else None
+        )
+    except Exception:
+        agent._credential_pool_entry_id = None
+
+
 def recover_with_credential_pool(
     agent,
     *,
@@ -935,10 +954,30 @@ def recover_with_credential_pool(
     # failing entry exactly; fall back to current()'s key only when the agent
     # carries no key at all.
     _api_key_hint = getattr(agent, "api_key", None) or None
+    _raw_credential_id = getattr(agent, "_credential_pool_entry_id", None)
+    _credential_id = (
+        _raw_credential_id
+        if isinstance(_raw_credential_id, str) and _raw_credential_id
+        else None
+    )
     if not _api_key_hint:
         _cur = pool.current()
         if _cur:
             _api_key_hint = getattr(_cur, "runtime_api_key", None)
+            if not _credential_id:
+                _current_id = getattr(_cur, "id", None)
+                if isinstance(_current_id, str) and _current_id:
+                    _credential_id = _current_id
+
+    def _rotate_failed_credential(rotate_status: int):
+        kwargs = {
+            "status_code": rotate_status,
+            "error_context": error_context,
+            "api_key_hint": _api_key_hint,
+        }
+        if _credential_id:
+            kwargs["credential_id"] = _credential_id
+        return pool.mark_exhausted_and_rotate(**kwargs)
 
     effective_reason = classified_reason
     if effective_reason is None:
@@ -973,11 +1012,7 @@ def recover_with_credential_pool(
         # Runtime credentials can be resolved by a separate pool instance,
         # leaving this recovery pool without ``current_id``. Match the key
         # that actually failed instead of quarantining a different account.
-        next_entry = pool.mark_exhausted_and_rotate(
-            status_code=rotate_status,
-            error_context=error_context,
-            api_key_hint=_api_key_hint,
-        )
+        next_entry = _rotate_failed_credential(rotate_status)
         if next_entry is not None:
             _ra().logger.info(
                 "Credential %s (billing) — rotated to pool entry %s",
@@ -996,8 +1031,13 @@ def recover_with_credential_pool(
         # Prefer the entry matching the failing key over the shared current()
         # pointer, for the same attribution reason as above.
         current_entry = None
-        if _api_key_hint:
+        if _credential_id:
             current_entry = next(
+                (e for e in pool.entries() if e.id == _credential_id),
+                None,
+            )
+        if _api_key_hint:
+            current_entry = current_entry or next(
                 (e for e in pool.entries() if e.runtime_api_key == _api_key_hint),
                 None,
             )
@@ -1010,11 +1050,7 @@ def recover_with_credential_pool(
                 current_last_status,
             )
             rotate_status = status_code if status_code is not None else 429
-            next_entry = pool.mark_exhausted_and_rotate(
-                status_code=rotate_status,
-                error_context=error_context,
-                api_key_hint=_api_key_hint,
-            )
+            next_entry = _rotate_failed_credential(rotate_status)
             if next_entry is not None:
                 _ra().logger.info(
                     "Credential %s (rate limit, pre-exhausted) — rotated to pool entry %s",
@@ -1038,11 +1074,7 @@ def recover_with_credential_pool(
         if not has_retried_429 and not usage_limit_reached:
             return False, True
         rotate_status = status_code if status_code is not None else 429
-        next_entry = pool.mark_exhausted_and_rotate(
-            status_code=rotate_status,
-            error_context=error_context,
-            api_key_hint=_api_key_hint,
-        )
+        next_entry = _rotate_failed_credential(rotate_status)
         if next_entry is not None:
             _ra().logger.info(
                 "Credential %s (rate limit) — rotated to pool entry %s",
@@ -1114,7 +1146,10 @@ def recover_with_credential_pool(
         # the shared pointer can reference a different, healthy entry, and
         # refreshing it would consume that entry's single-use refresh token
         # (or mark it exhausted on failure) for a failure it never had.
-        refreshed = pool.try_refresh_matching(api_key_hint=_api_key_hint)
+        refresh_kwargs = {"api_key_hint": _api_key_hint}
+        if _credential_id:
+            refresh_kwargs["credential_id"] = _credential_id
+        refreshed = pool.try_refresh_matching(**refresh_kwargs)
         if refreshed is not None:
             # ``try_refresh_matching()`` re-mints a fresh OAuth token and reports
             # success even when the upstream keeps rejecting it — a single-entry
@@ -1146,11 +1181,7 @@ def recover_with_credential_pool(
         # Refresh failed — rotate to next credential instead of giving up.
         # The failed entry is already marked exhausted by the refresh attempt.
         rotate_status = status_code if status_code is not None else 401
-        next_entry = pool.mark_exhausted_and_rotate(
-            status_code=rotate_status,
-            error_context=error_context,
-            api_key_hint=_api_key_hint,
-        )
+        next_entry = _rotate_failed_credential(rotate_status)
         if next_entry is not None:
             _ra().logger.info(
                 "Credential %s (auth refresh failed) — rotated to pool entry %s",
@@ -1191,15 +1222,29 @@ def try_recover_primary_transport(
     if agent._is_openrouter_url():
         return False
     provider_lower = (agent.provider or "").strip().lower()
-    if provider_lower in {"nous", "nous-research"}:
+    # Portal OpenAI-wire traffic still rides aggregator retry infra, so one
+    # more rebuilt OpenAI client won't help. Portal Claude on the native
+    # Messages route holds a local Anthropic SDK client whose connection
+    # pool *does* need the rebuild every other anthropic_messages provider
+    # already gets — don't blanket-skip the dual-wire path.
+    if (
+        provider_lower in {"nous", "nous-portal", "nousresearch"}
+        and getattr(agent, "api_mode", None) != "anthropic_messages"
+    ):
         return False
 
     try:
-        # Close existing client to release stale connections
+        # Retire the existing client to release stale connections. #70773:
+        # never hard-close the shared client here — this runs on the
+        # conversation-loop thread while workers from stale-killed streaming
+        # attempts may still be unwinding their SSL BIOs on the old pool.
+        # ``_retire_shared_openai_client`` shuts the sockets down (FD-safe
+        # from any thread) and defers the FD release to GC, which cannot
+        # complete until every borrowing thread has unwound.
         if getattr(agent, "client", None) is not None:
             try:
-                agent._close_openai_client(
-                    agent.client, reason="primary_recovery", shared=True,
+                agent._retire_shared_openai_client(
+                    agent.client, reason="primary_recovery",
                 )
             except Exception:
                 pass
@@ -1461,6 +1506,7 @@ def restore_primary_runtime(agent) -> bool:
                 pool_matches_primary = False
         if pool is not None and pool_provider and not pool_matches_primary:
             agent._credential_pool = None
+            agent._credential_pool_entry_id = None
             try:
                 from agent.credential_pool import load_pool
 
@@ -1480,6 +1526,7 @@ def restore_primary_runtime(agent) -> bool:
         # the pool for its current best entry and swap the live credential in.
         # When the pool is absent, empty, or the entry has no usable key, we
         # keep the snapshot key (the existing behavior).  Fixes #25205.
+        agent._credential_pool_entry_id = None
         pool = getattr(agent, "_credential_pool", None)
         if pool is not None and pool.has_available():
             entry = pool.select()
@@ -1857,7 +1904,15 @@ def anthropic_prompt_cache_policy(
 
     if is_native_anthropic:
         return True, True
-    if (is_openrouter or is_nous_portal) and (is_claude or is_kimi):
+    # Envelope layout is an OpenAI-wire construct. Portal Claude on the native
+    # Messages route must fall through to the third-party anthropic_messages
+    # branch below, which emits inner-block cache_control breakpoints; the
+    # envelope form would be dropped and serve 0% cache hits.
+    if (
+        (is_openrouter or is_nous_portal)
+        and (is_claude or is_kimi)
+        and not is_anthropic_wire
+    ):
         return True, False
     # Nous Portal Qwen (e.g. qwen3.6-plus) takes the same envelope-layout
     # cache_control path as Portal Claude. Portal proxies to OpenRouter
@@ -2021,8 +2076,11 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     from hermes_cli.providers import determine_api_mode
 
     # ── Determine api_mode if not provided ──
+    # Pass model so dual-wire providers (Nous Portal anthropic/* → Messages)
+    # resolve correctly; without it determine_api_mode falls back to the
+    # openai_chat overlay default.
     if not api_mode:
-        api_mode = determine_api_mode(new_provider, base_url)
+        api_mode = determine_api_mode(new_provider, base_url, model=new_model)
 
     # Defense-in-depth: ensure OpenCode base_url doesn't carry a trailing
     # /v1 into the anthropic_messages client, which would cause the SDK to
@@ -2076,6 +2134,9 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     # restore the original pool (issue #52727: pool reload is part of this
     # switch and must be reversible on rollback).
     _snapshot["_credential_pool"] = getattr(agent, "_credential_pool", _MISSING)
+    _snapshot["_credential_pool_entry_id"] = getattr(
+        agent, "_credential_pool_entry_id", _MISSING
+    )
 
     try:
         # Clear the per-config context_length override so the new model's
@@ -2132,6 +2193,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             # A pool bound to the old provider is worse than no pool: the
             # recovery guard rejects it and every later 401/429 skips rotation.
             agent._credential_pool = None
+            agent._credential_pool_entry_id = None
             try:
                 from agent.credential_pool import load_pool
                 agent._credential_pool = load_pool(new_provider)
@@ -2141,7 +2203,6 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
                     "continuing without pool rotation this turn",
                     new_provider, _pool_exc,
                 )
-
         # ── Build new client ──
         if (new_provider or "").strip().lower() == "moa":
             from agent.moa_loop import build_moa_facade
@@ -2237,6 +2298,8 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
                 reason="switch_model",
                 shared=True,
             )
+
+        sync_credential_pool_entry_id(agent)
     except Exception:
         # Rollback every mutated field to the pre-swap snapshot so the agent
         # is left consistent (old model + old provider + old client) and the
@@ -2571,6 +2634,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 _clarify_tool(
                     question=next_args.get("question", ""),
                     choices=next_args.get("choices"),
+                    multi_select=next_args.get("multi_select", False),
                     callback=agent.clarify_callback,
                 ),
                 next_args,
