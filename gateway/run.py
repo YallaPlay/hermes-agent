@@ -23895,7 +23895,11 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     hour, and polls the curator hourly (its inner gate enforces the real
     weekly cadence).
     """
-    from gateway.platforms.base import cleanup_image_cache, cleanup_document_cache
+    from gateway.platforms.base import (
+        cleanup_document_cache,
+        cleanup_history_image_cache,
+        cleanup_image_cache,
+    )
     from hermes_cli.debug import _sweep_expired_pastes
 
     IMAGE_CACHE_EVERY = 60   # ticks — once per hour at default 60s interval
@@ -23940,6 +23944,19 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
                     logger.info("Document cache cleanup: removed %d stale file(s)", removed)
             except Exception as e:
                 logger.debug("Document cache cleanup error: %s", e)
+            try:
+                # Transcript-referenced images follow SESSION retention, not
+                # the 24h inbound-media sweep — a reloaded session rebuilds
+                # its bubbles from these files. No-op unless
+                # ``sessions.auto_prune`` is on (default: keep forever, which
+                # matches sessions themselves never being pruned).
+                removed = cleanup_history_image_cache()
+                if removed:
+                    logger.info(
+                        "History image cache cleanup: removed %d expired file(s)", removed
+                    )
+            except Exception as e:
+                logger.debug("History image cache cleanup error: %s", e)
 
         if tick_count % PASTE_SWEEP_EVERY == 0:
             try:

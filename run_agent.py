@@ -201,6 +201,10 @@ from agent.trajectory import (
     convert_scratchpad_to_think,
     save_trajectory as _save_trajectory_to_file,
 )
+from agent.history_media import (
+    content_parts_to_text_and_image_refs,
+    merge_image_refs_into_display_metadata,
+)
 from agent.tool_dispatch_helpers import (
     _should_parallelize_tool_batch,  # noqa: F401  # re-exported for tests that `from run_agent import _should_parallelize_tool_batch`
     _is_destructive_command,  # noqa: F401  # re-exported for tests that access `run_agent._is_destructive_command`
@@ -2085,17 +2089,30 @@ class AIAgent:
                 # Persist multimodal tool results as their text summary only —
                 # base64 images would bloat the session DB and aren't useful
                 # for cross-session replay.
+                _row_display_metadata = msg.get("display_metadata")
                 if _is_multimodal_tool_result(content):
                     content = _multimodal_text_summary(content)
                 elif isinstance(content, list):
-                    # List of OpenAI-style content parts: strip images, keep text.
-                    _txt = []
-                    for p in content:
-                        if isinstance(p, dict) and p.get("type") == "text":
-                            _txt.append(str(p.get("text", "")))
-                        elif isinstance(p, dict) and p.get("type") in {"image", "image_url", "input_image"}:
-                            _txt.append("[screenshot]")
-                    content = "\n".join(_txt) if _txt else None
+                    # List of OpenAI-style content parts: keep the text (with a
+                    # `[screenshot]` line per image, as always — those bytes are
+                    # model-visible on reload and prompt-cache stability depends
+                    # on them), and write each image's bytes to the image cache
+                    # so a display-only reference survives in display_metadata.
+                    # Without the reference the placeholder is a dead end and any
+                    # transcript rebuilt from the DB (ACP session/load replay,
+                    # web UI, CLI resume) loses the image permanently.
+                    content, _image_refs = content_parts_to_text_and_image_refs(content)
+                    _row_display_metadata = merge_image_refs_into_display_metadata(
+                        _row_display_metadata, _image_refs
+                    )
+                    if _row_display_metadata is not None:
+                        # Stamp the LIVE dict too: display metadata is never a
+                        # provider field (conversation_loop pops it from every
+                        # outgoing copy), and keeping it on the in-memory
+                        # message means a later history rewrite that reinserts
+                        # rows (compaction reconcile, rewind) carries the image
+                        # references forward instead of dropping them.
+                        msg["display_metadata"] = _row_display_metadata
                 tool_calls_data = None
                 if hasattr(msg, "tool_calls") and isinstance(msg.tool_calls, list) and msg.tool_calls:
                     tool_calls_data = [
@@ -2128,6 +2145,7 @@ class AIAgent:
                     compression_lock_holder=getattr(
                         self, "_active_compression_lock_holder", None
                     ),
+                    display_metadata=_row_display_metadata,
                 )
                 msg[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the

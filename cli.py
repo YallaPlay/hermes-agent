@@ -2095,6 +2095,23 @@ def _run_state_db_auto_maintenance(session_db) -> None:
             vacuum=bool(cfg.get("vacuum_after_prune", True)),
             sessions_dir=_hermes_home_maint / "sessions",
         )
+        # Transcript-referenced images are part of session history, so they
+        # expire on the SAME schedule rather than the 24h inbound-media sweep.
+        # Gated behind the same auto_prune check above; sweeping here (not only
+        # in gateway housekeeping) keeps CLI/ACP-only installs symmetric —
+        # otherwise sessions get pruned but their images accumulate forever.
+        try:
+            from gateway.platforms.base import cleanup_history_image_cache
+
+            removed = cleanup_history_image_cache(
+                max_age_days=int(cfg.get("retention_days", 90))
+            )
+            if removed:
+                logger.info(
+                    "History image cache: removed %d expired file(s)", removed
+                )
+        except Exception as _img_exc:
+            logger.debug("History image cache cleanup skipped: %s", _img_exc)
     except Exception as exc:
         logger.debug("state.db auto-maintenance skipped: %s", exc)
 

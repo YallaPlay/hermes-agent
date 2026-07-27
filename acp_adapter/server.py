@@ -87,6 +87,11 @@ from agent.context_compressor import (
     COMPRESSED_SUMMARY_METADATA_KEY,
     ContextCompressor,
 )
+from agent.history_media import (
+    image_bytes_from_ref,
+    image_refs_from_message,
+    inline_image_bytes_from_content,
+)
 from tools.approval import (
     reset_hermes_interactive_context,
     set_hermes_interactive_context,
@@ -1589,6 +1594,67 @@ class HermesACPAgent(acp.Agent):
         return None
 
     @staticmethod
+    def _history_image_update(
+        *,
+        role: str,
+        data: bytes,
+        mime_type: str,
+        field_meta: dict[str, Any] | None = None,
+    ) -> UserMessageChunk | AgentMessageChunk | None:
+        """Build an ACP history replay update carrying one image.
+
+        Chunked separately from the text so clients that only understand text
+        blocks keep rendering the transcript unchanged (they ignore the image
+        chunk) while image-capable clients attach it to the same bubble.
+        """
+        block = ImageContentBlock(
+            type="image",
+            data=base64.b64encode(data).decode("ascii"),
+            mime_type=mime_type or "image/png",
+        )
+        if role == "user":
+            return UserMessageChunk(
+                session_update="user_message_chunk",
+                content=block,
+                field_meta=field_meta,
+            )
+        if role == "assistant":
+            return AgentMessageChunk(
+                session_update="agent_message_chunk",
+                content=block,
+                field_meta=field_meta,
+            )
+        return None
+
+    @classmethod
+    def _history_message_images(cls, message: dict[str, Any]) -> list[tuple[bytes, str]]:
+        """Return replayable ``(bytes, mime)`` images for a history message.
+
+        Two sources, in order:
+
+        1. Image parts still on the in-memory content list (this process ran
+           the turn, so the original base64 payload is right there).
+        2. ``display_metadata["images"]`` references written by the flush path,
+           read back from the image cache — the only source for a DB-sourced
+           replay (mid-turn, or a session this process never ran), where
+           content is already collapsed to ``[screenshot]`` text.
+
+        Never raises: a missing/expired cache file just yields no image, and
+        the text placeholder still explains what was there.
+        """
+        inline = inline_image_bytes_from_content(
+            message.get("content"), max_bytes=_MAX_ACP_RESOURCE_BYTES
+        )
+        if inline:
+            return inline
+        images: list[tuple[bytes, str]] = []
+        for ref in image_refs_from_message(message):
+            loaded = image_bytes_from_ref(ref, max_bytes=_MAX_ACP_RESOURCE_BYTES)
+            if loaded is not None:
+                images.append(loaded)
+        return images
+
+    @staticmethod
     def _history_thought_update(text: str) -> AgentThoughtChunk:
         """Build an ACP history replay update for an assistant thought."""
         return acp.update_agent_thought_text(text)
@@ -1714,18 +1780,32 @@ class HermesACPAgent(acp.Agent):
 
             if role == "user":
                 text = self._history_message_text(message)
+                chunk_meta = self._history_chunk_meta(message, text)
+                meta = (
+                    {"hermes": {"historyIndex": index}}
+                    if stamp_fork_indices
+                    else None
+                )
                 if text:
                     update = self._history_message_update(
                         role=role,
                         text=text,
-                        field_meta=self._history_chunk_meta(message, text),
-                    )
-                    meta = (
-                        {"hermes": {"historyIndex": index}}
-                        if stamp_fork_indices
-                        else None
+                        field_meta=chunk_meta,
                     )
                     if update is not None and not await _send(update, meta):
+                        return
+                # Attachments the user sent with this turn. Emitted after the
+                # text so the client's chunk-accumulating block already exists,
+                # and with the SAME notification meta so a fork coordinate
+                # isn't lost when a turn is image-only.
+                for data, mime_type in self._history_message_images(message):
+                    image_update = self._history_image_update(
+                        role=role,
+                        data=data,
+                        mime_type=mime_type,
+                        field_meta=chunk_meta,
+                    )
+                    if image_update is not None and not await _send(image_update, meta):
                         return
                 continue
 
@@ -1735,13 +1815,24 @@ class HermesACPAgent(acp.Agent):
                     return
 
                 text = self._history_message_text(message)
+                chunk_meta = self._history_chunk_meta(message, text)
                 if text:
                     update = self._history_message_update(
                         role=role,
                         text=text,
-                        field_meta=self._history_chunk_meta(message, text),
+                        field_meta=chunk_meta,
                     )
                     if update is not None and not await _send(update):
+                        return
+
+                for data, mime_type in self._history_message_images(message):
+                    image_update = self._history_image_update(
+                        role=role,
+                        data=data,
+                        mime_type=mime_type,
+                        field_meta=chunk_meta,
+                    )
+                    if image_update is not None and not await _send(image_update):
                         return
 
                 tool_calls = message.get("tool_calls")

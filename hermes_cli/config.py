@@ -3331,8 +3331,11 @@ DEFAULT_CONFIG = {
         # Default false: session history is valuable for search recall, and
         # silently deleting it could surprise users.  Opt in explicitly.
         "auto_prune": False,
-        # How many inactive days of ended-session history to keep. Matches
-        # the default of ``hermes sessions prune``.
+        # How many inactive days of ended-session history to keep. Matches the
+        # default of ``hermes sessions prune``.  Also governs how long
+        # transcript-referenced images (``<image cache>/history/``, written
+        # when a chat turn carries an attachment) are kept — they are part of
+        # session history, so they must not expire before the session does.
         "retention_days": 90,
         # When true, auto-archive (soft-hide, never delete) sessions that
         # haven't been touched in ``auto_archive_days`` days, once per
