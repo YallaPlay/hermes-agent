@@ -1278,6 +1278,26 @@ class TestBedrockContextLength:
         assert get_bedrock_context_length("global.anthropic.claude-fable-5") == 1_000_000
         assert get_bedrock_context_length("anthropic.claude-fable-5-v1:0") == 1_000_000
 
+    def test_claude_opus_5(self):
+        from agent.bedrock_adapter import get_bedrock_context_length
+        # Opus 5 serves a 1M window on Bedrock (verified live via
+        # probe_bedrock_context_length against us-east-1, which reported
+        # 1,000,000).  Without an explicit entry the longest-substring lookup
+        # matches NO key -- not even the generic "anthropic.claude-opus-4"
+        # (200K) -- so it fell all the way through to
+        # BEDROCK_DEFAULT_CONTEXT_LENGTH (128K), capping sessions at ~13% of
+        # the real window whenever the live probe was unavailable.
+        assert get_bedrock_context_length("anthropic.claude-opus-5") == 1_000_000
+        assert get_bedrock_context_length("global.anthropic.claude-opus-5") == 1_000_000
+        assert get_bedrock_context_length("us.anthropic.claude-opus-5") == 1_000_000
+        assert get_bedrock_context_length("anthropic.claude-opus-5-20260601-v1:0") == 1_000_000
+
+    def test_claude_opus_5_does_not_collide_with_opus_4_siblings(self):
+        from agent.bedrock_adapter import get_bedrock_context_length
+        # The new 1M key must not drag the 200K opus-4 family up with it.
+        assert get_bedrock_context_length("anthropic.claude-opus-4-20250514-v1:0") == 200_000
+        assert get_bedrock_context_length("anthropic.claude-opus-4") == 200_000
+
     def test_claude_opus_4_base_stays_200k(self):
         from agent.bedrock_adapter import get_bedrock_context_length
         # The original Opus 4 (no minor version) keeps the 200K window.
