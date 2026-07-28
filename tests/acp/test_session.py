@@ -1560,36 +1560,38 @@ def test_list_sessions_fetches_all_and_filters_archived_in_python():
     assert out[0]["archived"] is True
 
 
-def test_list_sessions_orders_by_last_user_message_not_last_activity():
-    # "b" has the most recent USER message even though "a" has fresher overall
-    # activity (assistant/tool churn). Ordering must follow the user message.
+def test_list_sessions_orders_by_last_activity_including_agent_messages():
+    # "a" is mid/just-finished a long turn: its user message is old but the
+    # agent kept writing (last_active 200). "b" got a user message more
+    # recently but has been quiet since. Ordering follows LAST ACTIVITY of any
+    # source, so the session that just produced output sorts first.
     rows = [
         {
             "id": "a", "cwd": ".", "model": "m", "message_count": 5,
-            "title": "agent-busy", "started_at": 0.0,
-            "last_active": 200.0, "last_user_active": 50.0,
+            "title": "long-turn-just-ended", "started_at": 0.0,
+            "last_active": 200.0,
         },
         {
             "id": "b", "cwd": ".", "model": "m", "message_count": 5,
-            "title": "user-recent", "started_at": 0.0,
-            "last_active": 120.0, "last_user_active": 100.0,
+            "title": "user-sent-later-but-quiet", "started_at": 0.0,
+            "last_active": 120.0,
         },
     ]
     mgr, _ = _mgr_with_db(rows)
     out = mgr.list_sessions()
-    assert [s["session_id"] for s in out] == ["b", "a"]
+    assert [s["session_id"] for s in out] == ["a", "b"]
 
 
-def test_list_sessions_updated_at_falls_back_without_user_messages():
+def test_list_sessions_updated_at_falls_back_to_started_at_without_activity():
     rows = [{
         "id": "s1", "cwd": ".", "model": "m", "message_count": 1,
         "title": "T", "started_at": 10.0,
-        "last_active": 42.0, "last_user_active": None,
+        "last_active": None,
     }]
     mgr, _ = _mgr_with_db(rows)
     out = mgr.list_sessions()
     from datetime import datetime, timezone
-    expected = datetime.fromtimestamp(42.0, tz=timezone.utc).isoformat()
+    expected = datetime.fromtimestamp(10.0, tz=timezone.utc).isoformat()
     assert out[0]["updated_at"] == expected
 
 

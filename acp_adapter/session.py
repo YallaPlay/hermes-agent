@@ -618,14 +618,15 @@ class SessionManager:
                         # No canonical title yet — candidate for background
                         # title backfill (see HermesACPAgent.list_sessions).
                         "untitled": not str(persisted.get("title") or "").strip(),
-                        # Order by the LAST USER MESSAGE, not any message: an
-                        # agent that keeps streaming/tool-calling after the user
-                        # moved on shouldn't keep hoisting its row. Fall back to
-                        # last_active/started_at for sessions without a
-                        # persisted user message yet.
+                        # Order by LAST ACTIVITY of ANY source — the newest
+                        # message on the transcript regardless of role. A long
+                        # turn that finally lands assistant/tool messages IS
+                        # activity: the row must resort to the top when the turn
+                        # ends, not stay frozen at the user's send time (that
+                        # made a 40-minute turn look older than it was and
+                        # buried the session the user was waiting on).
                         "updated_at": _format_updated_at(
-                            persisted.get("last_user_active")
-                            or persisted.get("last_active")
+                            persisted.get("last_active")
                             or persisted.get("started_at")
                             or time.time()
                         ),
@@ -667,9 +668,10 @@ class SessionManager:
                 "user_id": row.get("user_id") or "",
                 "title": _build_session_title(row.get("title"), row.get("preview"), session_cwd),
                 "untitled": not str(row.get("title") or "").strip(),
-                # Last user message wins for recency (see the in-memory branch).
+                # Last activity of any role wins for recency (see the in-memory
+                # branch).
                 "updated_at": _format_updated_at(
-                    row.get("last_user_active") or row.get("last_active") or row.get("started_at")
+                    row.get("last_active") or row.get("started_at")
                 ),
                 "archived": row_archived,
                 "parent_id": parent_id,

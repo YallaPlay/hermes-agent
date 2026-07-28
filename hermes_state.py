@@ -6210,8 +6210,6 @@ class SessionDB:
                         (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
                         s.started_at
                     ) AS last_active,
-                    (SELECT MAX(mu.timestamp) FROM messages mu
-                     WHERE mu.session_id = s.id AND mu.role = 'user') AS last_user_active,
                     COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active
                 FROM sessions s
                 LEFT JOIN chain_max cm ON cm.root_id = s.id
@@ -6236,9 +6234,7 @@ class SessionDB:
                     COALESCE(
                         (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
                         s.started_at
-                    ) AS last_active,
-                    (SELECT MAX(mu.timestamp) FROM messages mu
-                     WHERE mu.session_id = s.id AND mu.role = 'user') AS last_user_active
+                    ) AS last_active
                 FROM sessions s
                 {where_sql}
                 ORDER BY s.started_at DESC
@@ -6281,7 +6277,7 @@ class SessionDB:
                 merged = dict(s)
                 for key in (
                     "id", "ended_at", "end_reason", "message_count",
-                    "tool_call_count", "title", "last_active", "last_user_active", "preview",
+                    "tool_call_count", "title", "last_active", "preview",
                     "model", "system_prompt", "cwd", "git_branch", "git_repo_root",
                 ):
                     if key in tip_row:
@@ -6374,9 +6370,7 @@ class SessionDB:
                 COALESCE(
                     (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
                     s.started_at
-                ) AS last_active,
-                (SELECT MAX(mu.timestamp) FROM messages mu
-                 WHERE mu.session_id = s.id AND mu.role = 'user') AS last_user_active
+                ) AS last_active
             FROM sessions s
             WHERE s.id = ?
         """
