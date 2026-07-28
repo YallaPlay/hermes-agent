@@ -12,7 +12,11 @@ import pytest
 
 from agent.context_compressor import ARTIFACT_RESULT_TAG, ContextCompressor
 from agent.conversation_loop import _run_proactive_tool_result_prune
-from tools.tool_result_storage import PersistedToolArtifact, redact_sensitive_text
+from tools.tool_result_storage import (
+    _ARTIFACT_SCOPE_HASH_CHARS,
+    PersistedToolArtifact,
+    redact_sensitive_text,
+)
 
 
 class LocalArtifactEnv:
@@ -109,10 +113,13 @@ def test_proactive_artifact_success_uses_scope_and_preserves_arguments(tmp_path)
         "redacted": True,
         "tool": "terminal",
         "call_id": "call-1",
-        "read": f"Use read_file on {artifact_path}; verify SHA-256 before trusting the content.",
+        # The stub names the path exactly once -- a prose hint that repeated
+        # the path made ~60% of every stub redundant path text.
+        "read": "read_file the path above; sha256 is the content digest.",
     }
+    assert str(artifact_path) not in metadata["read"]
     scope_hash = hashlib.sha256(b"task-scope-A").hexdigest()
-    assert artifact_path.parent.name == scope_hash
+    assert artifact_path.parent.name == scope_hash[:_ARTIFACT_SCOPE_HASH_CHARS]
 
 
 def test_artifact_mode_never_uses_legacy_lossy_fallback(tmp_path):

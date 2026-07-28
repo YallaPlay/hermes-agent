@@ -46,6 +46,17 @@ _BUDGET_TOOL_NAME = "__budget_enforcement__"
 _UNSAFE_RESULT_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _SAFE_ARTIFACT_EXTENSION = re.compile(r"(?:\.[A-Za-z0-9_-]+)+")
 _MAX_RESULT_FILENAME_STEM = 120
+# Artifact paths are quoted verbatim inside the pruned tool-result stub that
+# stays in context, so every path character costs tokens for the rest of the
+# session. Full sha256/uuid4 hex made a single path 229 chars (~60% of a
+# 768-char stub). These prefixes keep the same roles -- scope namespace,
+# content digest, rollback nonce -- with collision odds that stay negligible
+# for a per-task artifact directory, while cutting the path to ~72 chars.
+# Provenance is unaffected: the stub still carries the FULL sha256, and
+# nothing parses these path segments back out.
+_ARTIFACT_SCOPE_HASH_CHARS = 16
+_ARTIFACT_CONTENT_DIGEST_CHARS = 16
+_ARTIFACT_ATTEMPT_TOKEN_CHARS = 8
 
 
 @dataclass(frozen=True)
@@ -239,10 +250,13 @@ def persist_tool_artifact(
         # deleting bytes already referenced by another successful prune. The
         # scope and content digests still make provenance and integrity
         # explicit, while the nonce gives each rollback exclusive ownership.
-        attempt_token = uuid.uuid4().hex
+        # All three are truncated because the path itself is quoted into the
+        # in-context stub; the returned artifact keeps the full sha256.
+        attempt_token = uuid.uuid4().hex[:_ARTIFACT_ATTEMPT_TOKEN_CHARS]
         remote_path = (
-            f"{_resolve_storage_dir(env)}/{scope_hash}/"
-            f"{content_sha256}_{safe_stem}_{attempt_token}{extension}"
+            f"{_resolve_storage_dir(env)}/{scope_hash[:_ARTIFACT_SCOPE_HASH_CHARS]}/"
+            f"{content_sha256[:_ARTIFACT_CONTENT_DIGEST_CHARS]}_{safe_stem}"
+            f"_{attempt_token}{extension}"
         )
         created = _publish_immutable_to_sandbox(persisted_content, remote_path, env)
         if created is None:

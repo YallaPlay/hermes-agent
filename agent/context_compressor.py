@@ -366,6 +366,9 @@ def _build_tool_result_artifact_stub(
     tool_name: str,
     tool_call_id: str,
 ) -> str:
+    # The stub stays in context for the rest of the session, so it names the
+    # path exactly ONCE. An earlier version also inlined the path into a prose
+    # "read" hint, which made ~60% of every stub repeated path text.
     payload = {
         "v": 1,
         "path": artifact.path,
@@ -374,10 +377,7 @@ def _build_tool_result_artifact_stub(
         "redacted": artifact.redacted,
         "tool": tool_name,
         "call_id": tool_call_id,
-        "read": (
-            f"Use read_file on {artifact.path}; verify SHA-256 before trusting "
-            "the content."
-        ),
+        "read": "read_file the path above; sha256 is the content digest.",
     }
     return (
         f"{ARTIFACT_RESULT_TAG}\n"

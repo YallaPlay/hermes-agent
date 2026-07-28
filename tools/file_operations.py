@@ -1156,8 +1156,14 @@ class ShellFileOperations(FileOperations):
         if offset == 1:
             read_output, _ = _strip_bom(read_output)
         
-        # Get total line count
-        wc_cmd = f"wc -l < {self._escape_shell_arg(path)}"
+        # Get total line count. ``wc -l`` counts NEWLINES, not lines, so a file
+        # whose last line has no trailing newline is undercounted by one -- and
+        # a single-line file with no trailing newline (e.g. a persisted tool
+        # artifact holding one JSON object) reported "0 total lines" while its
+        # content was plainly returned above. ``awk END{NR}`` counts records, so
+        # it includes the final unterminated line and still yields 0 for an
+        # empty file.
+        wc_cmd = f"awk 'END{{print NR+0}}' {self._escape_shell_arg(path)}"
         wc_result = self._exec(wc_cmd)
         wc_output = _strip_terminal_fence_leaks(wc_result.stdout)
         try:

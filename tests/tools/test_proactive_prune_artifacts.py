@@ -8,6 +8,7 @@ import subprocess
 
 import pytest
 
+from tools import tool_result_storage
 from tools.tool_result_storage import (
     persist_tool_artifact,
     redact_sensitive_text,
@@ -68,8 +69,22 @@ def test_persists_redacted_verified_private_bytes(tmp_path):
     assert artifact.created is True
     assert path.stat().st_mode & 0o777 == 0o600
     assert path.parent.stat().st_mode & 0o777 == 0o700
-    assert path.parent.name == hashlib.sha256(b"task-a").hexdigest()
-    assert artifact.sha256 in path.name
+    # Path segments are digest PREFIXES -- the full sha256 lives in the
+    # artifact metadata (and the in-context stub), not in the filename, so
+    # pruned stubs stay cheap. See _ARTIFACT_* constants in tool_result_storage.
+    assert path.parent.name == hashlib.sha256(b"task-a").hexdigest()[
+        :tool_result_storage._ARTIFACT_SCOPE_HASH_CHARS
+    ]
+    assert artifact.sha256[
+        : tool_result_storage._ARTIFACT_CONTENT_DIGEST_CHARS
+    ] in path.name
+    assert artifact.sha256 not in path.name
+    # Guard the token cost directly: the stub quotes this path verbatim, so the
+    # portion we generate must stay short regardless of how long the enclosing
+    # temp dir is. Everything except the tool-call id (kept whole for
+    # provenance) is fixed overhead: scope dir + digest + nonce + extension.
+    generated = f"{path.parent.name}/{path.name}"
+    assert len(generated) - len("call-1") <= 56, generated
 
 
 def test_attempt_paths_make_rollback_concurrency_safe(tmp_path):

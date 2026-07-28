@@ -508,7 +508,7 @@ class TestShellFileOpsHelpers:
                 return {"output": "hello", "returncode": 0}
             if command.startswith("sed -n"):
                 return {"output": "hello\n", "returncode": 0}
-            if command.startswith("wc -l"):
+            if command.startswith("awk "):
                 return {"output": "1\n", "returncode": 0}
             return {"output": "", "returncode": 0}
 
@@ -520,7 +520,7 @@ class TestShellFileOpsHelpers:
         assert commands[0] == "wc -c < '/c/Users/alice/notes.txt' 2>/dev/null"
         assert commands[1] == "head -c 1000 '/c/Users/alice/notes.txt' 2>/dev/null"
         assert commands[2] == "sed -n '1,500p' '/c/Users/alice/notes.txt'"
-        assert commands[3] == "wc -l < '/c/Users/alice/notes.txt'"
+        assert commands[3] == "awk 'END{print NR+0}' '/c/Users/alice/notes.txt'"
 
     def test_is_likely_binary_by_extension(self, file_ops):
         assert file_ops._is_likely_binary("photo.png") is True
@@ -595,7 +595,7 @@ class TestShellFileOpsHelpers:
                 return {"output": "print('ok')\n", "returncode": 0}
             if command.startswith("sed -n"):
                 return {"output": leaked, "returncode": 0}
-            if command.startswith("wc -l"):
+            if command.startswith("awk "):
                 return {"output": "1\n", "returncode": 0}
             return {"output": "", "returncode": 0}
 
@@ -631,6 +631,56 @@ class TestShellFileOpsHelpers:
 
         assert result.error is None
         assert result.content == "alpha\n"
+
+
+class TestReadFileTotalLineCount:
+    """total_lines must count the final unterminated line.
+
+    ``wc -l`` counts newlines, so a file whose last line lacks a trailing
+    newline was undercounted by one -- and a single-line file with no trailing
+    newline (exactly the shape of a persisted tool artifact holding one JSON
+    object) reported ``0 total lines`` alongside its own content.
+    """
+
+    class _BashEnv:
+        """Runs commands for real so the count reflects actual shell behavior."""
+
+        def __init__(self, cwd):
+            self.cwd = str(cwd)
+
+        def execute(self, command, **kwargs):
+            proc = subprocess.run(
+                ["bash", "-c", command],
+                cwd=self.cwd,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            return {
+                "output": proc.stdout + proc.stderr,
+                "returncode": proc.returncode,
+            }
+
+    @pytest.mark.parametrize(
+        "payload,expected",
+        [
+            ("", 0),
+            ("only line, no newline", 1),
+            ('{"v":1,"path":"/tmp/x"}', 1),
+            ("a\nb", 2),
+            ("a\nb\n", 2),
+            ("a\nb\n\n", 3),
+        ],
+    )
+    def test_total_lines_counts_unterminated_final_line(self, tmp_path, payload, expected):
+        target = tmp_path / "artifact.output.txt"
+        target.write_text(payload, encoding="utf-8")
+        ops = ShellFileOperations(self._BashEnv(tmp_path))
+
+        result = ops.read_file(str(target))
+
+        assert result.error is None
+        assert result.total_lines == expected
 
 
 class TestSearchPathValidation:
