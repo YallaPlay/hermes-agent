@@ -3827,12 +3827,17 @@ class SessionDB:
         (#64709), or lose its owning profile and be aggregated as "default" every
         time it rotated or branched (the cross-profile session-jump bug). This
         only fills NULLs — an explicit value on the child is never overwritten.
-        For compression forks specifically
-        (parent ended with ``end_reason='compression'``), the gateway origin
-        columns (``user_id``/``session_key``/``chat_id``/``chat_type``/
+        ``user_id`` (owner attribution) is inherited for EVERY lineage kind,
+        including delegate/subagent children, so delegated work is attributable
+        to the person who spawned it and shows up under a strict ``ownerOnly``
+        session list. For compression forks specifically
+        (parent ended with ``end_reason='compression'``), the remaining gateway
+        origin columns (``session_key``/``chat_id``/``chat_type``/
         ``thread_id``/``display_name``/``origin_json``) are inherited too, so a
         crash before the gateway re-records the peer can't strand the child
-        without a recoverable routing mapping (#59527).
+        without a recoverable routing mapping (#59527). Those stay fork-only
+        because they are routing keys — a live-parent child must never inherit
+        them or peer recovery could repoint gateway traffic into a subagent.
         """
         def _do(conn):
             conn.execute(
@@ -3890,6 +3895,27 @@ class SessionDB:
                      WHERE id = ? AND parent_session_id IS NOT NULL""",
                     (session_id,),
                 )
+                # Owner attribution (``user_id``) inherits from the parent for
+                # EVERY lineage kind — compression forks, branches, and
+                # delegate/subagent children alike. It identifies *whose* work a
+                # row represents, and a subagent is doing its spawner's work, so
+                # leaving it NULL made delegated spend unattributable by owner
+                # (it could only be reached by walking ``parent_session_id``) and
+                # hid children from the strict ``ownerOnly`` session list, which
+                # matches ``s.user_id = ?`` and drops untagged rows. Crucially
+                # ``user_id`` is NOT a routing key: peer recovery
+                # (``find_latest_gateway_session_for_peer``) keys off
+                # ``session_key`` and returns early without it, so inheriting the
+                # owner cannot repoint gateway traffic. The routing columns below
+                # stay gated to compression forks.
+                conn.execute(
+                    """UPDATE sessions
+                       SET user_id = COALESCE(sessions.user_id,
+                                     (SELECT p.user_id FROM sessions p
+                                       WHERE p.id = sessions.parent_session_id))
+                     WHERE id = ? AND parent_session_id IS NOT NULL""",
+                    (session_id,),
+                )
                 # Belt-and-suspenders for gateway routing metadata (#59527):
                 # the gateway re-records the peer on the child after rotation
                 # (d5b4879d4), but a hard crash between child creation and that
@@ -3903,10 +3929,7 @@ class SessionDB:
                 # traffic into a subagent's session.
                 conn.execute(
                     """UPDATE sessions
-                       SET user_id = COALESCE(sessions.user_id,
-                                     (SELECT p.user_id FROM sessions p
-                                       WHERE p.id = sessions.parent_session_id)),
-                           session_key = COALESCE(sessions.session_key,
+                       SET session_key = COALESCE(sessions.session_key,
                                          (SELECT p.session_key FROM sessions p
                                            WHERE p.id = sessions.parent_session_id)),
                            chat_id = COALESCE(sessions.chat_id,
