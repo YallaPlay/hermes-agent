@@ -9,6 +9,7 @@ from agent.title_generator import (
     auto_title_session,
     maybe_auto_title,
     _title_language,
+    _looks_like_conversational_reply,
 )
 from hermes_state import SessionDB
 
@@ -310,6 +311,171 @@ class TestGenerateTitle:
             assert generate_title("question", "answer") is None
 
         mock_call_llm.assert_not_called()
+
+    def test_conversational_reply_is_not_stored_as_title(self):
+        """End-to-end: the real 2026-07-29 incident reply must yield None so the
+        session stays untitled instead of being named after a refusal."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = (
+            "I'm ready to help! However, I don't see an image attached yet. "
+            "Could you please attach the image?"
+        )
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert generate_title("look at this screenshot", "...") is None
+
+    def test_conversational_reply_is_rejected_before_truncation(self):
+        """The rejection must happen before the 80-char ellipsis truncation —
+        otherwise the junk title is merely shortened, not dropped."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = (
+            "Sure, I can help with that. " + "x" * 200
+        )
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert generate_title("q", "a") is None
+
+    def test_legitimate_title_still_returned(self):
+        """The guard must not disturb an ordinary title."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "Slack bot image attachment fix"
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert generate_title("q", "a") == "Slack bot image attachment fix"
+
+
+# The exact title stored during the 2026-07-29 incident (session
+# 8987e113-810c-4557-8d9f-7b1aebf3ea05) before truncation.
+_INCIDENT_REPLY = (
+    "I'm ready to help! However, I don't see an image attached yet. "
+    "Could you please attach the image?"
+)
+
+
+class TestLooksLikeConversationalReply:
+    """Unit tests for the _looks_like_conversational_reply() predicate."""
+
+    def test_rejects_the_real_incident_string(self):
+        assert _looks_like_conversational_reply(_INCIDENT_REPLY) is True
+
+    def test_rejects_the_incident_string_as_truncated_and_stored(self):
+        """The stored form was truncated to 80 chars + ellipsis; the predicate
+        runs before truncation, but the truncated text must also be caught in
+        case the order ever changes."""
+        stored = _INCIDENT_REPLY[:77] + "..."
+        assert _looks_like_conversational_reply(stored) is True
+
+    @pytest.mark.parametrize(
+        "candidate",
+        [
+            # first-person / assistant-voice openers
+            "I'm ready to help with that",
+            "I’m ready to help with that",  # curly apostrophe
+            "I don't see an image attached",
+            "I do not have access to that file",
+            "I can help you with the deploy",
+            "I'll take a look at the logs",
+            "I need more information about the schema",
+            "I'd be happy to help",
+            "I apologize for the confusion",
+            # willingness / acknowledgement
+            "Sure, here is the config",
+            "Certainly! Let's look at the data",
+            "Of course, I can do that",
+            "Happy to help with the migration",
+            "Let me check the warehouse for you",
+            "No problem, that is easy",
+            "Thank you for the clarification",
+            # model voice
+            "As an AI, I cannot browse the web",
+            "As a language model I lack that ability",
+            # hedges / presentation
+            "It looks like the config is missing",
+            "It seems the job never ran",
+            "Here's a summary of the changes",
+            "Here is the breakdown you asked for",
+            "Here are the top three offenders",
+            # requests back to the user
+            "Could you clarify which environment",
+            "Can you share the stack trace",
+            "Please provide the session id",
+            "Please attach the screenshot",
+            # apology / refusal in conversational form
+            "Unfortunately I cannot read that file",
+            "Sorry, I can't access the database",
+            "My apologies for the delay",
+        ],
+    )
+    def test_rejects_conversational_openers(self, candidate):
+        assert _looks_like_conversational_reply(candidate) is True
+
+    @pytest.mark.parametrize(
+        "candidate",
+        [
+            "What did you want to analyze?",
+            "Which warehouse should I query?",
+            "Snowflake cost analysis for July?",
+        ],
+    )
+    def test_rejects_trailing_question_mark(self, candidate):
+        assert _looks_like_conversational_reply(candidate) is True
+
+    def test_rejects_refusal_marker_plus_assistant_voice(self):
+        """A reply that opens with a noun phrase but still speaks in the
+        assistant's voice about a refusal."""
+        assert _looks_like_conversational_reply(
+            "Unable to proceed because I don't see the attachment"
+        ) is True
+
+    def test_rejects_long_sentence_addressing_the_user(self):
+        assert _looks_like_conversational_reply(
+            "The file you uploaded appears to be empty so nothing was analyzed."
+        ) is True
+
+    @pytest.mark.parametrize(
+        "candidate",
+        [
+            # the three mandated survival examples
+            "Cannot connect to Snowflake warehouse",
+            "Fix I/O timeout in ranking service",
+            "Sorry state of the deals config",
+            # ordinary titles
+            "Slack bot image attachment fix",
+            "Snowflake cost analysis for July",
+            "Debugging Python Import Errors",
+            "Kubernetes Pod Debugging",
+            "Setting Up Docker Environment",
+            "Session title generator refusal guard",
+            "macOS Disk Cleanup",
+            "Weather Forecast Lookup",
+            "Missions analytics rewrite",
+            # keyword-bearing but legitimate
+            "Unable-to-pay webhook retry logic",
+            "Sorry-state audit of the offer ladder",
+            "Can't-repro flake in matchmaking tests",
+            "ID mapping for player accounts",
+            "Ill-formed JSON in config loader",
+            "Season Pass reward collection review",
+            "AI agent tool-choice quality metrics",
+            "Here-document parsing in shell tool",
+            # non-English titles (must survive — prompt allows user's language)
+            "Snowflakeのコスト分析",
+            "Analyse des coûts Snowflake",
+            "تحليل تكاليف Snowflake",
+            # long but phrase-like, no terminal punctuation
+            "Investigating the intermittent websocket disconnects in the realtime channel",
+        ],
+    )
+    def test_accepts_legitimate_titles(self, candidate):
+        assert _looks_like_conversational_reply(candidate) is False
+
+    def test_empty_and_whitespace_are_not_conversational(self):
+        """Emptiness is handled by the caller's falsy check, not here."""
+        assert _looks_like_conversational_reply("") is False
+        assert _looks_like_conversational_reply("   ") is False
 
 
 class TestAutoTitleSession:

@@ -5,6 +5,7 @@ adds latency to the user-facing reply.
 """
 
 import logging
+import re
 import threading
 from typing import Callable, Optional
 
@@ -70,6 +71,164 @@ def _auto_title_enabled() -> bool:
     except Exception:
         logger.debug("Failed to read title_generation.enabled", exc_info=True)
         return True
+
+
+# --- Conversational-reply rejection -----------------------------------------
+#
+# The titler asks an auxiliary model for ONLY a title, but the model sometimes
+# ANSWERS the exchange instead. The canonical failure (2026-07-29) is a titler
+# fed text-only input for a turn that carried an image attachment: the model
+# replied "I'm ready to help! However, I don't see an image attached yet. Could
+# you please attach the image?" and that reply was truncated to 80 chars and
+# stored as the session title.
+#
+# TRADEOFF: legitimate titles are short noun phrases, so the patterns below are
+# anchored at the START of the candidate and are word-boundary aware. Matching a
+# bare keyword anywhere in the string would destroy real titles — "Cannot
+# connect to Snowflake warehouse", "Fix I/O timeout in ranking service" and
+# "Sorry state of the deals config" all contain "refusal" keywords yet are
+# perfectly good titles. We accept that a conversational reply which happens to
+# open with a noun phrase slips through (the first-line rule above still bounds
+# the damage) in exchange for near-zero false positives on real titles.
+
+# Assistant-voice / conversational openers. Anchored at the start of the
+# candidate via _CONVERSATIONAL_OPENER_RE below.
+#
+# NOTE on apostrophes: models emit both straight (') and curly (’) forms, so
+# every contraction accepts either. The "I" contractions REQUIRE the apostrophe
+# — a bare `i'?d\b` / `i'?ll\b` would also match the acronyms "ID" and "ILL",
+# killing legitimate titles like "ID mapping for players".
+_APOS = r"['\u2019]"
+_CONVERSATIONAL_OPENERS = (
+    # first person (apostrophe mandatory — see NOTE above)
+    rf"i{_APOS}m\b",  # I'm ready / I'm sorry / I'm unable to
+    rf"i{_APOS}ll\b",
+    rf"i{_APOS}ve\b",
+    rf"i{_APOS}d\b",
+    r"i am\b",
+    r"i will\b",
+    r"i would\b",
+    rf"i don{_APOS}?t\b",
+    r"i do not\b",
+    r"i can\b",
+    rf"i can{_APOS}?t\b",
+    r"i cannot\b",
+    r"i could\b",
+    r"i need\b",
+    r"i see\b",
+    r"i have\b",
+    r"i notice\b",
+    r"i apologize\b",
+    r"i understand\b",
+    rf"we{_APOS}?ll need\b",
+    # willingness / acknowledgement
+    r"sure\b\s*[,.!:]",
+    r"certainly\b",
+    r"of course\b",
+    r"absolutely\b\s*[,.!:]",
+    r"happy to\b",
+    r"glad to\b",
+    r"let me\b",
+    r"got it\b\s*[,.!:]",
+    r"understood\b\s*[,.!:]",
+    r"no problem\b",
+    r"okay\b\s*[,.!:]",
+    r"ok\b\s*[,.!:]",
+    r"thanks\b\s*[,.!:]",
+    r"thank you\b",
+    # meta / model voice
+    r"as an ai\b",
+    r"as a language model\b",
+    # hedges and presentation
+    r"it looks like\b",
+    r"it seems\b",
+    r"it appears\b",
+    rf"here{_APOS}s\b",
+    r"here is\b",
+    r"here are\b",
+    rf"there{_APOS}?s no\b",
+    # requests back to the user
+    r"could you\b",
+    r"can you\b",
+    r"would you\b",
+    r"please provide\b",
+    r"please share\b",
+    r"please attach\b",
+    r"please let me\b",
+    r"please clarify\b",
+    # apology / refusal, only in unmistakably conversational form
+    r"unfortunately\b",
+    r"apologies\b",
+    r"my apologies\b",
+    r"sorry\b\s*[,.!:]",  # "Sorry, ..." — NOT "Sorry state of the deals config"
+)
+
+_CONVERSATIONAL_OPENER_RE = re.compile(
+    r"^\W*(?:" + "|".join(_CONVERSATIONAL_OPENERS) + r")",
+    re.IGNORECASE,
+)
+
+# Refusal markers that only condemn the candidate when it ALSO speaks in the
+# assistant's first-person voice somewhere. This catches replies that open with
+# a noun phrase ("Unable to proceed — I don't see an attachment") without
+# rejecting "Cannot connect to Snowflake warehouse".
+_REFUSAL_MARKER_RE = re.compile(
+    rf"\b(?:sorry|cannot|can{_APOS}?t|unable to|not able to|don{_APOS}?t have access)\b",
+    re.IGNORECASE,
+)
+
+_ASSISTANT_VOICE_RE = re.compile(
+    rf"\b(?:i{_APOS}m|i am|i{_APOS}ll|i{_APOS}ve|i{_APOS}d|i will|i would|"
+    rf"i don{_APOS}?t|i do not|i can|i can{_APOS}?t|i cannot|i need|i see|"
+    r"i have|as an ai)\b",
+    re.IGNORECASE,
+)
+
+# A title is a phrase, not prose. Prose that is long AND sentence-punctuated AND
+# addresses the user is conversational; none of those signals rejects on its own.
+_SENTENCE_LENGTH_SUSPICION = 60
+_ADDRESSES_USER_RE = re.compile(r"\b(?:you|your|you'?re|we|us)\b", re.IGNORECASE)
+
+
+def _looks_like_conversational_reply(title: str) -> bool:
+    """Return True when a candidate title is really a conversational reply.
+
+    Applied to the cleaned candidate inside :func:`generate_title` so a model
+    that answers the prompt (or refuses it, or asks a clarifying question)
+    leaves the session untitled instead of storing its reply as the title.
+
+    Conservative by construction — see the module comment above for the
+    false-positive tradeoff.
+    """
+    if not title:
+        return False
+    candidate = title.strip()
+    if not candidate:
+        return False
+
+    # 1. Assistant-voice / conversational opener at the START of the candidate.
+    if _CONVERSATIONAL_OPENER_RE.match(candidate):
+        return True
+
+    # 2. A title never asks a question.
+    if candidate.rstrip().endswith("?"):
+        return True
+
+    # 3. Refusal marker + first-person assistant voice anywhere.
+    if _REFUSAL_MARKER_RE.search(candidate) and _ASSISTANT_VOICE_RE.search(candidate):
+        return True
+
+    # 4. Long, sentence-punctuated prose that addresses the user. All three
+    #    signals are required together: "Snowflake cost analysis for July." is
+    #    fine, and so is a long noun phrase without terminal punctuation.
+    if (
+        len(candidate) > _SENTENCE_LENGTH_SUSPICION
+        and candidate.endswith((".", "!"))
+        and _ADDRESSES_USER_RE.search(candidate)
+    ):
+        return True
+
+    return False
 
 
 def _summarize_user_message(user_message: str) -> str:
@@ -170,6 +329,15 @@ def generate_title(
         # otherwise be stored verbatim and truncated mid-command. Keep the first
         # non-empty line — the closest thing to a title in that response.
         title = next((line.strip() for line in title.splitlines() if line.strip()), "")
+        # A single-line conversational reply survives the first-line rule above
+        # ("I'm ready to help! However, I don't see an image attached yet...")
+        # and would then be truncated to 80 chars and stored verbatim. Reject it
+        # so the session stays untitled and the caller's fallback applies.
+        if _looks_like_conversational_reply(title):
+            logger.debug(
+                "Rejecting conversational reply as session title: %r", title
+            )
+            return None
         # Enforce reasonable length
         if len(title) > 80:
             title = title[:77] + "..."
