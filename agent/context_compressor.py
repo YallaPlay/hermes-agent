@@ -2872,14 +2872,44 @@ class ContextCompressor(ContextEngine):
                 if not rollback():
                     logger.warning("Could not clean rejected proactive-prune artifacts")
                 return messages, 0, (), None
+            stub = _build_tool_result_artifact_stub(
+                artifact,
+                tool_name=tool_name,
+                tool_call_id=call_id,
+            )
+            # The stub embeds the absolute sandbox path TWICE (``path`` plus the
+            # ``read`` hint) alongside a SHA-256, giving it a floor of several
+            # hundred chars that grows with the sandbox root's depth. Since
+            # ``proactive_prune_min_result_chars`` clamps to 200, a floor tuned
+            # below the stub size would rewrite short results into LONGER
+            # references and grow the transcript — the exact opposite of
+            # pruning. Enforce the invariant here rather than trusting the
+            # eligibility floor: never replace content with a longer reference.
+            #
+            # A non-beneficial rewrite is an intentional no-op, NOT a
+            # persistence failure: the write itself succeeded. So drop only
+            # this artifact and keep going — aborting would discard every other
+            # successful rewrite in the same batch over one unlucky message.
+            if len(stub) >= len(content):
+                if artifact.created and not remove_created_tool_artifact(artifact, env):
+                    logger.warning(
+                        "Could not clean skipped proactive-prune artifact tool=%s call=%s",
+                        tool_name,
+                        call_id,
+                    )
+                logger.debug(
+                    "Proactive prune skipped tool=%s call=%s reason=stub_not_smaller "
+                    "stub_chars=%d content_chars=%d",
+                    tool_name,
+                    call_id,
+                    len(stub),
+                    len(content),
+                )
+                continue
             artifacts.append(artifact)
             result[index] = {
                 **result[index],
-                "content": _build_tool_result_artifact_stub(
-                    artifact,
-                    tool_name=tool_name,
-                    tool_call_id=call_id,
-                ),
+                "content": stub,
             }
 
         return result, len(artifacts), tuple(artifacts), env

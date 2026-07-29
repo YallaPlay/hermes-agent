@@ -377,3 +377,88 @@ def test_loop_passes_task_scope_only_to_capable_builtin():
     assert builtin.kwargs == {"current_tokens": 123, "task_id": "effective-task"}
     assert plugin.kwargs == {"current_tokens": 123}
     assert stale_subclass.current_tokens == 123
+
+
+def test_proactive_artifact_skips_results_smaller_than_their_stub(tmp_path):
+    """A result the reference stub would not shrink stays verbatim.
+
+    The artifact stub carries two copies of an absolute sandbox path (``path``
+    plus the ``read`` hint) alongside a SHA-256, so it has a ~500 char floor.
+    ``proactive_prune_min_result_chars`` clamps to 200, so any operator who
+    tunes the floor below the stub size opens a window where rewriting a tool
+    result makes the transcript BIGGER — the opposite of pruning. Guard the
+    invariant directly: never replace content with a longer reference.
+    """
+    env = LocalArtifactEnv(tmp_path)
+    # Comfortably above the 200-char eligibility floor, comfortably below the
+    # stub's own length. Sized relative to a real stub so the test cannot rot
+    # if the stub layout shrinks further.
+    small_output = "s" * 260
+    messages = _messages(output=small_output)
+
+    with patch("tools.terminal_tool.get_active_env", return_value=env):
+        result, count = _compressor().prune_tool_results_only(
+            messages,
+            current_tokens=10_000,
+            task_id="task-scope-small",
+        )
+
+    # Nothing was rewritten, so the no-op contract hands back the INPUT object.
+    assert count == 0
+    assert result is messages
+    assert result[2]["content"] == small_output
+    # The rejected artifact must not be left behind on disk.
+    assert list(tmp_path.rglob("*.output.txt")) == []
+
+
+def test_proactive_artifact_prunes_large_and_skips_small_in_one_pass(tmp_path):
+    """One non-beneficial result must not abort the whole pass.
+
+    Regression guard for the "one bad apple" shape: a skipped item is an
+    intentional no-op, not a persistence failure, so every other eligible
+    result in the same batch must still be pruned.
+    """
+    env = LocalArtifactEnv(tmp_path)
+    big_output = "b" * 20_000
+    small_output = "s" * 260
+    messages = [
+        {"role": "system", "content": "system"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call-big",
+                "type": "function",
+                "function": {"name": "terminal", "arguments": "{}"},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "call-big", "content": big_output},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call-small",
+                "type": "function",
+                "function": {"name": "terminal", "arguments": "{}"},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "call-small", "content": small_output},
+        {"role": "user", "content": "recent"},
+        {"role": "assistant", "content": "done"},
+    ]
+
+    with patch("tools.terminal_tool.get_active_env", return_value=env):
+        result, count = _compressor().prune_tool_results_only(
+            messages,
+            current_tokens=10_000,
+            task_id="task-scope-mixed",
+        )
+
+    assert count == 1
+    assert result is not messages
+    # Large result pruned to a reference stub...
+    assert result[2]["content"].startswith(ARTIFACT_RESULT_TAG)
+    # ...small result kept verbatim.
+    assert result[4]["content"] == small_output
+    # Exactly one artifact survives on disk (the skipped one was cleaned up).
+    assert len(list(tmp_path.rglob("*.output.txt"))) == 1
