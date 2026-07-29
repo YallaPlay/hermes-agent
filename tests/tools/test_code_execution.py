@@ -140,6 +140,68 @@ class TestHermesToolsGeneration(unittest.TestCase):
         self.assertIn("with _seq_lock:", src)
 
 
+class TestGeneratedToolResultParsing(unittest.TestCase):
+    """Regression: tool payloads with a trailing human-readable hint.
+
+    Several tools (search_files when results are truncated, notably) emit a
+    JSON object followed by a blank line and a "[Hint: ...]" string. A strict
+    json.loads() on that raises JSONDecodeError("Extra data"), which used to
+    surface inside execute_code as a spurious parse failure even though the
+    underlying tool call succeeded.
+    """
+
+    def _parser_for(self, transport):
+        src = generate_hermes_tools_module(["search_files"], transport=transport)
+        ns = {}
+        exec(compile(src, "hermes_tools", "exec"), ns)
+        self.assertIn("_parse_tool_result", ns)
+        return ns["_parse_tool_result"]
+
+    def test_both_transports_define_the_parser(self):
+        for transport in ("uds", "file"):
+            src = generate_hermes_tools_module(["search_files"], transport=transport)
+            self.assertIn("def _parse_tool_result(raw):", src)
+            # Neither transport should hand the raw payload to a strict loads().
+            self.assertNotIn("result = json.loads(raw)", src)
+
+    def test_plain_json_object_roundtrips(self):
+        for transport in ("uds", "file"):
+            parse = self._parser_for(transport)
+            result = parse(json.dumps({"total_count": 2, "matches_text": "a\nb"}))
+            self.assertEqual(result["total_count"], 2)
+            self.assertNotIn("_hint", result)
+
+    def test_trailing_hint_is_preserved_not_raised(self):
+        hint = "[Hint: Results truncated. Use offset=50 to see more.]"
+        payload = json.dumps({"total_count": 50, "truncated": True}) + "\n\n" + hint
+        for transport in ("uds", "file"):
+            parse = self._parser_for(transport)
+            result = parse(payload)
+            self.assertEqual(result["total_count"], 50)
+            self.assertTrue(result["truncated"])
+            self.assertEqual(result["_hint"], hint)
+
+    def test_existing_hint_key_is_not_clobbered(self):
+        payload = json.dumps({"ok": True, "_hint": "from tool"}) + "\n\ntrailing"
+        parse = self._parser_for("uds")
+        self.assertEqual(parse(payload)["_hint"], "from tool")
+
+    def test_double_encoded_payload_still_unwraps(self):
+        payload = json.dumps(json.dumps({"output": "hi", "exit_code": 0}))
+        parse = self._parser_for("file")
+        self.assertEqual(parse(payload)["output"], "hi")
+
+    def test_non_json_trailing_on_json_list_does_not_raise(self):
+        payload = "[1, 2, 3]\n\n[Hint: more]"
+        parse = self._parser_for("uds")
+        self.assertEqual(parse(payload), [1, 2, 3])
+
+    def test_truly_malformed_payload_still_raises(self):
+        parse = self._parser_for("uds")
+        with self.assertRaises(json.JSONDecodeError):
+            parse("not json at all")
+
+
 class TestExecuteCodeRemoteTempDir(unittest.TestCase):
     def test_execute_remote_uses_backend_temp_dir_for_sandbox(self):
         class FakeEnv:

@@ -416,6 +416,35 @@ def retry(fn, max_attempts=3, delay=2):
                 time.sleep(delay * (2 ** attempt))
     raise last_err
 
+
+def _parse_tool_result(raw):
+    """Parse an RPC tool-result payload into Python data.
+
+    Some Hermes tools append a human-readable hint AFTER the JSON payload --
+    e.g. search_files emits a JSON object, a blank line, then
+    "[Hint: Results truncated. Use offset=50 ...]" whenever results were
+    truncated. A strict json.loads() raises JSONDecodeError("Extra data") on
+    those, which used to surface inside execute_code as a spurious parse
+    failure even though the tool call itself succeeded. Decode the first JSON
+    value and keep any trailing text under the "_hint" key so nothing is lost.
+    """
+    text = raw.strip() if isinstance(raw, str) else raw
+    trailing = ""
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError:
+        result, end = json.JSONDecoder().raw_decode(text)
+        trailing = text[end:].strip()
+    if isinstance(result, str):
+        # Doubly-encoded payload: the outer JSON value is itself a JSON string.
+        try:
+            return _parse_tool_result(result)
+        except (json.JSONDecodeError, TypeError):
+            return result
+    if trailing and isinstance(result, dict) and "_hint" not in result:
+        result["_hint"] = trailing
+    return result
+
 '''
 
 # ---- UDS transport (local backend) ---------------------------------------
@@ -476,13 +505,7 @@ def _call(tool_name, args):
             if buf.endswith(b"\\n"):
                 break
     raw = buf.decode().strip()
-    result = json.loads(raw)
-    if isinstance(result, str):
-        try:
-            return json.loads(result)
-        except (json.JSONDecodeError, TypeError):
-            return result
-    return result
+    return _parse_tool_result(raw)
 
 '''
 
@@ -542,12 +565,7 @@ def _call(tool_name, args):
     except OSError:
         pass
 
-    result = json.loads(raw)
-    if isinstance(result, str):
-        try:
-            return json.loads(result)
-        except (json.JSONDecodeError, TypeError):
-            return result
+    result = _parse_tool_result(raw)
     return result
 
 '''
