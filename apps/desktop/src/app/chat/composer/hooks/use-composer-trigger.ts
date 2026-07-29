@@ -53,6 +53,11 @@ export function useComposerTrigger({
 }: UseComposerTriggerOptions) {
   const [trigger, setTrigger] = useState<TriggerState | null>(null)
   const [triggerActive, setTriggerActive] = useState(0)
+  // The list highlights its first row on open, which is a suggestion rather
+  // than a choice. This records that the user moved the highlight themselves,
+  // which is what lets Enter accept a completion in a free-text argument stage
+  // without stealing prose from everyone who never touched the arrows.
+  const [triggerActiveExplicit, setTriggerActiveExplicit] = useState(false)
   const [triggerItems, setTriggerItems] = useState<readonly Unstable_TriggerItem[]>([])
   // Set synchronously in keydown when the open trigger popover consumes a
   // navigation/control key (Arrow/Enter/Tab/Escape). The subsequent keyup must
@@ -62,6 +67,11 @@ export function useComposerTrigger({
   // used instead of reading `trigger` in keyup because by keyup time React has
   // re-rendered and the handler closure sees the post-keydown state.
   const triggerKeyConsumedRef = useRef(false)
+
+  const resetTriggerActive = useCallback(() => {
+    setTriggerActive(0)
+    setTriggerActiveExplicit(false)
+  }, [])
 
   const refreshTrigger = useCallback(() => {
     const editor = editorRef.current
@@ -80,7 +90,7 @@ export function useComposerTrigger({
     if (!rawText.includes('@') && !rawText.includes('/')) {
       if (trigger) {
         setTrigger(null)
-        setTriggerActive(0)
+        resetTriggerActive()
       }
 
       return
@@ -109,9 +119,9 @@ export function useComposerTrigger({
     // caret move (mouseup) or a stray refresh — must preserve the user's
     // current selection instead of snapping back to the first item.
     if (detected?.kind !== trigger?.kind || detected?.query !== trigger?.query) {
-      setTriggerActive(0)
+      resetTriggerActive()
     }
-  }, [editorRef, trigger])
+  }, [editorRef, resetTriggerActive, trigger])
 
   const triggerAdapter: Unstable_TriggerAdapter | null =
     trigger?.kind === '@' ? at.adapter : trigger?.kind === '/' ? slash.adapter : null
@@ -139,15 +149,23 @@ export function useComposerTrigger({
   // Space/Tab — neither should dead-end on a popover.
   const argStageEmpty = trigger?.kind === '/' && slashArgStage(trigger.query) && !triggerLoading && !triggerItems.length
 
-  const slashFreeTextArgStage =
-    trigger?.kind === '/' &&
-    slashArgStage(trigger.query) &&
-    ['mixed', 'text'].includes(desktopSlashCommandArgumentMode(slashCommandToken(trigger.query)) ?? '')
+  const slashArgumentMode =
+    trigger?.kind === '/' && slashArgStage(trigger.query)
+      ? desktopSlashCommandArgumentMode(slashCommandToken(trigger.query))
+      : null
+
+  const slashFreeTextArgStage = slashArgumentMode === 'mixed' || slashArgumentMode === 'text'
 
   const closeTrigger = () => {
     setTrigger(null)
     setTriggerItems([])
-    setTriggerActive(0)
+    resetTriggerActive()
+  }
+
+  /** Step the highlight, marking it as the user's own deliberate pick. */
+  const moveTriggerActive = (delta: number) => {
+    setTriggerActiveExplicit(true)
+    setTriggerActive(idx => (idx + delta + triggerItems.length) % triggerItems.length)
   }
 
   useEffect(() => {
@@ -189,7 +207,7 @@ export function useComposerTrigger({
     return true
   }
 
-  const replaceTriggerWithChip = (item: Unstable_TriggerItem) => {
+  const replaceTriggerWithChip = (item: Unstable_TriggerItem, options?: { descend?: boolean }) => {
     const editor = editorRef.current
 
     if (!editor || !trigger) {
@@ -218,6 +236,31 @@ export function useComposerTrigger({
 
     const serialized = hermesDirectiveFormatter.serialize(item)
     const starter = serialized.endsWith(':')
+
+    // Tab on a folder walks INTO it instead of committing it: re-type the
+    // token as the bare path so the next `complete.path` lists that folder's
+    // children, exactly as typing the path by hand would. Enter still commits
+    // the folder itself — the two intents are distinct, so the keys are too.
+    // Only `@` folders descend; a slash command's arg list has no hierarchy.
+    const descendInto =
+      options?.descend && trigger.kind === '@' && item.type === 'folder'
+        ? String((item.metadata as { insertId?: unknown } | undefined)?.insertId ?? '')
+        : ''
+
+    if (descendInto) {
+      const path = descendInto.endsWith('/') ? descendInto : `${descendInto}/`
+      const current = composerPlainText(editor)
+      const prefix = current.slice(0, Math.max(0, current.length - trigger.tokenLength))
+
+      renderComposerContents(editor, `${prefix}@${path}`)
+      placeCaretEnd(editor)
+      draftRef.current = composerPlainText(editor)
+      setComposerText(draftRef.current)
+      requestMainFocus()
+      window.setTimeout(refreshTrigger, 0)
+
+      return
+    }
 
     // Picking a bare arg-taking command (e.g. `/personality`) shouldn't commit
     // it — expand to its options step so the popover shows the inline list, just
@@ -300,16 +343,47 @@ export function useComposerTrigger({
     finish()
   }
 
+  /** Backspace inside an `@` path drops the last segment (`a/b/` → `a/`)
+   *  instead of one character. Descending is one Tab per level, so climbing
+   *  back out should cost one key too rather than a held delete. Returns
+   *  false when the caret isn't in a path, so keydown falls through. */
+  const ascendTriggerPath = () => {
+    const editor = editorRef.current
+
+    if (!editor || trigger?.kind !== '@' || !trigger.query.includes('/')) {
+      return false
+    }
+
+    // Trailing slash means we're listing a folder's children: drop that
+    // folder. Otherwise a partial segment is typed — drop just that.
+    const trimmed = trigger.query.replace(/\/$/, '')
+    const parent = trimmed.slice(0, trimmed.lastIndexOf('/') + 1)
+
+    const current = composerPlainText(editor)
+    const prefix = current.slice(0, Math.max(0, current.length - trigger.tokenLength))
+
+    renderComposerContents(editor, `${prefix}@${parent}`)
+    placeCaretEnd(editor)
+    draftRef.current = composerPlainText(editor)
+    setComposerText(draftRef.current)
+    window.setTimeout(refreshTrigger, 0)
+
+    return true
+  }
+
   return {
     argStageEmpty,
+    ascendTriggerPath,
     closeTrigger,
     commitTypedSlashDirective,
+    moveTriggerActive,
     refreshTrigger,
     replaceTriggerWithChip,
     setTriggerActive,
     slashFreeTextArgStage,
     trigger,
     triggerActive,
+    triggerActiveExplicit,
     triggerItems,
     triggerKeyConsumedRef,
     triggerLoading
