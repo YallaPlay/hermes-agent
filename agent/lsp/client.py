@@ -79,6 +79,13 @@ INITIALIZE_TIMEOUT = 45.0
 DIAGNOSTICS_DOCUMENT_WAIT = 5.0
 DIAGNOSTICS_FULL_WAIT = 10.0
 DIAGNOSTICS_REQUEST_TIMEOUT = 3.0
+
+# Navigation (definition/references/symbol) budget.  Deliberately larger
+# than the diagnostics budget: whole-project servers (Roslyn, jdtls) load
+# the solution lazily, so the FIRST navigation request in a session pays
+# the load cost.  Measured on a real multi-project C# solution: ~11-16s
+# cold, ~1s warm.
+NAVIGATION_REQUEST_TIMEOUT = 60.0
 PUSH_DEBOUNCE = 0.15
 SHUTDOWN_GRACE = 1.0  # seconds between SIGTERM and SIGKILL
 
@@ -978,6 +985,99 @@ class LSPClient:
             )
         return _dedupe(doc.push, doc.pull)
 
+    # ------------------------------------------------------------------
+    # navigation (definition / references / symbols)
+    # ------------------------------------------------------------------
+
+    def supports(self, capability: str) -> Optional[bool]:
+        """Return the server's advertised value for a capability key.
+
+        ``None`` means the server did not advertise it.  Callers must
+        treat that as *unknown*, NOT as unsupported: several servers
+        (csharp-ls among them) answer navigation requests correctly
+        while advertising nothing in their initialize result.  Probe
+        by sending the request and handling ``MethodNotFound`` instead.
+        """
+        caps = (self._initialize_result or {}).get("capabilities") or {}
+        val = caps.get(capability)
+        if isinstance(val, dict):
+            return True
+        return val if isinstance(val, bool) else None
+
+    async def _navigate(
+        self,
+        method: str,
+        params: Dict[str, Any],
+        *,
+        timeout: float = NAVIGATION_REQUEST_TIMEOUT,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Send a navigation request, normalizing the reply to a list.
+
+        Returns ``None`` when the server reports the method as
+        unsupported (``MethodNotFound``), so callers can fall back to
+        text search rather than reporting "no results" — an empty list
+        and an unimplemented method must not be conflated.
+
+        Other request errors propagate; transport/timeout failures are
+        the caller's problem to bound.
+        """
+        try:
+            result = await self._send_request_with_retry(method, params, timeout=timeout)
+        except LSPRequestError as e:
+            if e.code == ERROR_METHOD_NOT_FOUND:
+                return None
+            raise
+        if result is None:
+            return []
+        if isinstance(result, dict):
+            # A single Location, or a LocationLink list collapsed to one.
+            return [result]
+        if isinstance(result, list):
+            return [r for r in result if isinstance(r, dict)]
+        return []
+
+    async def definition(self, path: str, line: int, character: int) -> Optional[List[Dict[str, Any]]]:
+        """Resolve the definition site(s) of the symbol at a position.
+
+        ``line``/``character`` are 0-based, per the LSP spec.
+        """
+        return await self._navigate(
+            "textDocument/definition",
+            {
+                "textDocument": {"uri": file_uri(os.path.abspath(path))},
+                "position": {"line": line, "character": character},
+            },
+        )
+
+    async def references(
+        self,
+        path: str,
+        line: int,
+        character: int,
+        *,
+        include_declaration: bool = False,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Find reference sites of the symbol at a position."""
+        return await self._navigate(
+            "textDocument/references",
+            {
+                "textDocument": {"uri": file_uri(os.path.abspath(path))},
+                "position": {"line": line, "character": character},
+                "context": {"includeDeclaration": include_declaration},
+            },
+        )
+
+    async def document_symbols(self, path: str) -> Optional[List[Dict[str, Any]]]:
+        """Return the symbol outline for one file."""
+        return await self._navigate(
+            "textDocument/documentSymbol",
+            {"textDocument": {"uri": file_uri(os.path.abspath(path))}},
+        )
+
+    async def workspace_symbols(self, query: str) -> Optional[List[Dict[str, Any]]]:
+        """Search the whole project for symbols matching ``query``."""
+        return await self._navigate("workspace/symbol", {"query": query})
+
 
 def _dedupe(*lists: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen: Set[str] = set()
@@ -1024,6 +1124,7 @@ __all__ = [
     "file_uri",
     "uri_to_path",
     "INITIALIZE_TIMEOUT",
+    "NAVIGATION_REQUEST_TIMEOUT",
     "DIAGNOSTICS_DOCUMENT_WAIT",
     "DIAGNOSTICS_FULL_WAIT",
 ]

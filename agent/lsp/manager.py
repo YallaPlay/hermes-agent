@@ -532,6 +532,181 @@ class LSPService:
             return []
         return list(client.diagnostics_for(file_path, fresh_only=True))
 
+    # ------------------------------------------------------------------
+    # navigation
+    # ------------------------------------------------------------------
+
+    def navigate_sync(
+        self,
+        kind: str,
+        *,
+        file_path: Optional[str] = None,
+        line: Optional[int] = None,
+        character: Optional[int] = None,
+        query: Optional[str] = None,
+        extra_roots: Optional[List[str]] = None,
+        timeout: float = 90.0,
+    ) -> Dict[str, Any]:
+        """Synchronous navigation entry point for tools.
+
+        Mirrors :meth:`get_diagnostics_sync`: blocks on the background
+        loop, reuses any already-spawned client for the resolved root,
+        and never raises — failures come back as ``{"error": ...}`` so a
+        caller can fall back to text search.
+
+        ``kind`` is one of ``definition``, ``references``,
+        ``document_symbols``, ``workspace_symbols``.
+
+        ``extra_roots`` lets a caller widen a ``workspace_symbols``
+        search across sibling projects: a monorepo often resolves to
+        several per-server roots (one per solution), and a query rooted
+        in one of them cannot see symbols in the others.
+        """
+        if not self._enabled:
+            return {"error": "lsp disabled"}
+        try:
+            return self._loop.run(
+                self._navigate_async(
+                    kind,
+                    file_path=file_path,
+                    line=line,
+                    character=character,
+                    query=query,
+                    extra_roots=extra_roots,
+                ),
+                timeout=timeout,
+            )
+        except Exception as e:  # noqa: BLE001
+            return {"error": f"{type(e).__name__}: {e}"}
+
+    async def _navigate_async(
+        self,
+        kind: str,
+        *,
+        file_path: Optional[str],
+        line: Optional[int],
+        character: Optional[int],
+        query: Optional[str],
+        extra_roots: Optional[List[str]],
+    ) -> Dict[str, Any]:
+        if kind == "workspace_symbols":
+            return await self._workspace_symbols_async(query or "", extra_roots)
+
+        if not file_path:
+            return {"error": f"{kind} requires file_path"}
+        client = await self._get_or_spawn(file_path)
+        if client is None:
+            return {"error": "no language server for this file (or project root gated off)"}
+
+        try:
+            await client.open_file(file_path, language_id=language_id_for(file_path))
+        except Exception as e:  # noqa: BLE001
+            return {"error": f"could not open file: {e}"}
+        self._last_used[(client.server_id, client.workspace_root)] = time.time()
+
+        if kind == "document_symbols":
+            res = await client.document_symbols(file_path)
+        elif kind in ("definition", "references"):
+            if line is None or character is None:
+                return {"error": f"{kind} requires line and character"}
+            if kind == "definition":
+                res = await client.definition(file_path, line, character)
+            else:
+                res = await client.references(file_path, line, character)
+        else:
+            return {"error": f"unknown navigation kind: {kind!r}"}
+
+        if res is None:
+            return {
+                "error": f"server {client.server_id!r} does not implement {kind}",
+                "unsupported": True,
+            }
+        return {
+            "server_id": client.server_id,
+            "root": client.workspace_root,
+            "results": res,
+        }
+
+    async def _workspace_symbols_async(
+        self, query: str, extra_roots: Optional[List[str]]
+    ) -> Dict[str, Any]:
+        """Fan a symbol query across every requested per-server root.
+
+        Results are merged and deduped by (uri, start line, name), since
+        the same symbol can legitimately surface from two roots that
+        share a source directory.
+        """
+        if not query:
+            return {"error": "workspace_symbols requires a query"}
+
+        roots: List[str] = []
+        for cand in extra_roots or []:
+            probe = self._probe_file_for_root(cand)
+            if probe is not None:
+                roots.append(probe)
+        if not roots:
+            return {"error": "workspace_symbols requires extra_roots (a path per project)"}
+
+        merged: List[Dict[str, Any]] = []
+        seen = set()
+        errors: List[str] = []
+        used_roots: List[str] = []
+        for probe in roots:
+            client = await self._get_or_spawn(probe)
+            if client is None:
+                errors.append(f"{probe}: no server / gated off")
+                continue
+            self._last_used[(client.server_id, client.workspace_root)] = time.time()
+            try:
+                res = await client.workspace_symbols(query)
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{client.workspace_root}: {type(e).__name__}: {e}")
+                continue
+            if res is None:
+                errors.append(f"{client.workspace_root}: workspace/symbol unsupported")
+                continue
+            used_roots.append(client.workspace_root)
+            for item in res:
+                loc = item.get("location") or {}
+                key = (
+                    loc.get("uri"),
+                    (loc.get("range") or {}).get("start", {}).get("line"),
+                    item.get("name"),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(item)
+
+        out: Dict[str, Any] = {"results": merged, "roots": used_roots}
+        if errors:
+            out["partial_errors"] = errors
+        if not used_roots:
+            out["error"] = "no root answered the query"
+        return out
+
+    def _probe_file_for_root(self, path: str) -> Optional[str]:
+        """Pick a real source file under ``path`` to drive root resolution.
+
+        Server roots are derived from a file, not a directory, so a
+        directory-shaped request needs a representative file inside it.
+        Returns ``path`` unchanged when it is already a file.
+        """
+        if os.path.isfile(path):
+            return path
+        if not os.path.isdir(path):
+            return None
+        for dirpath, dirnames, filenames in os.walk(path):
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in {".git", "node_modules", "bin", "obj", "__pycache__"}
+            ]
+            for fn in filenames:
+                candidate = os.path.join(dirpath, fn)
+                if find_server_for_file(candidate) is not None:
+                    return candidate
+        return None
+
     async def _get_or_spawn(self, file_path: str) -> Optional[LSPClient]:
         srv = find_server_for_file(file_path)
         if srv is None:
