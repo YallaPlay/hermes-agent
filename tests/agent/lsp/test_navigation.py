@@ -271,7 +271,7 @@ def test_probe_file_for_root_passthrough_for_file(tmp_path):
 
 
 def test_tool_rejects_bad_kind():
-    from tools.lsp_navigate_tool import lsp_navigate_tool
+    from plugins.lsp_navigate.tools import lsp_navigate_tool
 
     out = json.loads(lsp_navigate_tool(kind="teleport"))
     assert "error" in out and "valid_kinds" in out
@@ -279,7 +279,7 @@ def test_tool_rejects_bad_kind():
 
 def test_tool_converts_1based_line_to_0based(monkeypatch, tmp_path):
     """The agent reads 1-based lines; LSP wants 0-based. Off-by-one = wrong symbol."""
-    from tools import lsp_navigate_tool as mod
+    from plugins.lsp_navigate import tools as mod
 
     src = tmp_path / "a.cs"
     src.write_text("// line one\npublic int Target() {}\n")
@@ -306,7 +306,7 @@ def test_tool_converts_1based_line_to_0based(monkeypatch, tmp_path):
 
 
 def test_tool_symbol_not_on_line_is_an_error(monkeypatch, tmp_path):
-    from tools import lsp_navigate_tool as mod
+    from plugins.lsp_navigate import tools as mod
 
     src = tmp_path / "a.cs"
     src.write_text("class A {}\n")
@@ -321,7 +321,7 @@ def test_tool_symbol_not_on_line_is_an_error(monkeypatch, tmp_path):
 
 
 def test_tool_formats_locations_1based(tmp_path):
-    from tools.lsp_navigate_tool import _format_locations
+    from plugins.lsp_navigate.tools import _format_locations
 
     items = [{"uri": f"file://{tmp_path}/a.cs", "range": {"start": {"line": 41}}}]
     out = _format_locations(items, str(tmp_path))
@@ -331,13 +331,13 @@ def test_tool_formats_locations_1based(tmp_path):
 
 def test_tool_format_tolerates_null_location():
     """A null/!dict location must be skipped, not crash the digest."""
-    from tools.lsp_navigate_tool import _format_locations
+    from plugins.lsp_navigate.tools import _format_locations
 
     assert _format_locations([{"location": None}, "junk", {}], None) == []  # type: ignore[list-item]
 
 
 def test_tool_format_handles_location_link():
-    from tools.lsp_navigate_tool import _format_locations
+    from plugins.lsp_navigate.tools import _format_locations
 
     items = [{"targetUri": "file:///ws/b.cs", "targetSelectionRange": {"start": {"line": 3}}}]
     out = _format_locations(items, None)
@@ -346,7 +346,7 @@ def test_tool_format_handles_location_link():
 
 def test_flatten_symbol_tree_recurses_into_members():
     """A nested DocumentSymbol tree must yield members, not just the file node."""
-    from tools.lsp_navigate_tool import _flatten_symbol_tree
+    from plugins.lsp_navigate.tools import _flatten_symbol_tree
 
     tree = [{
         "name": "StorageGame.cs", "kind": 1,
@@ -371,13 +371,13 @@ def test_flatten_symbol_tree_recurses_into_members():
 
 
 def test_flatten_symbol_tree_tolerates_junk():
-    from tools.lsp_navigate_tool import _flatten_symbol_tree
+    from plugins.lsp_navigate.tools import _flatten_symbol_tree
 
     assert _flatten_symbol_tree([None, "x", {}]) == []  # type: ignore[list-item]
 
 
 def test_tool_reports_unsupported_with_fallback(monkeypatch, tmp_path):
-    from tools import lsp_navigate_tool as mod
+    from plugins.lsp_navigate import tools as mod
 
     src = tmp_path / "a.cs"
     src.write_text("class A {}\n")
@@ -394,3 +394,100 @@ def test_tool_reports_unsupported_with_fallback(monkeypatch, tmp_path):
         mod.lsp_navigate_tool(kind="definition", file_path=str(src), line=1, symbol="A")
     )
     assert "fallback" in out and "search_files" in out["fallback"]
+
+
+# ------------------------------------------------------------- plugin contract
+#
+# lsp_navigate ships as a bundled plugin rather than a tools/ built-in, so the
+# manifest and register() wiring are now a failure mode of their own: a rename
+# or a signature drift in ctx.register_tool would silently un-register the tool
+# with every unit test above still green.
+
+
+def test_plugin_manifest_matches_registered_tool():
+    """The manifest's provides_tools must match what register() actually adds."""
+    import yaml
+    from pathlib import Path
+
+    manifest_path = Path(__file__).resolve().parents[3] / "plugins" / "lsp_navigate" / "plugin.yaml"
+    manifest = yaml.safe_load(manifest_path.read_text())
+    assert manifest["name"] == "lsp_navigate"
+    assert manifest["kind"] == "backend", "bundled backend = auto-loads without opt-in"
+    assert manifest["provides_tools"] == ["lsp_navigate"]
+
+
+def test_plugin_register_adds_the_tool():
+    """register(ctx) must call ctx.register_tool with a usable schema."""
+    from plugins.lsp_navigate import register
+
+    captured = {}
+
+    class _Ctx:
+        def register_tool(self, **kw):
+            captured.update(kw)
+
+    register(_Ctx())
+    assert captured["name"] == "lsp_navigate"
+    assert captured["toolset"] == "development"
+    assert captured["schema"]["name"] == "lsp_navigate", "agent_init reads schema['name']"
+    assert callable(captured["handler"])
+    assert callable(captured["check_fn"])
+
+
+def test_plugin_handler_unwraps_args_dict():
+    """The handler takes the raw args dict the model sends, not kwargs."""
+    from plugins.lsp_navigate import _handle
+
+    out = json.loads(_handle({"kind": "teleport"}))
+    assert "error" in out and "valid_kinds" in out
+
+
+def test_plugin_register_signature_matches_host_api():
+    """Guard against ctx.register_tool drift in hermes_cli.plugins."""
+    import inspect
+
+    from hermes_cli.plugins import PluginContext
+
+    params = set(inspect.signature(PluginContext.register_tool).parameters)
+    used = {"name", "toolset", "schema", "handler", "check_fn", "emoji"}
+    missing = used - params
+    assert not missing, f"register() passes params the host no longer accepts: {missing}"
+
+
+def test_tool_module_does_not_self_register():
+    """A plugin's tool module must not touch the global registry directly.
+
+    Self-registering at import time would double-register alongside
+    register(ctx) and bypass the plugin enable/disable gate entirely.
+    """
+    from pathlib import Path
+
+    src = (
+        Path(__file__).resolve().parents[3]
+        / "plugins" / "lsp_navigate" / "tools.py"
+    ).read_text()
+    assert "registry.register" not in src
+    assert "from tools.registry import" not in src
+
+
+def test_plugin_respects_disabled_gate(monkeypatch):
+    """plugins.disabled must actually prevent tool registration.
+
+    Being disableable is the reason this ships as a plugin rather than a
+    tools/ built-in, so the gate is a functional requirement, not a detail.
+    """
+    import hermes_cli.plugins as P
+    from tools.registry import registry
+
+    had = registry._tools.pop("lsp_navigate", None)
+    try:
+        monkeypatch.setattr(P, "_get_disabled_plugins", lambda: {"lsp_navigate"})
+        P.PluginManager().discover_and_load()
+        assert registry._tools.get("lsp_navigate") is None, (
+            "disabled plugin still registered its tool"
+        )
+    finally:
+        if had is not None:
+            registry._tools["lsp_navigate"] = had
+
+

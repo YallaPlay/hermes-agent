@@ -34,8 +34,6 @@ import json
 import os
 from typing import Any, Dict, List, Optional
 
-from tools.registry import registry
-
 KINDS = ("definition", "references", "document_symbols", "workspace_symbols")
 
 # LSP SymbolKind → readable name, for symbol listings.
@@ -352,21 +350,3 @@ LSP_NAVIGATE_SCHEMA = {
         "required": ["kind"],
     },
 }
-
-
-registry.register(
-    name="lsp_navigate",
-    toolset="development",
-    schema=LSP_NAVIGATE_SCHEMA,
-    handler=lambda args, **kw: lsp_navigate_tool(
-        kind=args.get("kind", ""),
-        file_path=args.get("file_path"),
-        line=args.get("line"),
-        character=args.get("character"),
-        symbol=args.get("symbol"),
-        query=args.get("query"),
-        roots=args.get("roots"),
-    ),
-    check_fn=check_lsp_navigate_requirements,
-    emoji="🧭",
-)

@@ -1,0 +1,7 @@
+name: lsp_navigate
+version: 1.0.0
+description: "Semantic code navigation over the LSP subsystem — go-to-definition, find-references, file outline, and project-wide symbol search. Wraps agent/lsp (LSPService.navigate_sync), reusing already-spawned language servers. Availability is per-language: whatever `hermes lsp list` shows installed. Disable via plugins.disabled."
+author: YallaPlay
+kind: backend
+provides_tools:
+  - lsp_navigate
