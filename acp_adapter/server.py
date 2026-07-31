@@ -911,12 +911,26 @@ class HermesACPAgent(acp.Agent):
                 max_models=ACP_MAX_MODELS_PER_PROVIDER,
             )
 
+            # Named user-defined endpoints (providers: / custom_providers:)
+            # need ``custom:<name>`` slugs so choice ids round-trip through
+            # parse_model_input. The shared inventory can emit the same
+            # endpoint under its bare config key (e.g. ``bedrock-mantle``),
+            # which parse_model_input does NOT recognize as a provider prefix
+            # — selecting such a row silently mis-resolves to a canonical
+            # provider. Remap inventory rows onto their named slug so both
+            # sources dedupe and every choice id resolves correctly.
+            named_catalogs = _named_custom_provider_catalogs()
+            named_slug_by_key = {
+                slug.removeprefix("custom:"): slug for slug, _, _ in named_catalogs
+            }
+
             available_models: list[ModelInfo] = []
             seen_ids: set[str] = set()
             for row in payload.get("providers") or []:
                 row_provider = normalize_provider(str(row.get("slug") or "").strip())
                 if not row_provider:
                     continue
+                row_provider = named_slug_by_key.get(row_provider, row_provider)
                 provider_name = str(row.get("name") or "").strip() or provider_label(
                     row_provider
                 )
@@ -953,7 +967,9 @@ class HermesACPAgent(acp.Agent):
             # Named user-defined endpoints (providers: / custom_providers:)
             # are invisible to canonical provider enumeration — append them
             # so editor clients can select them like the TUI /model picker.
-            for named_slug, named_label, named_catalog in _named_custom_provider_catalogs():
+            # (named_catalogs computed above so inventory rows dedupe onto
+            # the same ``custom:<name>`` slugs.)
+            for named_slug, named_label, named_catalog in named_catalogs:
                 for named_model, named_desc in named_catalog:
                     named_choice = self._encode_model_choice(named_slug, named_model)
                     if not named_choice or named_choice in seen_ids:

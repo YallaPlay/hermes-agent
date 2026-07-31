@@ -156,3 +156,48 @@ class TestModelStateIncludesNamedProviders:
         provider, model = parse_model_input(choice_id, "bedrock")
         assert provider == "custom:bedrock-mantle"
         assert model == "openai.gpt-5.5"
+
+    @pytest.mark.asyncio
+    async def test_inventory_row_for_named_endpoint_dedupes_onto_named_slug(self):
+        """A named endpoint emitted by the shared inventory under its bare
+        config key must be remapped to the ``custom:<name>`` slug — otherwise
+        the selector shows the endpoint twice (bare + named) and the bare
+        choice id does not round-trip through parse_model_input."""
+        manager = SessionManager(
+            agent_factory=lambda: SimpleNamespace(
+                model="openai.gpt-5.5", provider="custom"
+            )
+        )
+        acp_agent = HermesACPAgent(session_manager=manager)
+
+        inventory_payload = {
+            "providers": [
+                {
+                    "slug": "bedrock-mantle",
+                    "name": "AWS Bedrock Mantle",
+                    "models": ["openai.gpt-5.5", "openai.gpt-5.6-luna"],
+                }
+            ]
+        }
+
+        with patch(
+            "hermes_cli.inventory.build_models_payload",
+            return_value=inventory_payload,
+        ), patch(
+            "acp_adapter.server._named_custom_provider_catalogs",
+            return_value=[
+                (
+                    "custom:bedrock-mantle",
+                    "AWS Bedrock Mantle",
+                    [("openai.gpt-5.5", ""), ("openai.gpt-5.6-luna", "")],
+                )
+            ],
+        ):
+            resp = await acp_agent.new_session(cwd="/tmp")
+
+        assert isinstance(resp.models, SessionModelState)
+        ids = [m.model_id for m in resp.models.available_models]
+        # Each model appears exactly once, under the round-trippable slug.
+        assert ids.count("custom:bedrock-mantle:openai.gpt-5.5") == 1
+        assert ids.count("custom:bedrock-mantle:openai.gpt-5.6-luna") == 1
+        assert not any(i.startswith("bedrock-mantle:") for i in ids)
