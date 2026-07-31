@@ -982,6 +982,80 @@ class TestDiscoverBedrockModels:
 
         assert models == []
 
+    def test_skips_profile_only_foundation_models(self):
+        """Models with inferenceTypesSupported=["INFERENCE_PROFILE"] can't be
+        invoked by their bare ID and must not appear in discovery (#58185)."""
+        from agent.bedrock_adapter import discover_bedrock_models, reset_discovery_cache
+        reset_discovery_cache()
+
+        mock_client = MagicMock()
+        mock_client.list_foundation_models.return_value = {
+            "modelSummaries": [
+                {
+                    "modelId": "anthropic.claude-sonnet-5",
+                    "modelName": "Claude Sonnet 5",
+                    "providerName": "Anthropic",
+                    "inputModalities": ["TEXT", "IMAGE"],
+                    "outputModalities": ["TEXT"],
+                    "responseStreamingSupported": True,
+                    "modelLifecycle": {"status": "ACTIVE"},
+                    "inferenceTypesSupported": ["INFERENCE_PROFILE"],
+                },
+                {
+                    "modelId": "amazon.titan-text-express-v1",
+                    "modelName": "Titan Text Express",
+                    "providerName": "Amazon",
+                    "inputModalities": ["TEXT"],
+                    "outputModalities": ["TEXT"],
+                    "responseStreamingSupported": True,
+                    "modelLifecycle": {"status": "ACTIVE"},
+                    "inferenceTypesSupported": ["ON_DEMAND"],
+                },
+            ],
+        }
+        mock_client.list_inference_profiles.return_value = {
+            "inferenceProfileSummaries": [{
+                "inferenceProfileId": "us.anthropic.claude-sonnet-5",
+                "inferenceProfileName": "US Claude Sonnet 5",
+                "status": "ACTIVE",
+                "models": [],
+            }],
+        }
+
+        with patch("agent.bedrock_adapter._get_bedrock_control_client", return_value=mock_client):
+            models = discover_bedrock_models("us-east-1")
+
+        ids = [m["id"] for m in models]
+        assert "anthropic.claude-sonnet-5" not in ids
+        assert "us.anthropic.claude-sonnet-5" in ids
+        assert "amazon.titan-text-express-v1" in ids
+
+    def test_keeps_models_without_inference_types_field(self):
+        """Older API shapes may omit inferenceTypesSupported — default permissive."""
+        from agent.bedrock_adapter import discover_bedrock_models, reset_discovery_cache
+        reset_discovery_cache()
+
+        mock_client = MagicMock()
+        mock_client.list_foundation_models.return_value = {
+            "modelSummaries": [{
+                "modelId": "anthropic.claude-v2",
+                "modelName": "Claude V2",
+                "providerName": "Anthropic",
+                "inputModalities": ["TEXT"],
+                "outputModalities": ["TEXT"],
+                "responseStreamingSupported": True,
+                "modelLifecycle": {"status": "ACTIVE"},
+            }],
+        }
+        mock_client.list_inference_profiles.return_value = {
+            "inferenceProfileSummaries": [],
+        }
+
+        with patch("agent.bedrock_adapter._get_bedrock_control_client", return_value=mock_client):
+            models = discover_bedrock_models("us-east-1")
+
+        assert [m["id"] for m in models] == ["anthropic.claude-v2"]
+
 
 class TestExtractProviderFromArn:
     def test_extracts_anthropic(self):
@@ -2133,3 +2207,251 @@ class TestBearerTokenRoutesToConverse:
         runtime = self._resolve(monkeypatch, bearer=False)
         assert runtime["api_mode"] == "anthropic_messages"
         assert runtime.get("bedrock_anthropic") is True
+
+
+# ---------------------------------------------------------------------------
+# Inference-profile dedup for the /model picker (#58185)
+# ---------------------------------------------------------------------------
+
+class TestDedupProfileCoveredIds:
+    """Bare foundation-model IDs covered by a profile must be dropped."""
+
+    def test_drops_bare_id_when_profile_present(self):
+        from agent.bedrock_adapter import _dedup_profile_covered_ids
+
+        ids = [
+            "global.anthropic.claude-fable-5",
+            "anthropic.claude-fable-5",
+        ]
+        result = _dedup_profile_covered_ids(ids)
+        assert "global.anthropic.claude-fable-5" in result
+        assert "anthropic.claude-fable-5" not in result
+
+    def test_keeps_uncovered_bare_ids(self):
+        from agent.bedrock_adapter import _dedup_profile_covered_ids
+
+        # No profile sibling for the titan model → keep it.
+        ids = [
+            "us.anthropic.claude-sonnet-4-6",
+            "anthropic.claude-sonnet-4-6",
+            "amazon.titan-text-express-v1",
+        ]
+        result = _dedup_profile_covered_ids(ids)
+        assert result == [
+            "us.anthropic.claude-sonnet-4-6",
+            "amazon.titan-text-express-v1",
+        ]
+
+    def test_dedups_across_all_regional_prefixes(self):
+        from agent.bedrock_adapter import _dedup_profile_covered_ids
+
+        ids = [
+            "eu.anthropic.claude-opus-4-6",
+            "anthropic.claude-opus-4-6",
+            "ap.amazon.nova-pro",
+            "amazon.nova-pro",
+        ]
+        result = _dedup_profile_covered_ids(ids)
+        assert result == ["eu.anthropic.claude-opus-4-6", "ap.amazon.nova-pro"]
+
+    def test_preserves_order_and_noop_without_profiles(self):
+        from agent.bedrock_adapter import _dedup_profile_covered_ids
+
+        ids = ["amazon.titan-text-express-v1", "cohere.command-r-v1:0"]
+        assert _dedup_profile_covered_ids(ids) == ids
+
+    def test_helper_applied_by_bedrock_model_ids_or_none(self):
+        from agent import bedrock_adapter
+
+        discovered = [
+            {"id": "global.anthropic.claude-fable-5", "provider": "inference-profile"},
+            {"id": "anthropic.claude-fable-5", "provider": "Anthropic"},
+        ]
+        with patch.object(
+            bedrock_adapter, "discover_bedrock_models", return_value=discovered
+        ), patch.object(
+            bedrock_adapter, "resolve_bedrock_region", return_value="us-east-1"
+        ):
+            result = bedrock_adapter.bedrock_model_ids_or_none()
+        assert result == ["global.anthropic.claude-fable-5"]
+
+
+# ---------------------------------------------------------------------------
+# repair_bedrock_model_id — load-time bare-ID repair (#58185)
+# ---------------------------------------------------------------------------
+
+class TestRepairBedrockModelId:
+    """Load-time repair of persisted bare foundation-model IDs."""
+
+    def _discovered(self, *ids):
+        return [{"id": i} for i in ids]
+
+    def test_repairs_bare_id_to_global_profile(self):
+        from agent import bedrock_adapter
+
+        with patch.object(
+            bedrock_adapter, "discover_bedrock_models",
+            return_value=self._discovered(
+                "global.anthropic.claude-fable-5",
+                "anthropic.claude-fable-5",
+            ),
+        ):
+            result = bedrock_adapter.repair_bedrock_model_id(
+                "anthropic.claude-fable-5", region="us-east-1"
+            )
+        assert result == "global.anthropic.claude-fable-5"
+
+    def test_prefers_region_geo_prefix_over_global(self):
+        from agent import bedrock_adapter
+
+        with patch.object(
+            bedrock_adapter, "discover_bedrock_models",
+            return_value=self._discovered(
+                "global.anthropic.claude-fable-5",
+                "eu.anthropic.claude-fable-5",
+            ),
+        ):
+            result = bedrock_adapter.repair_bedrock_model_id(
+                "anthropic.claude-fable-5", region="eu-west-1"
+            )
+        assert result == "eu.anthropic.claude-fable-5"
+
+    def test_falls_back_to_first_candidate_without_geo_or_global(self):
+        from agent import bedrock_adapter
+
+        with patch.object(
+            bedrock_adapter, "discover_bedrock_models",
+            return_value=self._discovered("jp.anthropic.claude-fable-5"),
+        ):
+            result = bedrock_adapter.repair_bedrock_model_id(
+                "anthropic.claude-fable-5", region="us-east-1"
+            )
+        assert result == "jp.anthropic.claude-fable-5"
+
+    def test_already_prefixed_id_is_untouched_without_aws_call(self):
+        from agent import bedrock_adapter
+
+        with patch.object(
+            bedrock_adapter, "discover_bedrock_models",
+            side_effect=AssertionError("must not call discovery"),
+        ):
+            for mid in (
+                "global.anthropic.claude-fable-5",
+                "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+                "apac.anthropic.claude-fable-5",
+                "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-v2",
+            ):
+                assert bedrock_adapter.repair_bedrock_model_id(
+                    mid, region="us-east-1"
+                ) == mid
+
+    def test_non_bedrock_shapes_are_untouched(self):
+        from agent import bedrock_adapter
+
+        with patch.object(
+            bedrock_adapter, "discover_bedrock_models",
+            side_effect=AssertionError("must not call discovery"),
+        ):
+            assert bedrock_adapter.repair_bedrock_model_id("", region="x") == ""
+            assert bedrock_adapter.repair_bedrock_model_id(
+                "gpt-4o", region="us-east-1"
+            ) == "gpt-4o"
+
+    def test_fails_open_when_discovery_raises(self):
+        from agent import bedrock_adapter
+
+        with patch.object(
+            bedrock_adapter, "discover_bedrock_models",
+            side_effect=RuntimeError("AccessDenied"),
+        ):
+            result = bedrock_adapter.repair_bedrock_model_id(
+                "anthropic.claude-fable-5", region="us-east-1"
+            )
+        assert result == "anthropic.claude-fable-5"
+
+    def test_fails_open_when_no_covering_profile(self):
+        from agent import bedrock_adapter
+
+        with patch.object(
+            bedrock_adapter, "discover_bedrock_models",
+            return_value=self._discovered(
+                "global.anthropic.claude-opus-5",
+                "amazon.titan-text-express-v1",
+            ),
+        ):
+            result = bedrock_adapter.repair_bedrock_model_id(
+                "anthropic.claude-fable-5", region="us-east-1"
+            )
+        assert result == "anthropic.claude-fable-5"
+
+    def test_fails_open_when_discovery_empty(self):
+        from agent import bedrock_adapter
+
+        with patch.object(
+            bedrock_adapter, "discover_bedrock_models", return_value=[]
+        ):
+            result = bedrock_adapter.repair_bedrock_model_id(
+                "anthropic.claude-fable-5", region="us-east-1"
+            )
+        assert result == "anthropic.claude-fable-5"
+
+    def test_resolves_region_when_not_supplied(self):
+        from agent import bedrock_adapter
+
+        with patch.object(
+            bedrock_adapter, "resolve_bedrock_region", return_value="eu-central-1"
+        ) as mock_region, patch.object(
+            bedrock_adapter, "discover_bedrock_models",
+            return_value=self._discovered("eu.anthropic.claude-fable-5"),
+        ) as mock_discover:
+            result = bedrock_adapter.repair_bedrock_model_id(
+                "anthropic.claude-fable-5"
+            )
+        assert result == "eu.anthropic.claude-fable-5"
+        mock_region.assert_called_once()
+        mock_discover.assert_called_once_with("eu-central-1")
+
+    def test_agent_init_repairs_bare_bedrock_pin(self, monkeypatch):
+        """A persisted bare Bedrock ID is upgraded during AIAgent init."""
+        from agent import bedrock_adapter
+
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        with patch.object(
+            bedrock_adapter, "discover_bedrock_models",
+            return_value=self._discovered(
+                "global.anthropic.claude-fable-5",
+            ),
+        ), patch("run_agent.ContextCompressor") as mock_compressor:
+            mock_compressor.return_value = MagicMock(
+                context_length=200000, threshold_tokens=100000
+            )
+            from run_agent import AIAgent
+
+            agent = AIAgent(
+                model="anthropic.claude-fable-5",
+                provider="bedrock",
+                api_key="unused",
+                base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
+            )
+        assert agent.model == "global.anthropic.claude-fable-5"
+
+    def test_agent_init_leaves_prefixed_pin_alone(self, monkeypatch):
+        from agent import bedrock_adapter
+
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        with patch.object(
+            bedrock_adapter, "discover_bedrock_models",
+            side_effect=AssertionError("must not call discovery"),
+        ), patch("run_agent.ContextCompressor") as mock_compressor:
+            mock_compressor.return_value = MagicMock(
+                context_length=200000, threshold_tokens=100000
+            )
+            from run_agent import AIAgent
+
+            agent = AIAgent(
+                model="global.anthropic.claude-fable-5",
+                provider="bedrock",
+                api_key="unused",
+                base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
+            )
+        assert agent.model == "global.anthropic.claude-fable-5"

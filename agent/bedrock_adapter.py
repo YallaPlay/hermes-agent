@@ -394,14 +394,119 @@ def bedrock_model_ids_or_none() -> Optional[List[str]]:
     This helper consolidates the discover → extract-ids → fallback
     pattern that was previously duplicated across ``provider_model_ids``,
     ``list_authenticated_providers`` section 2, and section 3.
+
+    Bare foundation-model IDs that are covered by a discovered inference
+    profile are dropped: on on-demand Bedrock accounts the bare ID is not
+    invokable (HTTP 400, "Retry ... with the ID or ARN of an inference
+    profile"), so offering it in the ``/model`` picker persists an
+    un-invokable model to config. This mirrors the profile-preferring
+    dedup the setup wizard already applies in ``model_setup_flows.py``.
     """
     try:
         discovered = discover_bedrock_models(resolve_bedrock_region())
         if discovered:
-            return [m["id"] for m in discovered]
+            return _dedup_profile_covered_ids([m["id"] for m in discovered])
     except Exception:
         pass
     return None
+
+
+# Regional inference-profile prefixes. A profile ID like
+# ``us.anthropic.claude-fable-5`` covers the bare foundation model
+# ``anthropic.claude-fable-5`` (its base ID with the prefix stripped).
+_PROFILE_PREFIXES = ("us.", "global.", "eu.", "ap.", "jp.")
+
+
+def _dedup_profile_covered_ids(ids: List[str]) -> List[str]:
+    """Drop bare foundation-model IDs that a discovered profile already covers.
+
+    Given a mix of inference-profile IDs (``us.anthropic.claude-fable-5``)
+    and bare foundation-model IDs (``anthropic.claude-fable-5``), keep every
+    profile ID and every bare ID that has no profile sibling, but drop bare
+    IDs whose profile counterpart is present. Order is preserved.
+    """
+    profile_bases = {
+        mid.split(".", 1)[1]
+        for mid in ids
+        if mid.startswith(_PROFILE_PREFIXES)
+    }
+    return [
+        mid for mid in ids
+        if mid.startswith(_PROFILE_PREFIXES) or mid not in profile_bases
+    ]
+
+
+# Full inference-profile prefix roster for repair checks. Superset of
+# ``_PROFILE_PREFIXES`` (which only carries the prefixes the dedup helper has
+# historically seen in discovery output): repair must never re-prefix an
+# already-prefixed ID from ANY geography.
+_REPAIR_PROFILE_PREFIXES = (
+    "global.", "us.", "eu.", "ap.", "apac.", "jp.", "ca.", "sa.", "me.", "af.",
+)
+
+
+def repair_bedrock_model_id(model_id: str, region: str = "") -> str:
+    """Upgrade a bare foundation-model ID to its covering inference profile.
+
+    Older ``/model`` pickers and setup flows persisted bare foundation-model
+    IDs (``anthropic.claude-fable-5``) into config files and session rows.
+    On on-demand Bedrock accounts those IDs are not invokable — every call
+    fails with HTTP 400 "Invocation of model ID ... with on-demand throughput
+    isn't supported" (#58185). The picker/discovery fixes stop NEW bare IDs
+    from being offered, but IDs already persisted keep failing on every
+    resumed session until repaired.
+
+    This helper is the load-time repair: given a model ID, return the
+    inference-profile ID that covers it when live discovery confirms one
+    exists, preferring the region's own geo prefix, then ``global.``, then
+    the first covering profile discovered. The result is the SAME model —
+    only the ID form changes — so applying it silently at load is a repair,
+    not a model substitution.
+
+    Fail-open: returns *model_id* unchanged when it is already
+    profile-prefixed or an ARN, does not look like a Bedrock foundation-model
+    ID, discovery is unavailable (no IAM ``bedrock:ListInferenceProfiles``,
+    no network), or no covering profile exists. Discovery results are cached
+    (1h per region), and already-prefixed IDs return without any AWS call.
+    """
+    mid = (model_id or "").strip()
+    if (
+        not mid
+        or mid.startswith(_REPAIR_PROFILE_PREFIXES)
+        or mid.startswith("arn:")
+        or "." not in mid
+    ):
+        return model_id
+
+    region = (region or "").strip() or resolve_bedrock_region()
+    try:
+        discovered = discover_bedrock_models(region)
+    except Exception:
+        return model_id
+    if not discovered:
+        return model_id
+
+    candidates = [
+        m["id"] for m in discovered
+        if m["id"].startswith(_REPAIR_PROFILE_PREFIXES)
+        and m["id"].split(".", 1)[1] == mid
+    ]
+    if not candidates:
+        return model_id
+
+    geo = ""
+    try:
+        from hermes_cli.model_setup_flows import bedrock_region_geo_prefix
+        geo = bedrock_region_geo_prefix(region)
+    except Exception:
+        pass
+    for preferred in (geo, "global."):
+        if not preferred:
+            continue
+        for candidate in candidates:
+            if candidate.startswith(preferred):
+                return candidate
+    return candidates[0]
 
 
 # ---------------------------------------------------------------------------
@@ -1254,6 +1359,16 @@ def discover_bedrock_models(
                 continue
             output_mods = summary.get("outputModalities", [])
             if "TEXT" not in output_mods:
+                continue
+            # Skip models that cannot be invoked by their bare foundation ID.
+            # ``inferenceTypesSupported == ["INFERENCE_PROFILE"]`` means AWS
+            # only accepts this model through an inference-profile ID
+            # (us.* / global.* / ...), which step 2 below discovers separately;
+            # offering the bare ID yields HTTP 400 "on-demand throughput isn't
+            # supported" at invoke time (#58185). Default permissive: an absent
+            # field (older API shapes) keeps the model.
+            inference_types = summary.get("inferenceTypesSupported")
+            if inference_types and "ON_DEMAND" not in inference_types:
                 continue
 
             models.append({
