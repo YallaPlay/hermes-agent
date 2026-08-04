@@ -197,6 +197,10 @@ class TestSpawnToolInjection:
         assert names == [SPAWN_SESSION_TOOL_NAME]
         assert SPAWN_SESSION_TOOL_NAME in fake.valid_tool_names
 
+        properties = fake.tools[0]["function"]["parameters"]["properties"]
+        assert properties["provider"]["type"] == "string"
+        assert properties["model"]["type"] == "string"
+
     def test_inject_is_idempotent(self):
         fake = MagicMock()
         fake.tools = []
@@ -227,7 +231,9 @@ class TestSpawnDispatch:
         assert "only available inside a live ACP" in payload["error"]
 
     def test_empty_prompt_rejected(self):
-        token = set_spawn_session_requester(lambda p, c, t: "sid")
+        token = set_spawn_session_requester(
+            lambda p, c, t, provider=None, model=None: "sid"
+        )
         try:
             payload = _loads(
                 maybe_dispatch_spawn_session(SPAWN_SESSION_TOOL_NAME, {"prompt": "  "})
@@ -239,10 +245,12 @@ class TestSpawnDispatch:
     def test_dispatch_returns_session_id(self):
         captured = {}
 
-        def _requester(prompt_text, cwd, title):
+        def _requester(prompt_text, cwd, title, provider=None, model=None):
             captured["prompt"] = prompt_text
             captured["cwd"] = cwd
             captured["title"] = title
+            captured["provider"] = provider
+            captured["model"] = model
             return "new-session-id"
 
         token = set_spawn_session_requester(_requester)
@@ -262,12 +270,14 @@ class TestSpawnDispatch:
             "prompt": "continue the migration",
             "cwd": "/work/dir",
             "title": None,
+            "provider": None,
+            "model": None,
         }
 
     def test_dispatch_forwards_title(self):
         captured = {}
 
-        def _requester(prompt_text, cwd, title):
+        def _requester(prompt_text, cwd, title, provider=None, model=None):
             captured["title"] = title
             return "sid"
 
@@ -285,8 +295,34 @@ class TestSpawnDispatch:
         assert payload["success"] is True
         assert captured["title"] == "Instrument steer delivery"
 
+    def test_dispatch_forwards_provider_and_model_overrides(self):
+        captured = {}
+
+        def _requester(prompt_text, cwd, title, provider=None, model=None):
+            captured["provider"] = provider
+            captured["model"] = model
+            return "sid"
+
+        token = set_spawn_session_requester(_requester)
+        try:
+            payload = _loads(
+                maybe_dispatch_spawn_session(
+                    SPAWN_SESSION_TOOL_NAME,
+                    {
+                        "prompt": "consult the council",
+                        "provider": "  moa  ",
+                        "model": " council_ext ",
+                    },
+                )
+            )
+        finally:
+            reset_spawn_session_requester(token)
+
+        assert payload["success"] is True
+        assert captured == {"provider": "moa", "model": "council_ext"}
+
     def test_requester_failure_surfaces_as_error(self):
-        def _requester(prompt_text, cwd, title):
+        def _requester(prompt_text, cwd, title, provider=None, model=None):
             raise RuntimeError("loop closed")
 
         token = set_spawn_session_requester(_requester)
@@ -304,7 +340,9 @@ class TestSpawnDispatch:
         guard (never the registry)."""
         from model_tools import handle_function_call
 
-        token = set_spawn_session_requester(lambda p, c, t: "routed-id")
+        token = set_spawn_session_requester(
+            lambda p, c, t, provider=None, model=None: "routed-id"
+        )
         try:
             payload = json.loads(
                 handle_function_call(SPAWN_SESSION_TOOL_NAME, {"prompt": "go"})
@@ -347,6 +385,14 @@ class TestServerSpawnRequester:
         # Inherits the parent's owner and cwd.
         assert child.owner == "u@yallaplay.com"
         assert child.cwd == parent_state.cwd
+        # Spawn is a clean-context derivative: lineage is visible, but no
+        # conversation history is copied from the parent.
+        assert child.parent_id == parent_state.session_id
+        assert child.history == []
+        row = agent.session_manager._get_db().get_session(new_id)
+        model_config = json.loads(row["model_config"])
+        assert model_config["_forked_from"] == parent_state.session_id
+        assert row["parent_session_id"] is None
 
     @pytest.mark.asyncio
     async def test_requester_honors_explicit_cwd(self, agent, tmp_path):
@@ -511,6 +557,41 @@ class TestServerSpawnRequester:
         assert captured["requested_provider"] == "openai-codex"
         assert captured["base_url"] == "https://chatgpt.com/backend-api/codex"
         assert captured["api_mode"] == "codex_responses"
+
+    @pytest.mark.asyncio
+    async def test_requester_dispatches_explicit_provider_and_model_route(
+        self, agent
+    ):
+        parent_resp = await agent.new_session(cwd="/tmp")
+        parent_state = agent.session_manager.get_session(parent_resp.session_id)
+        parent_state.model = "gpt-5.6-sol"
+        parent_state.agent.provider = "openai-codex"
+        parent_state.agent.base_url = "https://chatgpt.com/backend-api/codex"
+        parent_state.agent.api_mode = "codex_responses"
+        agent._run_spawned_first_turn = AsyncMock()
+
+        captured = {}
+        manager = agent.session_manager
+        real_factory = manager._agent_factory
+
+        def spying_make_agent(**kwargs):
+            captured.update(kwargs)
+            return real_factory()
+
+        loop = asyncio.get_running_loop()
+        requester = agent._make_spawn_session_requester(loop, parent_state)
+        with patch.object(manager, "_make_agent", side_effect=spying_make_agent):
+            new_id = await loop.run_in_executor(
+                None, requester, "consult", None, None, "moa", "council_ext"
+            )
+
+        assert new_id
+        assert captured["model"] == "council_ext"
+        assert captured["requested_provider"] == "moa"
+        # Parent transport metadata belongs to openai-codex and must not leak
+        # into an explicitly different provider route.
+        assert captured["base_url"] is None
+        assert captured["api_mode"] is None
 
     @pytest.mark.asyncio
     async def test_requester_persists_provider_routing_to_db(self, agent):

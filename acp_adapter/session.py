@@ -323,6 +323,7 @@ class SessionManager:
         requested_provider: str | None = None,
         base_url: str | None = None,
         api_mode: str | None = None,
+        parent_id: str | None = None,
     ) -> SessionState:
         """Create a new session with a unique ID and a fresh AIAgent.
 
@@ -337,6 +338,10 @@ class SessionManager:
         A model name is meaningless without its routing, so callers carrying
         a model over from an existing session must pass the whole tuple —
         same invariant as ``fork_session``.
+
+        ``parent_id`` records display-only derivation lineage via the existing
+        ``_forked_from`` model-config marker. It does not copy history and does
+        not use ``sessions.parent_session_id`` (reserved for hidden subagents).
         """
         import threading
 
@@ -355,6 +360,7 @@ class SessionManager:
             agent=agent,
             cwd=cwd,
             model=getattr(agent, "model", "") or "",
+            parent_id=parent_id,
             cancel_event=threading.Event(),
         )
         state.owner = (owner or "").strip() or None

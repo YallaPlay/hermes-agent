@@ -2765,19 +2765,24 @@ class HermesACPAgent(acp.Agent):
         the new session synchronously (SessionManager is thread-safe), then
         schedules its first turn as a background task on the server's event
         loop and returns the real session id immediately — the parent turn
-        never blocks on the child. The child inherits the parent's owner (and
-        cwd unless overridden) so per-user session lists show it, plus the
-        parent's edit-approval mode and reasoning effort: a spawned session
-        runs its first turn headless (no panel attached), so under the
-        default "ask" policy every edit-approval request would be silently
-        auto-denied by the client — inheriting the parent's mode makes the
-        child at least as capable as the session that spawned it. A caller-
-        provided title is stamped best-effort before the first turn starts,
-        with #N lineage dedup on collision.
+        never blocks on the child. The child is a visibly derived session with
+        clean context: it records display lineage to the parent but copies no
+        history. It inherits the parent's owner (and cwd unless overridden)
+        so per-user session lists show it, plus the parent's edit-approval mode
+        and reasoning effort. A spawned session runs its first turn headless
+        (no panel attached), so under the default "ask" policy every edit-
+        approval request would be silently auto-denied by the client —
+        inheriting the parent's mode makes the child at least as capable as
+        the session that spawned it. A caller-provided title is stamped best-
+        effort before the first turn starts, with #N lineage dedup on collision.
         """
 
         def _requester(
-            prompt_text: str, cwd: str | None, title: str | None = None
+            prompt_text: str,
+            cwd: str | None,
+            title: str | None = None,
+            provider: str | None = None,
+            model: str | None = None,
         ) -> str:
             from agent.async_utils import safe_schedule_threadsafe
 
@@ -2788,13 +2793,25 @@ class HermesACPAgent(acp.Agent):
             # that spawned it instead of silently resolving the config
             # default (a bedrock/fable child of an openai-codex/gpt parent).
             parent_agent = parent_state.agent
+            parent_provider = getattr(parent_agent, "provider", None)
+            spawn_provider = provider or parent_provider
+            spawn_model = model or parent_state.model or None
+            provider_changed = bool(provider and provider != parent_provider)
             new_state = self.session_manager.create_session(
                 cwd=spawn_cwd,
                 owner=parent_state.owner,
-                model=parent_state.model or None,
-                requested_provider=getattr(parent_agent, "provider", None),
-                base_url=getattr(parent_agent, "base_url", None),
-                api_mode=getattr(parent_agent, "api_mode", None),
+                model=spawn_model,
+                requested_provider=spawn_provider,
+                # A base URL and API mode describe the provider transport.
+                # Keep them for inherited/same-provider routes, but never leak
+                # parent transport metadata into an explicit provider change.
+                base_url=(
+                    None if provider_changed else getattr(parent_agent, "base_url", None)
+                ),
+                api_mode=(
+                    None if provider_changed else getattr(parent_agent, "api_mode", None)
+                ),
+                parent_id=parent_state.session_id,
             )
             # Also carry the parent's edit-approval mode and reasoning-effort
             # override, then re-persist so the whole tuple survives an agent

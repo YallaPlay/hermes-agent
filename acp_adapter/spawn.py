@@ -34,8 +34,10 @@ SPAWN_SESSION_TOOL_SCHEMA: dict[str, Any] = {
     "function": {
         "name": SPAWN_SESSION_TOOL_NAME,
         "description": (
-            "Spawn a NEW independent Hermes session inside this running ACP "
-            "server and start its first turn immediately in the background. "
+            "Spawn a NEW derived, clean-context Hermes session inside this "
+            "running ACP server and start its first turn immediately in the "
+            "background. The new session is visibly linked to this parent but "
+            "does not copy its conversation history. "
             "Returns the new session id right away — do not wait for the "
             "spawned turn to finish. The session appears in the VS Code "
             "sessions sidebar with live streaming and steer support. Use for "
@@ -75,14 +77,30 @@ SPAWN_SESSION_TOOL_SCHEMA: dict[str, Any] = {
                         "stamping is best-effort and never fails the spawn."
                     ),
                 },
+                "provider": {
+                    "type": "string",
+                    "description": (
+                        "Optional provider route override. Defaults to this "
+                        "session's provider."
+                    ),
+                },
+                "model": {
+                    "type": "string",
+                    "description": (
+                        "Optional model route override. Defaults to this "
+                        "session's model."
+                    ),
+                },
             },
             "required": ["prompt"],
         },
     },
 }
 
-# (prompt_text, cwd_or_none, title_or_none) -> new session id. Raises on failure.
-SpawnSessionRequester = Callable[[str, Optional[str], Optional[str]], str]
+# (prompt, cwd, title, provider, model) -> new session id. Raises on failure.
+SpawnSessionRequester = Callable[
+    [str, Optional[str], Optional[str], Optional[str], Optional[str]], str
+]
 
 _SPAWN_SESSION_REQUESTER: ContextVar[SpawnSessionRequester | None] = ContextVar(
     "ACP_SPAWN_SESSION_REQUESTER",
@@ -175,9 +193,13 @@ def maybe_dispatch_spawn_session(
     cwd = str(cwd).strip() if cwd else None
     title = arguments.get("title")
     title = str(title).strip() if title else None
+    provider = arguments.get("provider")
+    provider = str(provider).strip() if provider else None
+    model = arguments.get("model")
+    model = str(model).strip() if model else None
 
     try:
-        session_id = requester(prompt_text, cwd, title)
+        session_id = requester(prompt_text, cwd, title, provider, model)
     except Exception as exc:
         logger.warning("ACP spawn_session requester failed: %s", exc)
         return json.dumps(
@@ -189,9 +211,9 @@ def maybe_dispatch_spawn_session(
             "success": True,
             "session_id": session_id,
             "note": (
-                "New session created in this ACP server; its first turn is "
-                "running in the background. It will appear in the sessions "
-                "sidebar. Do not wait for it here."
+                "Derived clean-context session created in this ACP server; "
+                "its first turn is running in the background. It will appear "
+                "in the sessions sidebar. Do not wait for it here."
             ),
         },
         ensure_ascii=False,
