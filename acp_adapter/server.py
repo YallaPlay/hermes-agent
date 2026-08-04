@@ -3688,6 +3688,7 @@ class HermesACPAgent(acp.Agent):
             "tools": self._cmd_tools,
             "context": self._cmd_context,
             "reset": self._cmd_reset,
+            "compact": self._cmd_compress,
             "compress": self._cmd_compress,
             "steer": self._cmd_steer,
             "queue": self._cmd_queue,

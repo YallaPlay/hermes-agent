@@ -2722,7 +2722,8 @@ class TestSlashCommands:
 
 
 
-    def test_compact_compresses_context(self, agent, mock_manager):
+    @pytest.mark.parametrize("command", ["compress", "compact"])
+    def test_compact_compresses_context(self, agent, mock_manager, command):
         state = self._make_state(mock_manager)
         state.history = [
             {"role": "user", "content": "one"},
@@ -2754,7 +2755,7 @@ class TestSlashCommands:
                 side_effect=[40, 12],
             ),
         ):
-            result = agent._handle_slash_command("/compress", state)
+            result = agent._handle_slash_command(f"/{command}", state)
 
         assert "Context compressed: 4 -> 1 messages" in result
         assert "~40 -> ~12 tokens" in result
