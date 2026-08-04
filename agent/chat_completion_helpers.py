@@ -228,6 +228,53 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _estimate_chunk_bytes(chunk: Any) -> int:
+    """Cheap per-chunk size estimate for the stream diagnostic counters.
+
+    The previous implementation used ``len(repr(chunk))`` — a full recursive
+    repr of a pydantic model on EVERY streaming chunk (5.5-8.8 µs each,
+    ~20-30 ms of pure CPU on a 3,000-chunk response, in the hottest loop in
+    the agent). The counter only feeds a retry-diagnostic log line, so an
+    estimate based on the delta payload lengths is plenty (2.1-2.4 µs, ~3x
+    cheaper, and independent of model/pydantic field count). Chat Completions
+    chunks are sized from their delta content/reasoning/tool-argument strings
+    plus a small framing constant; anything shape-unknown (Anthropic events,
+    stub providers) falls back to a flat constant so `bytes` stays monotonic
+    and roughly proportional to traffic.
+    """
+    size = 40  # SSE/JSON framing floor per chunk
+    try:
+        choices = getattr(chunk, "choices", None)
+        if choices:
+            delta = getattr(choices[0], "delta", None)
+            if delta is not None:
+                for attr in ("content", "reasoning_content", "reasoning"):
+                    v = getattr(delta, attr, None)
+                    if isinstance(v, str):
+                        size += len(v)
+                tool_calls = getattr(delta, "tool_calls", None)
+                if tool_calls:
+                    for tc in tool_calls:
+                        fn = getattr(tc, "function", None)
+                        if fn is not None:
+                            args = getattr(fn, "arguments", None)
+                            if isinstance(args, str):
+                                size += len(args)
+                            name = getattr(fn, "name", None)
+                            if isinstance(name, str):
+                                size += len(name)
+        else:
+            # Non-chat-completions shapes (Anthropic events etc.): try the
+            # common text fields, else keep the framing floor.
+            for attr in ("text", "partial_json"):
+                v = getattr(getattr(chunk, "delta", None), attr, None)
+                if isinstance(v, str):
+                    size += len(v)
+    except Exception:
+        pass
+    return size
+
+
 def _codex_wait_notice_recovery(
     *,
     stale_timeout: float,
@@ -1085,9 +1132,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
-def build_api_kwargs(agent, api_messages: list) -> dict:
+def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
     """Build the keyword arguments dict for the active API mode."""
-    tools_for_api = agent.tools
+    if tools_for_api is None:
+        tools_for_api = agent.tools
 
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()
@@ -1753,19 +1801,17 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # Pass base_url and api_key from fallback config so custom
         # endpoints (e.g. Ollama Cloud) resolve correctly instead of
         # falling through to OpenRouter defaults.
+        from hermes_cli.fallback_config import resolve_entry_api_key
+
         fb_base_url_hint = (fb.get("base_url") or "").strip() or None
-        fb_api_key_hint = (fb.get("api_key") or "").strip() or None
-        if not fb_api_key_hint:
-            # key_env and api_key_env are both documented aliases (see
-            # _normalize_custom_provider_entry in hermes_cli/config.py).
-            fb_key_env = (fb.get("key_env") or fb.get("api_key_env") or "").strip()
-            if fb_key_env:
-                fb_api_key_hint = os.getenv(fb_key_env, "").strip() or None
+        fb_api_key_hint = resolve_entry_api_key(fb)
         # For Ollama Cloud endpoints, pull OLLAMA_API_KEY from env
         # when no explicit key is in the fallback config. Host match
         # (not substring) — see GHSA-76xc-57q6-vm5m.
         if fb_base_url_hint and base_url_host_matches(fb_base_url_hint, "ollama.com") and not fb_api_key_hint:
-            fb_api_key_hint = os.getenv("OLLAMA_API_KEY") or None
+            from agent.secret_scope import get_secret
+
+            fb_api_key_hint = get_secret("OLLAMA_API_KEY") or None
         fb_client, _resolved_fb_model = resolve_provider_client(
             fb_provider, model=fb_model, raw_codex=True,
             explicit_base_url=fb_base_url_hint,
@@ -2349,7 +2395,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
 
     except Exception as e:
-        logger.warning(f"Failed to get summary response: {e}")
+        logger.warning("Failed to get summary response: %s", e)
         final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
     finally:
         from agent import relay_llm
@@ -2390,7 +2436,7 @@ def cleanup_task_resources(agent, task_id: str) -> None:
             _ra().cleanup_vm(task_id)
     except Exception as e:
         if agent.verbose_logging:
-            logger.warning(f"Failed to cleanup VM for task {task_id}: {e}")
+            logger.warning("Failed to cleanup VM for task %s: %s", task_id, e)
     try:
         headed = False
         try:
@@ -2408,7 +2454,7 @@ def cleanup_task_resources(agent, task_id: str) -> None:
             _ra().cleanup_browser(task_id)
     except Exception as e:
         if agent.verbose_logging:
-            logger.warning(f"Failed to cleanup browser for task {task_id}: {e}")
+            logger.warning("Failed to cleanup browser for task %s: %s", task_id, e)
 
 
 def _build_partial_stream_stub(
@@ -3126,12 +3172,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
                 if _diag.get("first_chunk_at") is None:
                     _diag["first_chunk_at"] = last_chunk_time["t"]
-                # Approximate byte size from the chunk's repr — exact wire
-                # bytes aren't exposed by the SDK, but len(repr(chunk)) is
-                # a stable proxy for "how much content arrived" that
-                # survives stub provider differences.
+                # Approximate byte size from the chunk's delta payload —
+                # exact wire bytes aren't exposed by the SDK. A full
+                # repr() per chunk was 5.5-8.8 µs of pure CPU on the
+                # hottest loop in the agent; the delta-length estimate
+                # is ~3x cheaper and stays proportional to traffic.
                 try:
-                    _diag["bytes"] = int(_diag.get("bytes", 0)) + len(repr(chunk))
+                    _diag["bytes"] = int(_diag.get("bytes", 0)) + _estimate_chunk_bytes(chunk)
                 except Exception:
                     pass
             except Exception:
@@ -3572,7 +3619,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
                     if _diag.get("first_chunk_at") is None:
                         _diag["first_chunk_at"] = last_chunk_time["t"]
-                    _diag["bytes"] = int(_diag.get("bytes", 0)) + len(repr(event))
+                    _diag["bytes"] = int(_diag.get("bytes", 0)) + _estimate_chunk_bytes(event)
                 except Exception:
                     pass
                 if agent._interrupt_requested:
@@ -3949,7 +3996,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                                 "   To avoid this delay, set display.streaming: false "
                                 "in config.yaml\n"
                             )
-                        logger.info(
+                        logger.exception(
                             "Streaming failed before delivery: %s",
                             e,
                         )
@@ -3998,9 +4045,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # env var ``HERMES_LOCAL_STREAM_STALE_TIMEOUT`` overrides for escape-hatch.
         _local_default = 900.0
         try:
-            from hermes_cli.config import load_config
+            from hermes_cli.config import load_config_readonly
 
-            _cfg = load_config()
+            _cfg = load_config_readonly()  # read-only consumer — no deepcopy
             _agent_cfg = _cfg.get("agent") if isinstance(_cfg, dict) else None
             if isinstance(_agent_cfg, dict):
                 _v = _agent_cfg.get("local_stream_stale_timeout")

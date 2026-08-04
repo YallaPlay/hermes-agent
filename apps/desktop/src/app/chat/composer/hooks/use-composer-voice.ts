@@ -4,11 +4,12 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useI18n } from '@/i18n'
 import { chatMessageText, collectUnspokenTurnSpeech } from '@/lib/chat-messages'
 import { triggerHaptic } from '@/lib/haptics'
+import { clearWakeIndicator, syncWakeIndicatorWithVoice } from '@/lib/wake-indicator'
 import { $voiceConversationStartRequest, takeVoiceConversationStart } from '@/store/composer'
 import { resetBrowseState } from '@/store/composer-input-history'
 import { $gateway } from '@/store/gateway'
-import { notifyError } from '@/store/notifications'
-import { $autoSpeakReplies, setAutoSpeakReplies } from '@/store/voice-prefs'
+import { notify, notifyError } from '@/store/notifications'
+import { $autoSpeakReplies, $voiceStopPhrase, setAutoSpeakReplies } from '@/store/voice-prefs'
 import { resumeWakeAfterVoice } from '@/store/wake-word'
 
 import type { ComposerTarget } from '../focus'
@@ -27,6 +28,9 @@ interface UseComposerVoiceArgs {
   focusInput: () => void
   insertText: (text: string) => void
   maxRecordingSeconds: number
+  /** Interrupt the in-flight agent turn (Stop-button seam) — fired when the
+   *  user speaks over the model while it is still generating. */
+  onInterrupt?: () => Promise<void> | void
   onSubmit: ChatBarProps['onSubmit']
   onTranscribeAudio: ChatBarProps['onTranscribeAudio']
   sessionId: string | null | undefined
@@ -48,6 +52,7 @@ export function useComposerVoice({
   focusInput,
   insertText,
   maxRecordingSeconds,
+  onInterrupt,
   onSubmit,
   onTranscribeAudio,
   sessionId,
@@ -58,6 +63,7 @@ export function useComposerVoice({
   const { $messages } = useComposerScope()
   const [voiceConversationActive, setVoiceConversationActive] = useState(false)
   const lastSpokenIdRef = useRef<string | null>(null)
+  const ownsWakeIndicatorRef = useRef(false)
   const voiceStartRequest = useStore($voiceConversationStartRequest)
 
   const { dictate, voiceActivityState, voiceStatus } = useVoiceRecorder({
@@ -129,6 +135,10 @@ export function useComposerVoice({
     consumePendingResponse,
     enabled: voiceConversationActive,
     onFatalError: () => setVoiceConversationActive(false),
+    // Speaking over the model mid-generation interrupts the in-flight turn —
+    // the same seam as the Stop button — so the interjection becomes the next
+    // turn instead of waiting behind a reply the user already rejected.
+    onInterrupt,
     // A spoken stop command ("stop", "never mind", "goodbye", …) ends the
     // hands-free conversation. Flipping the flag is the authoritative off
     // switch — the enabled=false prop + effect below drive conversation.end()
@@ -141,6 +151,26 @@ export function useComposerVoice({
     // to finish releasing the capture device (see wakePauseBarrierRef).
     beforeMicOpen: () => wakePauseBarrierRef.current ?? undefined
   })
+
+  // eslint-disable-next-line no-restricted-syntax -- ownership token used only by unmount cleanup
+  useEffect(() => {
+    if (target !== 'main') {
+      return
+    }
+
+    if (syncWakeIndicatorWithVoice(voiceConversationActive, conversation.status)) {
+      ownsWakeIndicatorRef.current = voiceConversationActive
+    }
+  }, [conversation.status, target, voiceConversationActive])
+
+  useEffect(
+    () => () => {
+      if (ownsWakeIndicatorRef.current) {
+        clearWakeIndicator()
+      }
+    },
+    []
+  )
 
   // The `composer.voice` hotkey (Ctrl+B) toggles the conversation. Starting
   // with STT unconfigured lets the conversation surface its own "configure
@@ -207,6 +237,26 @@ export function useComposerVoice({
       resumeWakeIfPaused()
     }
   }, [pauseWakeForVoice, resumeWakeIfPaused, voiceConversationActive])
+
+  // 'Say "stop" to end the voice chat.' notice when the conversation starts.
+  // Phrase comes from voice.stop_phrases (first entry) so a custom phrase
+  // renders correctly; a null phrase (stop_phrases: []) shows no notice.
+  useEffect(() => {
+    if (!voiceConversationActive) {
+      return
+    }
+
+    const phrase = $voiceStopPhrase.get()
+
+    if (phrase) {
+      notify({
+        id: 'voice-stop-hint',
+        kind: 'info',
+        icon: 'mic',
+        message: t.notifications.voice.sayStopToEnd(phrase)
+      })
+    }
+  }, [t, voiceConversationActive])
 
   useEffect(() => resumeWakeIfPaused, [resumeWakeIfPaused])
 

@@ -29,7 +29,13 @@ import threading
 import time
 from typing import Dict, Any, Iterable, List, Optional, Tuple
 
-from tools.registry import discover_builtin_tools, registry
+from tools.registry import (
+    CHECK_FN_CACHE_BYPASS,
+    check_fn_cache_scope,
+    discover_builtin_tools,
+    registry,
+    tool_error,
+)
 from toolsets import resolve_toolset, validate_toolset
 
 logger = logging.getLogger(__name__)
@@ -317,6 +323,7 @@ def get_tool_definitions(
     # user-visible config edits that affect dynamic schemas (execute_code
     # mode, discord action allowlist, etc.) without needing an explicit
     # invalidate hook on every config-writer.
+    cache_key = None
     if quiet_mode:
         try:
             from hermes_cli.config import get_config_path
@@ -325,16 +332,19 @@ def get_tool_definitions(
             cfg_fp = (cfg_stat.st_mtime_ns, cfg_stat.st_size)
         except (FileNotFoundError, OSError, ImportError):
             cfg_fp = None
-        cache_key = (
-            frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
-            frozenset(disabled_toolsets) if disabled_toolsets else None,
-            registry._generation,
-            cfg_fp,
-            bool(os.environ.get("HERMES_KANBAN_TASK")),
-            bool(skip_tool_search_assembly),
-            _is_delegated_child_context(),
-        )
-        cached = _tool_defs_cache.get(cache_key)
+        profile_scope = check_fn_cache_scope()
+        if profile_scope != CHECK_FN_CACHE_BYPASS:
+            cache_key = (
+                frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
+                frozenset(disabled_toolsets) if disabled_toolsets else None,
+                registry._generation,
+                cfg_fp,
+                bool(os.environ.get("HERMES_KANBAN_TASK")),
+                bool(skip_tool_search_assembly),
+                _is_delegated_child_context(),
+                profile_scope,
+            )
+        cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
         if cached is not None:
             # Update _last_resolved_tool_names so downstream callers see
             # consistent state even on a cache hit.
@@ -346,7 +356,7 @@ def get_tool_definitions(
 
     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
                                        skip_tool_search_assembly=skip_tool_search_assembly)
-    if quiet_mode:
+    if quiet_mode and cache_key is not None:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
         # schemas to self.tools) don't poison the cache. Without this, a
@@ -360,6 +370,8 @@ def get_tool_definitions(
         if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
             _tool_defs_cache.pop(next(iter(_tool_defs_cache)))  # evict oldest
         _tool_defs_cache[cache_key] = result
+        return list(result)
+    if quiet_mode:
         return list(result)
     return result
 
@@ -1184,8 +1196,7 @@ def handle_function_call(
                 function_args or {}, allowed_names=catalog_names
             )
             if err or not underlying_name:
-                return json.dumps({"error": err or "tool_call could not be resolved"},
-                                  ensure_ascii=False)
+                return tool_error(err or "tool_call could not be resolved")
             # Defense in depth: the underlying tool MUST be in the session's
             # scoped deferrable catalog. resolve_underlying_call() only checks
             # that the name is deferrable in the global registry; this gate
@@ -1198,12 +1209,10 @@ def handle_function_call(
                 else _ts_mod.scoped_deferrable_names(current_defs)
             )
             if underlying_name not in _scoped_deferrable:
-                return json.dumps({
-                    "error": (
-                        f"'{underlying_name}' is not available in this session. "
-                        "Use tool_search to find tools you can call."
-                    ),
-                }, ensure_ascii=False)
+                return tool_error(
+                    f"'{underlying_name}' is not available in this session. "
+                    "Use tool_search to find tools you can call."
+                )
             # Probe-validate against the deferred tool's schema (ironclaw#5149):
             # a blind call missing required arguments returns the parameter
             # schema instead of dispatching into an opaque downstream failure.
@@ -1251,7 +1260,7 @@ def handle_function_call(
 
     try:
         if function_name in _AGENT_LOOP_TOOLS:
-            return json.dumps({"error": f"{function_name} must be handled by the agent loop"})
+            return tool_error(f"{function_name} must be handled by the agent loop")
 
         # Check plugin hooks for a block/approve directive (unless caller
         # already checked — e.g. run_agent._invoke_tool passes skip=True to
@@ -1282,7 +1291,7 @@ def handle_function_call(
                 logger.debug("pre_tool_call hook error: %s", _hook_err)
 
             if block_message is not None:
-                result = json.dumps({"error": block_message}, ensure_ascii=False)
+                result = tool_error(block_message)
                 _emit_post_tool_call_hook(
                     function_name=function_name,
                     function_args=function_args,
@@ -1311,7 +1320,7 @@ def handle_function_call(
         except Exception as _edit_approval_err:
             logger.debug("ACP edit approval guard error: %s", _edit_approval_err)
             if function_name in {"write_file", "patch"}:
-                return json.dumps({"error": "Edit approval denied: approval guard failed"}, ensure_ascii=False)
+                return tool_error("Edit approval denied: approval guard failed")
 
         # ACP in-process session spawn (acp_spawn_session). Like edit
         # approval, the requester is a ContextVar bound only during an ACP
@@ -1453,7 +1462,7 @@ def handle_function_call(
     except Exception as e:
         error_msg = f"Error executing {function_name}: {str(e)}"
         logger.exception(error_msg)
-        return json.dumps({"error": _sanitize_tool_error(error_msg)}, ensure_ascii=False)
+        return tool_error(_sanitize_tool_error(error_msg))
 
 
 # =============================================================================

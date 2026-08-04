@@ -233,9 +233,9 @@ const sidebars: SidebarsConfig = {
                   key: 'skills-bundled-mlops',
                   collapsed: true,
                   items: [
+                    'user-guide/skills/bundled/mlops/mlops-evaluation-evaluating-llms-harness',
                     'user-guide/skills/bundled/mlops/mlops-huggingface-hub',
                     'user-guide/skills/bundled/mlops/mlops-inference-llama-cpp',
-                    'user-guide/skills/bundled/mlops/mlops-evaluation-evaluating-llms-harness',
                     'user-guide/skills/bundled/mlops/mlops-inference-serving-llms-vllm',
                     'user-guide/skills/bundled/mlops/mlops-evaluation-weights-and-biases',
                   ],
@@ -276,6 +276,7 @@ const sidebars: SidebarsConfig = {
                   items: [
                     'user-guide/skills/bundled/research/research-arxiv',
                     'user-guide/skills/bundled/research/research-blogwatcher',
+                    'user-guide/skills/bundled/research/research-grounded-citations',
                     'user-guide/skills/bundled/research/research-llm-wiki',
                     'user-guide/skills/bundled/research/research-polymarket',
                     'user-guide/skills/bundled/research/research-research-paper-writing',
@@ -307,6 +308,7 @@ const sidebars: SidebarsConfig = {
                   items: [
                     'user-guide/skills/bundled/software-development/software-development-dogfood',
                     'user-guide/skills/bundled/software-development/software-development-hermes-agent-skill-authoring',
+                    'user-guide/skills/bundled/software-development/software-development-inspecting-hermes-desktop-dom',
                     'user-guide/skills/bundled/software-development/software-development-node-inspect-debugger',
                     'user-guide/skills/bundled/software-development/software-development-plan',
                     'user-guide/skills/bundled/software-development/software-development-python-debugpy',
@@ -374,6 +376,7 @@ const sidebars: SidebarsConfig = {
                     'user-guide/skills/optional/creative/creative-kanban-video-orchestrator',
                     'user-guide/skills/optional/creative/creative-meme-generation',
                     'user-guide/skills/optional/creative/creative-pixel-art',
+                    'user-guide/skills/optional/creative/creative-tldraw-offline',
                     'user-guide/skills/optional/creative/creative-unreal-mcp',
                   ],
                 },
@@ -552,6 +555,7 @@ const sidebars: SidebarsConfig = {
                     'user-guide/skills/optional/research/research-gitnexus-explorer',
                     'user-guide/skills/optional/research/research-osint-investigation',
                     'user-guide/skills/optional/research/research-parallel-cli',
+                    'user-guide/skills/optional/research/research-pinecone-research',
                     'user-guide/skills/optional/research/research-qmd',
                     'user-guide/skills/optional/research/research-scrapling',
                     'user-guide/skills/optional/research/research-searxng-search',
@@ -653,6 +657,7 @@ const sidebars: SidebarsConfig = {
           type: 'category',
           label: 'Other',
           items: [
+            'user-guide/messaging/a2a',
             'user-guide/messaging/homeassistant',
             'user-guide/messaging/mattermost',
             'user-guide/messaging/matrix',
@@ -665,6 +670,7 @@ const sidebars: SidebarsConfig = {
             'user-guide/messaging/ntfy',
             'user-guide/messaging/irc',
             'user-guide/messaging/open-webui',
+            'user-guide/messaging/relay',
             'user-guide/messaging/webhooks',
           ],
         },

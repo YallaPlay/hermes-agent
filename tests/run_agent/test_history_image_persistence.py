@@ -68,7 +68,11 @@ def _flush_user_image_turn(agent, content):
     agent._persist_user_message_timestamp = None
     msg = {"role": "user", "content": content}
     agent._flush_messages_to_session_db([msg], [])
-    return msg, agent._session_db.append_message.call_args.kwargs
+    # The flush batches the turn's rows into ONE append_messages_batch call;
+    # assert on the single row dict it carried (same keys the old per-row
+    # append_message kwargs had).
+    (row,) = agent._session_db.append_messages_batch.call_args.kwargs["messages"]
+    return msg, row
 
 
 def test_flush_keeps_screenshot_placeholder_text(agent):
@@ -158,7 +162,8 @@ def test_flush_preserves_existing_display_metadata_keys(agent):
         "display_metadata": {"delegation_id": "d1"},
     }
     agent._flush_messages_to_session_db([msg], [])
-    metadata = agent._session_db.append_message.call_args.kwargs["display_metadata"]
+    (row,) = agent._session_db.append_messages_batch.call_args.kwargs["messages"]
+    metadata = row["display_metadata"]
     assert metadata["delegation_id"] == "d1"
     assert len(metadata[DISPLAY_METADATA_KEY]) == 1
 
@@ -187,6 +192,6 @@ def test_flush_multimodal_tool_result_still_uses_text_summary(agent):
             run_agent, "_multimodal_text_summary", return_value="text_summary here"
         ):
             agent._flush_messages_to_session_db([tool_msg], [])
-    kwargs = agent._session_db.append_message.call_args.kwargs
-    assert kwargs["content"] == "text_summary here"
-    assert kwargs["display_metadata"] is None
+    (row,) = agent._session_db.append_messages_batch.call_args.kwargs["messages"]
+    assert row["content"] == "text_summary here"
+    assert row["display_metadata"] is None

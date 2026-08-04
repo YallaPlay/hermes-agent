@@ -146,7 +146,7 @@ class TestRuntimeMainTeardown:
         # Override cleared: _read_main_model must fall back to config.yaml
         # (a deterministic sentinel below) rather than returning the stale model.
         assert aux._RUNTIME_MAIN_MODEL == ""
-        with patch("hermes_cli.config.load_config", return_value={"model": {"default": "global.anthropic.claude-opus-4-8"}}):
+        with patch("hermes_cli.config.load_config", return_value={"model": {"default": "global.anthropic.claude-opus-4-8"}}), patch("hermes_cli.config.load_config_readonly", return_value={"model": {"default": "global.anthropic.claude-opus-4-8"}}):
             resolved = aux._read_main_model()
         assert resolved == "global.anthropic.claude-opus-4-8", (
             f"Expected config fallback after teardown, got stale {resolved!r}"
