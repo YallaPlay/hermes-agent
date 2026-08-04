@@ -273,10 +273,11 @@ class SessionState:
     # on session/new. Persisted to sessions.user_id so the ACP sessions list can
     # filter to a user's own sessions. Soft display key, not an access boundary.
     owner: Optional[str] = None
-    # Session this one was forked from (session/fork lineage). Persisted as a
-    # ``_forked_from`` marker in the model_config JSON — NOT sessions.
-    # parent_session_id, which list_sessions_rich treats as subagent/compression
-    # lineage and would hide the fork from session lists. Display-only.
+    # Session this one was derived from (fork or clean-context ACP spawn).
+    # Persisted via the legacy ``_forked_from`` model_config marker — NOT
+    # sessions.parent_session_id, which list_sessions_rich treats as
+    # subagent/compression lineage and would hide it from session lists.
+    # Display-only.
     parent_id: Optional[str] = None
     # True for delegate-child (source="subagent") sessions restored for
     # observation. These are read-only from ACP's side: the delegate child
