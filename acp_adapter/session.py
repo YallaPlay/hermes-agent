@@ -108,6 +108,24 @@ def _build_session_title(title: Any, preview: Any, cwd: str | None) -> str:
     return leaf or "New thread"
 
 
+def _agent_provider_identity(agent: Any) -> str | None:
+    """Best provider identity for persist/fork/model-state round-trips.
+
+    Prefers the requested (pre-canonicalization) identity — e.g.
+    ``custom:yallaplay-cpa`` — over the canonical ``provider`` attribute,
+    which for named custom endpoints is bare ``custom``. Re-resolving bare
+    ``custom`` yields the *generic* env/config custom provider (default
+    base_url: OpenRouter), silently rerouting the session away from the
+    named endpoint the user picked. Non-string / empty values (MagicMock
+    test agents, legacy agents) fall through to ``provider``.
+    """
+    for attr in ("requested_provider", "provider"):
+        value = getattr(agent, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 def _forked_from_marker(model_config: Any) -> str | None:
     """Extract the ``_forked_from`` lineage marker from a model_config blob.
 
@@ -483,7 +501,14 @@ class SessionManager:
             session_id=new_id,
             cwd=cwd,
             model=original.model or None,
-            requested_provider=getattr(parent_agent, "provider", None),
+            # Prefer the requested (pre-canonicalization) identity: a named
+            # custom endpoint's ``provider`` is bare ``custom``, which would
+            # re-resolve to the generic env/config custom provider
+            # (OpenRouter) instead of the parent's actual endpoint.
+            requested_provider=(
+                _agent_provider_identity(parent_agent)
+                or getattr(parent_agent, "provider", None)
+            ),
             base_url=getattr(parent_agent, "base_url", None),
             api_mode=getattr(parent_agent, "api_mode", None),
         )
@@ -827,7 +852,14 @@ class SessionManager:
         # Ensure model is a plain string (not a MagicMock or other proxy).
         model_str = str(state.model) if state.model else None
         session_meta = {"cwd": state.cwd}
-        provider = getattr(state.agent, "provider", None)
+        # Persist the requested (pre-canonicalization) provider identity when
+        # available: a named custom endpoint canonicalizes to bare ``custom``,
+        # and restoring from bare ``custom`` resolves the generic env/config
+        # custom provider (default base_url: OpenRouter) instead of the named
+        # endpoint the user picked.
+        provider = _agent_provider_identity(state.agent) or getattr(
+            state.agent, "provider", None
+        )
         base_url = getattr(state.agent, "base_url", None)
         api_mode = getattr(state.agent, "api_mode", None)
         if isinstance(provider, str) and provider.strip():
@@ -1235,6 +1267,13 @@ class SessionManager:
             kwargs.update(
                 {
                     "provider": runtime.get("provider"),
+                    # Preserve the pre-canonicalization identity (e.g.
+                    # ``custom:yallaplay-cpa``). Without it the agent only
+                    # knows the bare ``custom`` provider, and every persist/
+                    # fork/model-state round-trip degrades to the *generic*
+                    # env/config custom provider — whose default base_url is
+                    # OpenRouter, silently rerouting the session.
+                    "requested_provider": runtime.get("requested_provider"),
                     "api_mode": api_mode or runtime.get("api_mode"),
                     "base_url": base_url or runtime.get("base_url"),
                     "api_key": runtime.get("api_key"),

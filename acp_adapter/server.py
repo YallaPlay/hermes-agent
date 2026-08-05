@@ -79,6 +79,7 @@ from acp_adapter.provenance import session_provenance_meta
 from acp_adapter.session import (
     SessionManager,
     SessionState,
+    _agent_provider_identity,
     _apply_effort_to_agent,
     _expand_acp_enabled_toolsets,
 )
@@ -203,6 +204,43 @@ def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, st
         catalogs.append((slug, name, [(mid, "") for mid in model_ids]))
 
     return catalogs
+
+
+def _named_slug_for_base_url(base_url: str | None) -> str | None:
+    """Map a live agent ``base_url`` back to its named custom-provider slug.
+
+    Recovery path for agents that only know the canonical ``custom`` provider
+    (sessions created before ``requested_provider`` was plumbed through, or
+    metadata written by older builds). Encoding such a session's current model
+    as bare ``custom:<model>`` is a routing hazard: clients cache that id and
+    re-apply it to new sessions, where ``resolve_runtime_provider("custom")``
+    resolves the *generic* env/config custom provider — default base_url
+    ``https://openrouter.ai/api/v1`` — silently rerouting traffic away from
+    the named endpoint the user picked.
+    """
+    url = str(base_url or "").strip().rstrip("/").lower()
+    if not url:
+        return None
+    try:
+        from hermes_cli.config import get_compatible_custom_providers
+        from hermes_cli.providers import custom_provider_slug
+    except ImportError:
+        return None
+    try:
+        for entry in get_compatible_custom_providers():
+            if not isinstance(entry, dict):
+                continue
+            entry_url = str(entry.get("base_url", "") or "").strip().rstrip("/").lower()
+            if not entry_url or entry_url != url:
+                continue
+            name = str(entry.get("name", "") or "").strip()
+            if not name:
+                continue
+            provider_key = str(entry.get("provider_key", "") or "").strip()
+            return custom_provider_slug(name, provider_key)
+    except Exception:
+        logger.debug("Could not map base_url to a named custom provider", exc_info=True)
+    return None
 
 try:
     from hermes_cli import __version__ as HERMES_VERSION
@@ -885,7 +923,21 @@ class HermesACPAgent(acp.Agent):
         probing endpoints takes seconds and would block session creation.
         """
         model = str(state.model or getattr(state.agent, "model", "") or "").strip()
-        provider = getattr(state.agent, "provider", None) or detect_provider() or "openrouter"
+        # Prefer the requested (pre-canonicalization) identity so a named
+        # custom endpoint (``custom:yallaplay-cpa``) advertises round-trippable
+        # choice ids instead of degrading to bare ``custom`` (whose generic
+        # resolution routes to OpenRouter). For agents that predate the
+        # requested_provider plumbing, recover the named slug from base_url.
+        provider = (
+            _agent_provider_identity(state.agent)
+            or getattr(state.agent, "provider", None)
+            or detect_provider()
+            or "openrouter"
+        )
+        if str(provider).strip().lower() == "custom":
+            recovered = _named_slug_for_base_url(getattr(state.agent, "base_url", None))
+            if recovered:
+                provider = recovered
 
         try:
             from hermes_cli.inventory import build_models_payload, load_picker_context
@@ -2793,7 +2845,10 @@ class HermesACPAgent(acp.Agent):
             # that spawned it instead of silently resolving the config
             # default (a bedrock/fable child of an openai-codex/gpt parent).
             parent_agent = parent_state.agent
-            parent_provider = getattr(parent_agent, "provider", None)
+            # Requested (pre-canonicalization) identity: bare ``custom`` would
+            # re-resolve to the generic env/config custom provider
+            # (OpenRouter) instead of the parent's named endpoint.
+            parent_provider = _agent_provider_identity(parent_agent)
             spawn_provider = provider or parent_provider
             spawn_model = model or parent_state.model or None
             provider_changed = bool(provider and provider != parent_provider)
@@ -3733,10 +3788,19 @@ class HermesACPAgent(acp.Agent):
     def _cmd_model(self, args: str, state: SessionState) -> str:
         if not args:
             model = state.model or getattr(state.agent, "model", "unknown")
-            provider = getattr(state.agent, "provider", None) or "auto"
+            provider = (
+                _agent_provider_identity(state.agent)
+                or getattr(state.agent, "provider", None)
+                or "auto"
+            )
             return f"Current model: {model}\nProvider: {provider}"
 
-        current_provider = getattr(state.agent, "provider", None) or "openrouter"
+        # Requested (pre-canonicalization) identity — see set_session_model.
+        current_provider = (
+            _agent_provider_identity(state.agent)
+            or getattr(state.agent, "provider", None)
+            or "openrouter"
+        )
         target_provider, new_model = self._resolve_model_selection(args, current_provider)
 
         state.model = new_model
@@ -4015,7 +4079,14 @@ class HermesACPAgent(acp.Agent):
         """Switch the model for a session (called by ACP protocol)."""
         state = self.session_manager.get_session(session_id)
         if state:
-            current_provider = getattr(state.agent, "provider", None)
+            # Compare against the requested (pre-canonicalization) identity:
+            # a named custom endpoint's ``provider`` attribute is bare
+            # ``custom``, which would make a switch between two named custom
+            # endpoints look like "same provider" and wrongly carry the old
+            # base_url/api_mode onto the new endpoint.
+            current_provider = _agent_provider_identity(state.agent) or getattr(
+                state.agent, "provider", None
+            )
             requested_provider, resolved_model = self._resolve_model_selection(
                 model_id,
                 current_provider or "openrouter",

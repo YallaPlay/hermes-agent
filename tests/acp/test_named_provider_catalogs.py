@@ -12,7 +12,11 @@ from unittest.mock import patch
 
 import pytest
 
-from acp_adapter.server import HermesACPAgent, _named_custom_provider_catalogs
+from acp_adapter.server import (
+    HermesACPAgent,
+    _named_custom_provider_catalogs,
+    _named_slug_for_base_url,
+)
 from acp_adapter.session import SessionManager
 from acp.schema import SessionModelState
 
@@ -201,3 +205,112 @@ class TestModelStateIncludesNamedProviders:
         assert ids.count("custom:bedrock-mantle:openai.gpt-5.5") == 1
         assert ids.count("custom:bedrock-mantle:openai.gpt-5.6-luna") == 1
         assert not any(i.startswith("bedrock-mantle:") for i in ids)
+
+
+class TestNamedSlugIdentityPreserved:
+    """A named custom endpoint must not degrade to the bare ``custom``
+    provider in advertised model state. Bare ``custom:<model>`` ids get
+    cached by editor clients and re-applied to new sessions, where generic
+    ``custom`` resolution routes to OpenRouter instead of the named endpoint
+    the user picked (2026-08-05 incident: YallaPlay CPA session silently
+    billed through openrouter.ai)."""
+
+    CPA_ENTRY = {
+        "name": "YallaPlay CPA",
+        "provider_key": "yallaplay-cpa",
+        "base_url": "https://cpa-api.yallaplay.com/v1",
+        "model": "gpt-5.6-sol",
+        "api_mode": "codex_responses",
+    }
+
+    def test_named_slug_for_base_url_maps_named_endpoint(self):
+        with patch(
+            "hermes_cli.config.get_compatible_custom_providers",
+            return_value=[self.CPA_ENTRY],
+        ):
+            assert (
+                _named_slug_for_base_url("https://cpa-api.yallaplay.com/v1")
+                == "custom:yallaplay-cpa"
+            )
+            # Trailing slash / case must not defeat the match.
+            assert (
+                _named_slug_for_base_url("https://CPA-API.yallaplay.com/v1/")
+                == "custom:yallaplay-cpa"
+            )
+            assert _named_slug_for_base_url("https://other.example/v1") is None
+            assert _named_slug_for_base_url("") is None
+
+    @pytest.mark.asyncio
+    async def test_current_model_id_uses_requested_provider_identity(self):
+        """Agent carrying requested_provider must advertise the named slug."""
+        manager = SessionManager(
+            agent_factory=lambda: SimpleNamespace(
+                model="gpt-5.6-sol",
+                provider="custom",
+                requested_provider="custom:yallaplay-cpa",
+                base_url="https://cpa-api.yallaplay.com/v1",
+            )
+        )
+        acp_agent = HermesACPAgent(session_manager=manager)
+
+        with patch(
+            "acp_adapter.server._named_custom_provider_catalogs",
+            return_value=[
+                ("custom:yallaplay-cpa", "YallaPlay CPA", [("gpt-5.6-sol", "")])
+            ],
+        ):
+            resp = await acp_agent.new_session(cwd="/tmp")
+
+        assert isinstance(resp.models, SessionModelState)
+        assert resp.models.current_model_id == "custom:yallaplay-cpa:gpt-5.6-sol"
+        ids = [m.model_id for m in resp.models.available_models]
+        assert "custom:gpt-5.6-sol" not in ids
+
+    @pytest.mark.asyncio
+    async def test_bare_custom_agent_recovers_named_slug_from_base_url(self):
+        """Legacy agents (no requested_provider) recover identity via base_url."""
+        manager = SessionManager(
+            agent_factory=lambda: SimpleNamespace(
+                model="gpt-5.6-sol",
+                provider="custom",
+                base_url="https://cpa-api.yallaplay.com/v1",
+            )
+        )
+        acp_agent = HermesACPAgent(session_manager=manager)
+
+        with patch(
+            "hermes_cli.config.get_compatible_custom_providers",
+            return_value=[self.CPA_ENTRY],
+        ), patch(
+            "acp_adapter.server._named_custom_provider_catalogs",
+            return_value=[
+                ("custom:yallaplay-cpa", "YallaPlay CPA", [("gpt-5.6-sol", "")])
+            ],
+        ):
+            resp = await acp_agent.new_session(cwd="/tmp")
+
+        assert isinstance(resp.models, SessionModelState)
+        assert resp.models.current_model_id == "custom:yallaplay-cpa:gpt-5.6-sol"
+
+    def test_persist_prefers_requested_provider(self, tmp_path):
+        """Session metadata must store the named identity, not bare ``custom``."""
+        import json
+
+        from hermes_state import SessionDB
+
+        db = SessionDB(tmp_path / "state.db")
+        manager = SessionManager(
+            agent_factory=lambda: SimpleNamespace(
+                model="gpt-5.6-sol",
+                provider="custom",
+                requested_provider="custom:yallaplay-cpa",
+                base_url="https://cpa-api.yallaplay.com/v1",
+                api_mode="codex_responses",
+            ),
+            db=db,
+        )
+        state = manager.create_session(cwd=str(tmp_path))
+        row = db.get_session(state.session_id)
+        assert row is not None
+        meta = json.loads(row["model_config"])
+        assert meta["provider"] == "custom:yallaplay-cpa"
