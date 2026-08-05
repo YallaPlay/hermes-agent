@@ -3681,6 +3681,19 @@ def intent_ack_continuation_mode(agent) -> str:
     """
     mode = getattr(agent, "_intent_ack_continuation", "auto")
 
+    # `hermes config set` can only write scalar strings, so a model-list
+    # arrives as the literal text '["gpt-5.6"]'. Parse JSON-shaped strings
+    # into the list form before classification.
+    if isinstance(mode, str) and mode.lstrip().startswith("["):
+        try:
+            import json as _json
+
+            parsed = _json.loads(mode)
+            if isinstance(parsed, list):
+                mode = parsed
+        except ValueError:
+            pass
+
     if mode is True or (isinstance(mode, str) and mode.lower() in {"true", "always", "yes", "on"}):
         return "all"
     if mode is False or (isinstance(mode, str) and mode.lower() in {"false", "never", "no", "off"}):

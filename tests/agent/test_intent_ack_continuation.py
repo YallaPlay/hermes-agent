@@ -454,3 +454,13 @@ def test_progressive_narration_still_gated_in_codex_only():
     )
 
 
+def test_mode_parses_json_string_model_list():
+    # `hermes config set` writes scalars only, so a model-list arrives as the
+    # literal string '["gpt-5.6"]'. It must classify like the real list.
+    a = _agent('["gpt-5.6"]', "chat_completions", model="openai.gpt-5.6-sol")
+    assert intent_ack_continuation_mode(a) == "all"
+    b = _agent('["gpt-5.6"]', "chat_completions", model="anthropic.claude-fable-5")
+    assert intent_ack_continuation_mode(b) == "off"
+    # Malformed JSON-ish strings fall through to the historical default.
+    c = _agent('[not json', "chat_completions")
+    assert intent_ack_continuation_mode(c) == "off"
