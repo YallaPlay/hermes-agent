@@ -464,3 +464,56 @@ def test_mode_parses_json_string_model_list():
     # Malformed JSON-ish strings fall through to the historical default.
     c = _agent('[not json', "chat_completions")
     assert intent_ack_continuation_mode(c) == "off"
+def test_all_mode_fires_on_passive_progress_production_stall():
+    # Verbatim Sol production stall (2026-08-05): third-person progress
+    # report, no first-person lead-in, turn ended with work incomplete.
+    a = _agent(True, "chat_completions")
+    text = (
+        "NOTE: offline validation is underway against the specified "
+        "1,000-pair seed-42 corpus. The recoding reproduces the study "
+        "exactly: 402 convertible one-trick-short failures, including 119 "
+        "cat4 (29.6%), with 102/119 cat4 decisions in tricks 0-3."
+    )
+    assert looks_like_codex_intermediate_ack(
+        a, _MIDTASK_USER, text, _MIDTASK_MSGS, require_workspace=False
+    )
+
+
+def test_passive_progress_variants_fire():
+    a = _agent(True, "chat_completions")
+    for text in (
+        "The migration is still in progress; three tables remain.",
+        "Verification is pending on the last two seeds.",
+        "The corpus rebuild is ongoing.",
+        "The fix is being validated against the holdout set.",
+        "The suite is not yet complete.",
+    ):
+        assert looks_like_codex_intermediate_ack(
+            a, _MIDTASK_USER, text, _MIDTASK_MSGS, require_workspace=False
+        ), text
+
+
+def test_passive_progress_does_not_fire_on_completed_or_past():
+    a = _agent(True, "chat_completions")
+    for text in (
+        # past tense / completed
+        "The validation was underway when the corpus changed, so I re-ran it; "
+        "all 1,000 pairs now pass.",
+        "The migration completed; all tables verified.",
+        # describing an external system's state, question for the user
+        "Your deployment pipeline shows the rollout finished at 14:02.",
+        # sign-off guard still wins
+        "Validation is pending on two seeds. Let me know if you want me to "
+        "wait for them.",
+    ):
+        assert not looks_like_codex_intermediate_ack(
+            a, _MIDTASK_USER, text, _MIDTASK_MSGS, require_workspace=False
+        ), text
+
+
+def test_passive_progress_still_gated_in_codex_only():
+    a = _agent("auto", "codex_responses")
+    text = "Offline validation is underway against the corpus."
+    assert not looks_like_codex_intermediate_ack(
+        a, _MIDTASK_USER, text, _MIDTASK_MSGS, require_workspace=True
+    )

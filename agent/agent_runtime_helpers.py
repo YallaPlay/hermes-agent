@@ -3517,6 +3517,20 @@ _ACK_PROGRESSIVE_LEADIN_RE = re.compile(
     r"\bi(?:['’]?m|\s+am)\s+(?:now\s+|currently\s+|just\s+)?\w+ing\b"
 )
 
+# Passive/impersonal in-progress statement ("offline validation is underway",
+# "the migration is in progress", "verification is still running/pending/
+# ongoing"). GPT-5.x also stalls in third person — no first-person lead-in at
+# all — so the progressive patterns above never see it (observed in
+# production: a Sol subagent ended its turn on "NOTE: offline validation is
+# underway against the specified corpus"). The subject must be in the same
+# clause (no sentence punctuation between subject and marker), and the
+# past-tense/completed counterparts ("was underway", "completed") do not match.
+_ACK_PASSIVE_PROGRESS_RE = re.compile(
+    r"\b(?:is|are|remains?)\s+(?:still\s+)?"
+    r"(?:underway|in\s+progress|ongoing|pending|being\s+\w+(?:ed|en)\b|"
+    r"not\s+(?:yet\s+)?(?:complete|done|finished))\b"
+)
+
 # Sign-off / conditional-offer / question-for-input: the model is offering
 # future help, reporting finished work, or asking the user — not announcing an
 # imminent action. Suppress even when an action word co-occurs.
@@ -3635,6 +3649,11 @@ def looks_like_codex_intermediate_ack(
         if _ACK_PROGRESSIVE_LEADIN_RE.search(assistant_text) and _ACK_INCOMPLETE_RE.search(
             assistant_text
         ):
+            return True
+        # Passive/impersonal in-progress statement ("validation is underway",
+        # "the migration is still in progress"): the model reports its own
+        # unfinished work in third person and yields.
+        if _ACK_PASSIVE_PROGRESS_RE.search(assistant_text):
             return True
         return False
 
