@@ -364,3 +364,93 @@ def test_all_mode_continues_after_a_tool_already_ran():
     )
 
 
+# ── detector: present-progressive mid-task narration ─────────────────────────
+# GPT-5.x Responses models narrate mid-task progress in first-person
+# present-progressive ("I'm now locking down…") with no future-ack and no
+# colon ending, so the announce/truncation patterns never see it. Observed in
+# production subagent transcripts (2026-08-05): turns ended on exactly these
+# texts after 30-60 tool calls, reporting status=completed with no deliverable.
+
+_MIDTASK_USER = "Fix the confirmed defects in StrategyV7 following the TDD protocol."
+_MIDTASK_MSGS = [
+    {"role": "user", "content": _MIDTASK_USER},
+    {"role": "assistant", "content": "", "tool_calls": [{"id": "1"}]},
+    {"role": "tool", "content": "search results ..."},
+]
+
+
+def test_all_mode_fires_on_progressive_narration_production_stall_1():
+    # Verbatim production stall: recon done, plan narrated, turn ended.
+    a = _agent(True, "chat_completions")
+    text = (
+        "We have the audit and protocol. The target worktree is the explicitly "
+        "named `/mnt/ephemeral/...` worktree on `spades-bot-v7-inference`; it is "
+        "clean at the audited base. I\u2019m now locking down the test harness "
+        "details before making the first (D2) red-test change."
+    )
+    assert looks_like_codex_intermediate_ack(
+        a, _MIDTASK_USER, text, _MIDTASK_MSGS, require_workspace=False
+    )
+
+
+def test_all_mode_fires_on_progressive_narration_production_stall_2():
+    # Verbatim production stall: failed patch, narrated retry, turn ended.
+    a = _agent(True, "chat_completions")
+    text = (
+        "The combined patch did not apply because one icon hunk was "
+        "under-specified; no files were modified. I\u2019m narrowing the edits "
+        "to unique contexts before continuing."
+    )
+    assert looks_like_codex_intermediate_ack(
+        a, _MIDTASK_USER, text, _MIDTASK_MSGS, require_workspace=False
+    )
+
+
+def test_all_mode_fires_on_compiling_answer_narration():
+    # The #74604 repro shape.
+    a = _agent(True, "chat_completions")
+    assert looks_like_codex_intermediate_ack(
+        a,
+        _MIDTASK_USER,
+        "I am now compiling the complete answer.",
+        _MIDTASK_MSGS,
+        require_workspace=False,
+    )
+
+
+def test_progressive_narration_does_not_fire_on_finals_or_prose():
+    a = _agent(True, "chat_completions")
+    for text in (
+        # genuine final summaries
+        "Done. All three defects are fixed and committed as a1b2c3d; the "
+        "verdict suite passes 9/9 seeds.",
+        "The sidebar now collapses groups; 4 files changed, typecheck green. "
+        "Let me know if you want the icon tweaked.",
+        # past tense report
+        "I reviewed the harness and fixed both defects. Tests pass.",
+        # describing state, not announcing action
+        "The build is failing because the icon hunk was under-specified.",
+        # quoting the user's own progressive phrasing
+        "You said you were narrowing the scope before continuing, which "
+        "matches the plan.",
+        # negation
+        "I'm not making any further changes before you confirm.",
+        # waiting on input (progressive lead-in but no action verb/marker)
+        "I'm blocking on a decision only you can make: which of the two APIs "
+        "should win?",
+    ):
+        assert not looks_like_codex_intermediate_ack(
+            a, _MIDTASK_USER, text, _MIDTASK_MSGS, require_workspace=False
+        ), text
+
+
+def test_progressive_narration_still_gated_in_codex_only():
+    # Default mode keeps the historical scope: mid-task narration does not
+    # continue without the explicit opt-in (after-tool gate applies).
+    a = _agent("auto", "codex_responses")
+    text = "I\u2019m now locking down the test harness before making the first change."
+    assert not looks_like_codex_intermediate_ack(
+        a, _MIDTASK_USER, text, _MIDTASK_MSGS, require_workspace=True
+    )
+
+

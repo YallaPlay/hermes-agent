@@ -3495,6 +3495,28 @@ _ACK_ANNOUNCE_RE = re.compile(
     r"(?:(?!\b(?:never|not)\b)[^,.:;!?\n]){0,40}?\b(?:" + _ACK_ACTION_ALT + r")\b"
 )
 
+# First-person present-progressive announcement ("I'm now locking down the
+# test harness", "I am currently narrowing the edits"). GPT-5.x Responses
+# models narrate mid-task progress in this tense — with no future-ack and no
+# colon ending — so the future-ack patterns above never see it (observed in
+# production: subagents ending turns on exactly this shape after 30-60 tool
+# calls). The lead-in must directly govern a gerund in the same clause.
+_ACK_PROGRESSIVE_RE = re.compile(
+    r"\bi(?:['’]?m|\s+am)\s+(?:now\s+|currently\s+|just\s+)?(?=\w+ing\b)"
+    r"(?:(?!\b(?:never|not)\b)[^,.:;!?\n]){0,40}?\b(?:" + _ACK_ACTION_ALT + r")\b"
+)
+
+# Explicit more-work-remains marker: "…before continuing", "…before making the
+# first change". Only consulted alongside a progressive lead-in (below), never
+# alone, so ordinary prose mentioning "before starting X" cannot trip it.
+_ACK_INCOMPLETE_RE = re.compile(
+    r"\bbefore\s+(?:continuing|proceeding|making|starting|applying|"
+    r"finali[sz]ing|committing|running|writing)\b"
+)
+_ACK_PROGRESSIVE_LEADIN_RE = re.compile(
+    r"\bi(?:['’]?m|\s+am)\s+(?:now\s+|currently\s+|just\s+)?\w+ing\b"
+)
+
 # Sign-off / conditional-offer / question-for-input: the model is offering
 # future help, reporting finished work, or asking the user — not announcing an
 # imminent action. Suppress even when an action word co-occurs.
@@ -3603,6 +3625,16 @@ def looks_like_codex_intermediate_ack(
         if _ACK_ANNOUNCE_RE.search(assistant_text):
             return True
         if looks_truncated and has_future_ack and assistant_mentions_action:
+            return True
+        # Present-progressive narration ("I'm now locking down the harness
+        # before making the first change", "I'm narrowing the edits before
+        # continuing"): a first-person gerund governing an action verb, or a
+        # progressive lead-in plus an explicit more-work-remains marker.
+        if _ACK_PROGRESSIVE_RE.search(assistant_text):
+            return True
+        if _ACK_PROGRESSIVE_LEADIN_RE.search(assistant_text) and _ACK_INCOMPLETE_RE.search(
+            assistant_text
+        ):
             return True
         return False
 
