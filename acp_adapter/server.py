@@ -1850,10 +1850,30 @@ class HermesACPAgent(acp.Agent):
             or ""
         ).strip()
 
+    @staticmethod
+    def _stable_history_prefix_len(
+        history: list[dict[str, Any]], transcript: list[dict[str, Any]]
+    ) -> int:
+        """Length of the leading run where the DB transcript still matches
+        ``state.history``.
+
+        ``fork_session`` slices ``state.history``, so indices into this
+        matching prefix are valid fork coordinates even while a turn is
+        running. Rows are compared by (role, content) — enough to detect a
+        mid-turn compaction that rewrote older rows, at which point stamping
+        stops at the first divergence.
+        """
+        limit = min(len(history), len(transcript))
+        for i in range(limit):
+            h, t = history[i], transcript[i]
+            if str(h.get("role") or "") != str(t.get("role") or ""):
+                return i
+            if h.get("content") != t.get("content"):
+                return i
+        return limit
+
     async def _replay_session_history(self, state: SessionState) -> None:
         """Replay persisted user/assistant history during session/load or session/resume.
-
-        Invoked inline (``await``) from both ``load_session`` and
         ``resume_session`` so that spec-compliant ACP clients receive the
         full transcript within the request's lifetime — see the comment at
         the call sites for the rationale and prior-art citations.
@@ -1870,21 +1890,31 @@ class HermesACPAgent(acp.Agent):
             turn_running = state.is_running
 
         source: list[dict[str, Any]] = state.history
-        stamp_fork_indices = True
+        # Index below which replayed user chunks carry a fork coordinate
+        # (_meta.hermes.historyIndex). Defaults to "everything".
+        fork_index_limit = len(source)
         if turn_running:
             transcript = self.session_manager.live_transcript_history(state.session_id)
             if transcript is not None and len(transcript) >= len(state.history):
                 # Mid-turn: state.history only extends at turn END, but
                 # run_agent flushes messages to the DB continuously — the DB
-                # is the faithful transcript. Its rows have no stable fork
-                # coordinates (compaction may rewrite them before the turn
-                # finalizes), so omit historyIndex — clients degrade to a
-                # full-copy fork, and the running turn hides its fork button
-                # anyway. A None/shorter transcript means the store is
+                # is the faithful transcript. Rows past the last completed
+                # turn have no stable fork coordinates (compaction may
+                # rewrite them before the turn finalizes), so those chunks
+                # omit historyIndex. But the prefix that still matches
+                # state.history IS stable — fork_session slices
+                # state.history, so indices into that prefix remain valid
+                # and "fork from an earlier completed turn" keeps working
+                # while a turn runs. We stamp only the verified matching
+                # prefix: a mid-turn compaction that rewrote older rows
+                # breaks the match and stops stamping at the first
+                # divergence. A None/shorter transcript means the store is
                 # unavailable or resolved the wrong lineage: fail open to
                 # the in-memory history below.
+                fork_index_limit = self._stable_history_prefix_len(
+                    state.history, transcript
+                )
                 source = transcript
-                stamp_fork_indices = False
         else:
             transcript = self.session_manager.live_transcript_history(
                 state.session_id, repair_alternation=True
@@ -1948,7 +1978,7 @@ class HermesACPAgent(acp.Agent):
                 chunk_meta = self._history_chunk_meta(message, text)
                 meta = (
                     {"hermes": {"historyIndex": index}}
-                    if stamp_fork_indices
+                    if index < fork_index_limit
                     else None
                 )
                 if text:

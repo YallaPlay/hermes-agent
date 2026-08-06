@@ -880,14 +880,46 @@ class TestSessionOps:
         )
 
     @pytest.mark.asyncio
-    async def test_running_turn_replay_omits_history_index_meta(self, agent):
-        """DB rows have no stable fork coordinates (compaction may rewrite
-        them before the turn finalizes), so DB-sourced replay must not stamp
-        _meta.hermes.historyIndex on any chunk."""
+    async def test_running_turn_replay_stamps_only_stable_prefix(self, agent):
+        """Mid-turn replay stamps historyIndex only on user chunks within the
+        prefix of the DB transcript that still matches state.history — those
+        indices remain valid fork_session coordinates. Rows past the last
+        completed turn (or after a divergence) carry no fork meta."""
         state, mock_conn = await self._running_replay_state(agent)
         state.is_running = True
+        transcript = self._db_transcript() + [
+            {"role": "user", "content": "mid-turn steer message"},
+        ]
         agent.session_manager.live_transcript_history = MagicMock(
-            return_value=self._db_transcript()
+            return_value=transcript
+        )
+
+        await agent._replay_session_history(state)
+
+        user_calls = [
+            call for call in mock_conn.session_update.await_args_list
+            if getattr(call.kwargs.get("update"), "session_update", None)
+            == "user_message_chunk"
+        ]
+        assert len(user_calls) == 2
+        # Index 0 matches state.history → stable fork coordinate.
+        assert user_calls[0].kwargs["update"].content.text == "kick off the long job"
+        assert user_calls[0].kwargs["hermes"] == {"historyIndex": 0}
+        # Index 3 is past the completed prefix → no fork meta.
+        assert user_calls[1].kwargs["update"].content.text == "mid-turn steer message"
+        assert "hermes" not in user_calls[1].kwargs
+
+    @pytest.mark.asyncio
+    async def test_running_turn_replay_stops_stamping_at_divergence(self, agent):
+        """If the DB transcript's older rows were rewritten (mid-turn
+        compaction), the prefix match breaks and NO chunk from the divergence
+        onward carries historyIndex."""
+        state, mock_conn = await self._running_replay_state(agent)
+        state.is_running = True
+        transcript = self._db_transcript()
+        transcript[0] = {"role": "user", "content": "[compacted] different text"}
+        agent.session_manager.live_transcript_history = MagicMock(
+            return_value=transcript
         )
 
         await agent._replay_session_history(state)
@@ -975,7 +1007,9 @@ class TestSessionOps:
     @pytest.mark.asyncio
     async def test_running_turn_replay_uses_db_at_equal_length(self, agent):
         """Equal lengths: the DB is still the faithful mid-turn transcript
-        (the gate is >=, not >) — replay the DB rows, without index meta."""
+        (the gate is >=, not >) — replay the DB rows. The user row at index 0
+        matches state.history, so it keeps its fork coordinate; the diverged
+        assistant row does not."""
         state, mock_conn = await self._running_replay_state(
             agent,
             history=[
@@ -1004,10 +1038,13 @@ class TestSessionOps:
         assert [c.kwargs["update"].content.text for c in agent_calls] == [
             "fresh db snapshot"
         ]
-        assert all(
-            "hermes" not in call.kwargs
-            for call in mock_conn.session_update.await_args_list
-        )
+        user_calls = [
+            call for call in mock_conn.session_update.await_args_list
+            if getattr(call.kwargs.get("update"), "session_update", None)
+            == "user_message_chunk"
+        ]
+        assert user_calls[0].kwargs["hermes"] == {"historyIndex": 0}
+        assert all("hermes" not in call.kwargs for call in agent_calls)
 
     @pytest.mark.asyncio
     async def test_idle_replay_adopts_longer_db_transcript(self, agent):
