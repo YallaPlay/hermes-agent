@@ -1601,19 +1601,6 @@ class TestApplyReasoningEffort:
         assert result["persisted"] is False
         assert agent.reasoning_config == {"enabled": True, "effort": "low"}
 
-    def test_invoke_tool_routes_reasoning_effort(self, agent):
-        """The agent-loop interception must handle reasoning_effort — the
-        registry dispatcher only returns a stub error for loop tools."""
-        agent.reasoning_config = {"enabled": True, "effort": "medium"}
-
-        result = json.loads(
-            agent._invoke_tool("reasoning_effort", {"level": "xhigh"}, "task-1")
-        )
-
-        assert result["success"] is True
-        assert agent.reasoning_config == {"enabled": True, "effort": "xhigh"}
-
-
 class TestBuildAssistantMessage:
     def test_basic_message(self, agent):
         msg = _mock_assistant_msg(content="Hello!")
@@ -2484,11 +2471,6 @@ class TestAgentRuntimePostHookOwnershipSync:
         ("read_preview", {}),
         ("read_window_below", {}),
         ("delegate_task", {"goal": "Check the child path"}),
-        # Fork-only agent-runtime tool (reasoning-effort self-adjustment). It
-        # emits its own post_tool_call hook, so it belongs in
-        # AGENT_RUNTIME_POST_HOOK_TOOL_NAMES and must be exercised on both
-        # executor paths like every other entry.
-        ("reasoning_effort", {"level": "medium"}),
     )
 
     @pytest.mark.parametrize(("tool_name", "tool_args"), _CASES)

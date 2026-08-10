@@ -70,8 +70,6 @@ _HERMES_CORE_TOOLS = [
     "session_search",
     # Clarifying questions
     "clarify",
-    # Runtime reasoning-effort control
-    "reasoning_effort",
     # Code execution + delegation
     "execute_code", "delegate_task",
     # Cronjob management
@@ -288,12 +286,6 @@ TOOLSETS = {
     "clarify": {
         "description": "Ask the user clarifying questions (multiple-choice or open-ended)",
         "tools": ["clarify"],
-        "includes": []
-    },
-
-    "reasoning": {
-        "description": "Adjust runtime reasoning effort for the active session",
-        "tools": ["reasoning_effort"],
         "includes": []
     },
 

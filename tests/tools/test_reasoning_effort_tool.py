@@ -92,17 +92,10 @@ class TestReasoningEffortTool:
         assert "do not adjust it based on task difficulty" in description
         assert "task at hand needs" not in description
 
-    def test_registered_in_registry(self):
-        # Other tests may reset the global registry; reload the module so its
-        # import-time registry.register(...) runs against the current registry.
-        import importlib
-
-        import tools.reasoning_effort_tool as _mod
+    def test_not_registered_or_exposed_to_agents(self):
         from tools.registry import registry
+        from toolsets import TOOLSETS, _HERMES_CORE_TOOLS
 
-        if registry.get_entry("reasoning_effort") is None:
-            importlib.reload(_mod)
-
-        entry = registry.get_entry("reasoning_effort")
-        assert entry is not None
-        assert entry.toolset == "reasoning"
+        assert registry.get_entry("reasoning_effort") is None
+        assert "reasoning_effort" not in _HERMES_CORE_TOOLS
+        assert "reasoning" not in TOOLSETS

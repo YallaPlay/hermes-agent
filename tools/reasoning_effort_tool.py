@@ -13,7 +13,6 @@ on the next request without touching the lifetime-stable system prompt.
 import json
 
 from hermes_constants import VALID_REASONING_EFFORTS, parse_reasoning_effort
-from tools.registry import registry
 
 
 def check_reasoning_effort_requirements() -> bool:
@@ -88,17 +87,3 @@ REASONING_EFFORT_SCHEMA = {
         "required": ["level"],
     },
 }
-
-
-registry.register(
-    name="reasoning_effort",
-    toolset="reasoning",
-    schema=REASONING_EFFORT_SCHEMA,
-    handler=lambda args, **kw: reasoning_effort_tool(
-        level=args.get("level", ""),
-        persist=args.get("persist", False),
-        callback=kw.get("callback"),
-    ),
-    check_fn=check_reasoning_effort_requirements,
-    emoji="🧠",
-)
