@@ -86,6 +86,12 @@ class TestReasoningEffortTool:
         schema_levels = REASONING_EFFORT_SCHEMA["parameters"]["properties"]["level"]["enum"]
         assert schema_levels == ["none", *VALID_REASONING_EFFORTS]
 
+    def test_schema_requires_explicit_user_request(self):
+        description = REASONING_EFFORT_SCHEMA["description"]
+        assert "only when the user explicitly asks" in description
+        assert "do not adjust it based on task difficulty" in description
+        assert "task at hand needs" not in description
+
     def test_registered_in_registry(self):
         # Other tests may reset the global registry; reload the module so its
         # import-time registry.register(...) runs against the current registry.

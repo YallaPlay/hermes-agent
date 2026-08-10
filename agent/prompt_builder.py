@@ -212,9 +212,8 @@ SKILLS_GUIDANCE = (
 # reasoning_effort tool result; request construction reads
 # agent.reasoning_config live on every API call.
 REASONING_EFFORT_GUIDANCE = (
-    "You can adjust your own reasoning depth with the reasoning_effort tool: "
-    "raise it for ambiguity, debugging, risky changes, or multi-step synthesis; "
-    "lower it for trivial, mechanical, or routine turns. "
+    "Use the reasoning_effort tool only when the user explicitly asks to change "
+    "the reasoning level. Do not adjust reasoning effort based on task difficulty. "
     "Changes apply from your next model request onward and last for the rest of "
     "the session unless changed again; pass persist=true only when the user asks "
     "for a permanent default."
@@ -228,8 +227,8 @@ def reasoning_effort_status_line(reasoning_config: Any) -> str:
     (agent lifetime) from the agent's init-time ``reasoning_config``. It states
     the START level, never a live value — the model tracks later changes from
     reasoning_effort tool results, which report the new level. Telling the
-    model where it starts lets it SKIP a redundant reasoning_effort call (and
-    the round-trip) when skill guidance asks for a level that already matches.
+    model where it starts lets it skip a redundant reasoning_effort call when the
+    user requests the current level.
     """
     if isinstance(reasoning_config, dict):
         if reasoning_config.get("enabled") is False:

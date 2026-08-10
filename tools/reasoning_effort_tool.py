@@ -60,8 +60,9 @@ REASONING_EFFORT_SCHEMA = {
     "name": "reasoning_effort",
     "description": (
         "Adjust your own reasoning effort for the current session. "
-        "Use it when the task at hand needs materially more or less thinking "
-        "depth. The change applies from the next model request onward. "
+        "Use it only when the user explicitly asks to change the reasoning level; "
+        "do not adjust it based on task difficulty. The change applies from the "
+        "next model request onward. "
         "Levels from lowest to highest: none, "
         + ", ".join(VALID_REASONING_EFFORTS)
         + "."

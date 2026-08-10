@@ -56,10 +56,11 @@ class TestGuidanceConstants:
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
 
-    def test_reasoning_effort_guidance_gives_raise_and_lower_triggers(self):
+    def test_reasoning_effort_guidance_requires_explicit_user_request(self):
         assert "reasoning_effort tool" in REASONING_EFFORT_GUIDANCE
-        assert "raise it for ambiguity" in REASONING_EFFORT_GUIDANCE
-        assert "lower it for trivial, mechanical, or routine turns" in REASONING_EFFORT_GUIDANCE
+        assert "only when the user explicitly asks" in REASONING_EFFORT_GUIDANCE
+        assert "Do not adjust reasoning effort based on task difficulty" in REASONING_EFFORT_GUIDANCE
+        assert "raise it for ambiguity" not in REASONING_EFFORT_GUIDANCE
         assert "persist=true" in REASONING_EFFORT_GUIDANCE
 
     def test_reasoning_effort_guidance_is_static_no_level_placeholder(self):
