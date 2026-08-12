@@ -3,7 +3,7 @@ import time
 from types import ModuleType, SimpleNamespace
 
 import pytest
-from acp.schema import TextContentBlock
+from acp.schema import ImageContentBlock, TextContentBlock
 
 from acp_adapter.server import (
     INTERRUPTED_PROMPT_SALVAGE_WINDOW_SEC,
@@ -290,6 +290,39 @@ async def test_acp_completed_turn_marks_response_delivered():
     # And a cancel arriving now (turn idle) still arms nothing.
     await acp_agent.cancel(state.session_id)
     assert state.interrupted_prompt_text == ""
+
+
+@pytest.mark.asyncio
+async def test_acp_multimodal_turn_clears_fresh_interrupted_prompt():
+    """A turn that skips the salvage branches must still drop the buffer.
+
+    Multimodal prompts bypass both text-only salvage paths, so without the
+    turn-start clear a FRESH buffer would survive that turn and be picked up
+    by the next text prompt — the user having visibly moved on twice.
+    This pins the turn-start clear adopted from upstream PR #56624.
+    """
+    acp_agent, state, fake, _conn = make_agent_and_state()
+    state.interrupted_prompt_text = "refactor the auth module"
+    state.interrupted_prompt_at = time.monotonic()  # fresh, inside the window
+
+    await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[
+            TextContentBlock(type="text", text="what is in this image?"),
+            ImageContentBlock(type="image", data="aGVsbG8=", mimeType="image/png"),
+        ],
+    )
+
+    assert state.interrupted_prompt_text == ""
+    assert state.interrupted_prompt_at == 0.0
+
+    # The following text prompt therefore runs clean.
+    fake.runs.clear()
+    await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="thanks, now check the logs")],
+    )
+    assert fake.runs == ["thanks, now check the logs"]
 
 
 

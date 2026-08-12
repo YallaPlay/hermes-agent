@@ -3299,13 +3299,20 @@ class HermesACPAgent(acp.Agent):
                 # A real turn is starting, so any prompt salvaged for a later
                 # /steer after a prior client cancel is now stale — the user
                 # moved on to this turn. Drop it so a correction on a future
-                # idle session can't resurrect an abandoned prompt. Both
-                # salvage paths above already consumed and cleared the field
-                # before reaching here, so this only discards a value left by
-                # an intervening completed turn. Adopted from upstream
-                # PR NousResearch/hermes-agent#56624.
-                state.interrupted_prompt_text = ""
-                state.interrupted_prompt_at = 0.0
+                # idle session can't resurrect an abandoned prompt. The salvage
+                # paths above already consumed and cleared the field on
+                # text-only turns; this closes the gap for turns that skip them
+                # (multimodal prompts), which would otherwise leave a live
+                # buffer for a later text prompt to pick up. Adopted from
+                # upstream PR NousResearch/hermes-agent#56624 — but scoped to
+                # real user turns: a SYNTHETIC notification is a background
+                # event, not the user moving on, and must leave the buffer
+                # intact for the next real prompt (tests/acp/test_server.py::
+                # test_notification_does_not_resurrect_cancelled_prompt). The
+                # unscoped upstream version breaks that invariant.
+                if not synthetic_notification:
+                    state.interrupted_prompt_text = ""
+                    state.interrupted_prompt_at = 0.0
                 state.response_delivered = False
 
         if redirected:
