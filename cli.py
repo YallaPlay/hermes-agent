@@ -4544,6 +4544,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             mcp_names = set((CLI_CONFIG.get("mcp_servers") or {}).keys())
             invalid = [t for t in toolsets if not validate_toolset(t) and t not in mcp_names]
             if invalid:
+                # Plugin-registered toolsets (e.g. lsp_navigate's "development")
+                # only become visible to validate_toolset() after plugin
+                # discovery, which may not have run yet at Agent init. Run it
+                # lazily — only when we'd otherwise warn — and re-validate.
+                try:
+                    from hermes_cli.plugins import discover_plugins
+
+                    discover_plugins()
+                    invalid = [t for t in invalid if not validate_toolset(t)]
+                except Exception:
+                    pass
+            if invalid:
                 self._console_print(f"[bold red]Warning: Unknown toolsets: {', '.join(invalid)}[/]")
         
         # Filesystem checkpoints: CLI flag > config
