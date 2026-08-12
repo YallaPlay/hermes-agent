@@ -206,6 +206,34 @@ def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, st
     return catalogs
 
 
+def _named_custom_provider_serves_model(provider: str | None, model: str | None) -> bool:
+    """True when named endpoint ``provider`` already lists ``model`` in its catalog.
+
+    Guards bare-name provider detection: if the endpoint the session is
+    already pointed at serves the requested id, there is nothing to detect
+    and rerouting elsewhere would contradict the user's selection.
+
+    Fails closed — a catalog error reports "served" so a transient discovery
+    failure can never silently move traffic off the endpoint the user chose.
+    A wrong model id then fails loudly against that endpoint, which is the
+    diagnosable outcome.
+    """
+    slug = str(provider or "").strip().lower()
+    target = str(model or "").strip().lower()
+    if not slug.startswith("custom:") or not target:
+        return False
+    try:
+        catalogs = _named_custom_provider_catalogs()
+    except Exception:
+        logger.debug("Named custom catalog lookup failed; keeping provider", exc_info=True)
+        return True
+    for catalog_slug, _label, rows in catalogs:
+        if str(catalog_slug).strip().lower() != slug:
+            continue
+        return any(str(mid or "").strip().lower() == target for mid, _desc in rows)
+    return False
+
+
 def _named_slug_for_base_url(base_url: str | None) -> str | None:
     """Map a live agent ``base_url`` back to its named custom-provider slug.
 
@@ -1071,15 +1099,34 @@ class HermesACPAgent(acp.Agent):
 
     @staticmethod
     def _resolve_model_selection(raw_model: str, current_provider: str) -> tuple[str, str]:
-        """Resolve ``provider:model`` input into the provider and normalized model id."""
+        """Resolve ``provider:model`` input into the provider and normalized model id.
+
+        ``detect_provider_for_model`` exists to guess a provider for a BARE
+        model name.  It must not touch a selection the user made explicitly:
+        a picker-encoded choice id (``custom:<name>:<model>``) parses back to
+        the provider it names, and when that equals the session's current
+        provider — i.e. an ordinary same-endpoint model switch — detection
+        used to fire anyway and rewrite the request onto whichever canonical
+        provider happens to publish a similarly-named model.  On a named
+        custom endpoint that silently rerouted every model (Claude *and* GPT
+        ids) to OpenRouter while the client selector still displayed the
+        endpoint's own label.
+        """
         target_provider = current_provider
         new_model = raw_model.strip()
 
         try:
             from hermes_cli.models import detect_provider_for_model, parse_model_input
 
+            stripped = new_model
             target_provider, new_model = parse_model_input(new_model, current_provider)
-            if target_provider == current_provider:
+            # A consumed provider prefix means the caller named the provider.
+            explicitly_qualified = new_model != stripped
+            if (
+                target_provider == current_provider
+                and not explicitly_qualified
+                and not _named_custom_provider_serves_model(current_provider, new_model)
+            ):
                 detected = detect_provider_for_model(new_model, current_provider)
                 if detected:
                     target_provider, new_model = detected
