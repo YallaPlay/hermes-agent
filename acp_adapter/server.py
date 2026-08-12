@@ -9,6 +9,7 @@ import contextvars
 import json
 import logging
 import os
+import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -287,6 +288,64 @@ _executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="acp-agent")
 # a client-side limit, so this is a fixed cap that clients paginate against
 # using `cursor` / `next_cursor`.
 _LIST_SESSIONS_PAGE_SIZE = 40
+
+# How long a cancelled prompt stays salvageable for the next prompt on the
+# session. The salvage feature (see SessionState.interrupted_prompt_text)
+# exists for ACP clients that implement "stop and send" as two back-to-back
+# protocol calls — cancel, then submit the correction — which land within
+# milliseconds of each other. Anything slower is a user who cancelled, walked
+# away, and came back with an unrelated request; re-attaching the abandoned
+# prompt to it makes the agent resume work nobody asked for.
+INTERRUPTED_PROMPT_SALVAGE_WINDOW_SEC = 30.0
+
+
+def _consume_interrupted_prompt(state: Any) -> str:
+    """Pop the salvageable interrupted prompt, or "" if there is none.
+
+    Always clears the buffer, including when it is refused for being stale —
+    a buffer that outlived its window is dead and must not linger to ambush a
+    later prompt. Caller must NOT hold ``state.runtime_lock``.
+    """
+    with state.runtime_lock:
+        text = state.interrupted_prompt_text
+        armed_at = state.interrupted_prompt_at
+        state.interrupted_prompt_text = ""
+        state.interrupted_prompt_at = 0.0
+    if not text:
+        return ""
+    if not armed_at:
+        # Never armed by a real cancel (or armed by an older build that did
+        # not stamp). Not salvageable — fail closed.
+        return ""
+    age = time.monotonic() - armed_at
+    if age > INTERRUPTED_PROMPT_SALVAGE_WINDOW_SEC:
+        logger.info(
+            "Dropping stale interrupted prompt (%.1fs old, window %.1fs): %s",
+            age,
+            INTERRUPTED_PROMPT_SALVAGE_WINDOW_SEC,
+            text[:100],
+        )
+        return ""
+    return text
+
+
+def _merge_interrupted_prompt(new_text: str, interrupted_prompt: str) -> str:
+    """Combine a salvaged interrupted prompt with the user's new message.
+
+    The NEW message leads: it is the live instruction, and the interrupted one
+    is background that exists so deictic follow-ups ("not that file") still
+    have a referent. Putting the interrupted request first made models read
+    the abandoned task as the directive and the user's actual message as an
+    afterthought.
+    """
+    return (
+        f"{new_text}\n\n"
+        "[Context — your previous request on this session was interrupted "
+        "before it finished. It is included below for reference only, so "
+        "references like \"that file\" resolve. It is NOT a new instruction; "
+        "the message above is what to act on.]\n"
+        f"{interrupted_prompt}"
+    )
 
 
 def _group_session_families(
@@ -2247,8 +2306,13 @@ class HermesACPAgent(acp.Agent):
         state = self.session_manager.get_session(session_id)
         if state and state.cancel_event:
             with state.runtime_lock:
-                if state.is_running and state.current_prompt_text:
+                if (
+                    state.is_running
+                    and state.current_prompt_text
+                    and not state.response_delivered
+                ):
                     state.interrupted_prompt_text = state.current_prompt_text
+                    state.interrupted_prompt_at = time.monotonic()
                 # Publish cancellation and hard-stop the agent before another
                 # prompt can acquire this lock and mistake the turn for
                 # redirectable work.
@@ -3144,17 +3208,12 @@ class HermesACPAgent(acp.Agent):
             interrupted_prompt = ""
             rewrite_idle = False
             with state.runtime_lock:
-                if not state.is_running and steer_text:
-                    if state.interrupted_prompt_text:
-                        interrupted_prompt = state.interrupted_prompt_text
-                        state.interrupted_prompt_text = ""
-                    else:
-                        rewrite_idle = True
+                idle_steer = not state.is_running and bool(steer_text)
+            if idle_steer:
+                interrupted_prompt = _consume_interrupted_prompt(state)
+                rewrite_idle = not interrupted_prompt
             if interrupted_prompt:
-                user_text = (
-                    f"{interrupted_prompt}\n\n"
-                    f"User correction/guidance after interrupt: {steer_text}"
-                )
+                user_text = _merge_interrupted_prompt(steer_text, interrupted_prompt)
                 user_content = user_text
             elif rewrite_idle:
                 user_text = steer_text
@@ -3168,17 +3227,15 @@ class HermesACPAgent(acp.Agent):
             # Some ACP clients implement "stop and send" as two protocol calls:
             # cancel the active prompt, then submit plain correction text. Keep
             # the cancelled request attached so deictic follow-ups ("not that
-            # file") still have an explicit target.
+            # file") still have an explicit target — but only inside the
+            # salvage window, and only as context BELOW the new instruction.
             interrupted_prompt = ""
             with state.runtime_lock:
-                if not state.is_running and state.interrupted_prompt_text:
-                    interrupted_prompt = state.interrupted_prompt_text
-                    state.interrupted_prompt_text = ""
+                idle = not state.is_running
+            if idle:
+                interrupted_prompt = _consume_interrupted_prompt(state)
             if interrupted_prompt:
-                user_text = (
-                    f"{interrupted_prompt}\n\n"
-                    f"User correction/guidance after interrupt: {user_text}"
-                )
+                user_text = _merge_interrupted_prompt(user_text, interrupted_prompt)
                 user_content = user_text
 
         # Intercept slash commands — handle locally without calling the LLM.
@@ -3239,6 +3296,17 @@ class HermesACPAgent(acp.Agent):
             else:
                 state.is_running = True
                 state.current_prompt_text = user_text or "[Image attachment]"
+                # A real turn is starting, so any prompt salvaged for a later
+                # /steer after a prior client cancel is now stale — the user
+                # moved on to this turn. Drop it so a correction on a future
+                # idle session can't resurrect an abandoned prompt. Both
+                # salvage paths above already consumed and cleared the field
+                # before reaching here, so this only discards a value left by
+                # an intervening completed turn. Adopted from upstream
+                # PR NousResearch/hermes-agent#56624.
+                state.interrupted_prompt_text = ""
+                state.interrupted_prompt_at = 0.0
+                state.response_delivered = False
 
         if redirected:
             if self._conn:
@@ -3646,6 +3714,15 @@ class HermesACPAgent(acp.Agent):
                 suppress_interrupt_response = interrupted and final_response.startswith(
                     INTERRUPT_WAITING_FOR_MODEL_PREFIX
                 )
+                if final_response and not interrupted:
+                    # The turn produced its answer. From here on there is
+                    # nothing to salvage: a cancel landing in the post-turn
+                    # tail (history persistence, provenance updates, queued
+                    # drain) must not arm the interrupted-prompt buffer with a
+                    # request that was already fulfilled and delivered — doing
+                    # so makes the NEXT, unrelated prompt replay finished work.
+                    with state.runtime_lock:
+                        state.response_delivered = True
                 if (
                     final_response
                     and conn

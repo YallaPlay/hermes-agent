@@ -308,6 +308,18 @@ class SessionState:
     runtime_lock: Any = field(default_factory=Lock)
     current_prompt_text: str = ""
     interrupted_prompt_text: str = ""
+    # ``time.monotonic()`` stamp of the cancel that armed
+    # ``interrupted_prompt_text``. The salvage feature exists for clients that
+    # implement "stop and send" as cancel-then-submit, which is two protocol
+    # calls milliseconds apart — so a buffer is only salvageable inside a short
+    # window (see INTERRUPTED_PROMPT_SALVAGE_WINDOW_SEC). A zero stamp means
+    # "never armed by a real cancel" and is never salvageable.
+    interrupted_prompt_at: float = 0.0
+    # True once the running turn has produced its final response. A cancel
+    # arriving after that point has nothing to salvage: the request was already
+    # answered and delivered, so re-attaching it to the NEXT prompt replays
+    # finished work.
+    response_delivered: bool = False
 
 
 class SessionManager:

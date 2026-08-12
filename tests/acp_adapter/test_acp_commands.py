@@ -1,10 +1,14 @@
 import sys
+import time
 from types import ModuleType, SimpleNamespace
 
 import pytest
 from acp.schema import TextContentBlock
 
-from acp_adapter.server import HermesACPAgent
+from acp_adapter.server import (
+    INTERRUPTED_PROMPT_SALVAGE_WINDOW_SEC,
+    HermesACPAgent,
+)
 from acp_adapter.session import SessionManager
 
 
@@ -161,6 +165,131 @@ async def test_acp_cancel_publishes_hard_stop_while_holding_runtime_lock():
     assert observed["lock_held"] is True
     assert state.cancel_event.is_set()
     assert state.interrupted_prompt_text == "original request"
+
+
+@pytest.mark.asyncio
+async def test_acp_normal_turn_clears_stale_interrupted_prompt():
+    """A completed normal turn must not leave a salvageable prompt behind.
+
+    Regression: interrupted_prompt_text is set only on a running-cancel and
+    cleared only inside the salvage paths. If the user cancels a running turn,
+    then sends an ordinary prompt (which runs to completion), the interrupted
+    prompt was never cleared — so a later correction on the idle session would
+    resurrect and re-run the task the user cancelled and moved on from.
+    Starting any real turn must drop the stale salvage buffer.
+
+    Adopted from upstream PR NousResearch/hermes-agent#56624.
+    """
+    acp_agent, state, fake, _conn = make_agent_and_state()
+    # Left over from a prior running-cancel of "refactor the auth module".
+    state.interrupted_prompt_text = "refactor the auth module"
+
+    # An ordinary prompt runs to completion in between.
+    await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="what's the weather")],
+    )
+    assert state.interrupted_prompt_text == ""
+    assert fake.runs == ["what's the weather"]
+
+    # Now a follow-up on the idle session must run ONLY the new text, not the
+    # abandoned prompt.
+    fake.runs.clear()
+    await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="/steer be concise")],
+    )
+    assert fake.runs == ["be concise"]
+
+
+@pytest.mark.asyncio
+async def test_acp_stale_interrupted_prompt_is_not_salvaged_after_window():
+    """A cancelled prompt is salvageable only briefly, not indefinitely.
+
+    Regression (live incident, 2026-08-12): a turn was cancelled, its prompt
+    armed the salvage buffer, and FOUR HOURS later an unrelated one-line
+    request from a different user was merged behind it. The agent read the
+    abandoned request as the instruction and rebuilt work nobody asked for.
+    """
+    acp_agent, state, fake, _conn = make_agent_and_state()
+    state.interrupted_prompt_text = "make a clone of the reference sheet and fill it"
+    # Armed four hours ago, as in the live incident. Deliberately a fixed
+    # absolute age, NOT derived from the window constant — a test that moves
+    # with the constant can't detect the constant being widened.
+    state.interrupted_prompt_at = time.monotonic() - 4 * 60 * 60
+    assert 4 * 60 * 60 > INTERRUPTED_PROMPT_SALVAGE_WINDOW_SEC
+
+    await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="give me editor access to both sheets")],
+    )
+
+    assert fake.runs == ["give me editor access to both sheets"]
+    assert "clone of the reference sheet" not in fake.runs[0]
+    # The dead buffer is dropped, not left to ambush a later prompt.
+    assert state.interrupted_prompt_text == ""
+    assert state.interrupted_prompt_at == 0.0
+
+
+@pytest.mark.asyncio
+async def test_acp_fresh_interrupted_prompt_is_salvaged_with_new_message_leading():
+    """Legitimate "stop and send" still salvages — but the NEW text leads.
+
+    The interrupted request must survive as referenceable context (so deictic
+    corrections resolve), while the live message stays the instruction.
+    """
+    acp_agent, state, fake, _conn = make_agent_and_state()
+    state.interrupted_prompt_text = "refactor the auth module"
+    state.interrupted_prompt_at = time.monotonic()
+
+    await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="not that file, do the login one")],
+    )
+
+    assert len(fake.runs) == 1
+    merged = fake.runs[0]
+    # New instruction leads; interrupted request survives below it as context.
+    assert merged.startswith("not that file, do the login one")
+    assert "refactor the auth module" in merged
+    assert merged.index("not that file") < merged.index("refactor the auth module")
+    assert "NOT a new instruction" in merged
+
+
+@pytest.mark.asyncio
+async def test_acp_cancel_after_response_delivered_does_not_arm_salvage():
+    """A cancel landing after the turn answered must not arm the buffer.
+
+    The final response is delivered inside the post-turn tail, but is_running
+    stays True until the finally block. A cancel in that window used to store
+    an already-fulfilled prompt, which the next unrelated prompt then replayed.
+    """
+    acp_agent, state, fake, _conn = make_agent_and_state()
+    state.is_running = True
+    state.current_prompt_text = "build the sheets"
+    state.response_delivered = True  # turn already produced and sent its answer
+
+    await acp_agent.cancel(state.session_id)
+
+    assert state.interrupted_prompt_text == ""
+    assert state.interrupted_prompt_at == 0.0
+    assert state.cancel_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_acp_completed_turn_marks_response_delivered():
+    """The delivered flag is actually set by a normal completed turn."""
+    acp_agent, state, fake, _conn = make_agent_and_state()
+
+    await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="hello")],
+    )
+
+    assert state.response_delivered is True
+    # And a cancel arriving now (turn idle) still arms nothing.
+    await acp_agent.cancel(state.session_id)
+    assert state.interrupted_prompt_text == ""
 
 
 
