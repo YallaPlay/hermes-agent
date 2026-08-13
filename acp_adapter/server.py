@@ -3263,6 +3263,13 @@ class HermesACPAgent(acp.Agent):
         state = self.session_manager.get_session(session_id)
         if state is None:
             logger.error("prompt: session %s not found", session_id)
+            if completion_sink is not None:
+                completion_sink(
+                    "",
+                    False,
+                    "failed",
+                    f"ACP session {session_id} was not found.",
+                )
             return PromptResponse(stop_reason="refusal")
 
         user_text = _extract_text(prompt).strip()
@@ -3285,8 +3292,22 @@ class HermesACPAgent(acp.Agent):
                 # A truncate with nothing to resend is not a supported shape —
                 # the rewind extension is always "edit & resend". Fail loudly
                 # instead of dropping history with no replacement turn.
+                if completion_sink is not None:
+                    completion_sink(
+                        "",
+                        False,
+                        "failed",
+                        "The spawned turn requested keepHistory with an empty prompt.",
+                    )
                 raise acp.RequestError.invalid_params(
                     {"reason": "_meta.hermes.keepHistory requires a non-empty prompt"}
+                )
+            if completion_sink is not None:
+                completion_sink(
+                    "",
+                    False,
+                    "failed",
+                    "The spawned turn received an empty prompt.",
                 )
             return PromptResponse(stop_reason="end_turn")
 
@@ -3296,6 +3317,13 @@ class HermesACPAgent(acp.Agent):
                     # The executor thread owns state.history mid-turn; queueing
                     # the text while dropping the rewind would silently keep the
                     # turn being rewound away. Clients cancel first, then rewind.
+                    if completion_sink is not None:
+                        completion_sink(
+                            "",
+                            False,
+                            "failed",
+                            "The spawned turn cannot rewind a session while it is running.",
+                        )
                     raise acp.RequestError.invalid_params(
                         {"reason": "cannot rewind while a turn is running"}
                     )
@@ -3380,6 +3408,13 @@ class HermesACPAgent(acp.Agent):
         ):
             response_text = self._handle_slash_command(user_text, state)
             if response_text is not None:
+                if completion_sink is not None:
+                    completion_sink(
+                        "",
+                        False,
+                        "failed",
+                        "The spawned prompt resolved as a local slash command, not an agent turn.",
+                    )
                 if self._conn:
                     update = acp.update_agent_message_text(response_text)
                     await self._conn.session_update(session_id, update)
@@ -3401,6 +3436,7 @@ class HermesACPAgent(acp.Agent):
                     text_only_prompt
                     and isinstance(user_content, str)
                     and not synthetic_notification
+                    and completion_sink is None
                     and getattr(
                         state.agent,
                         "_supports_active_turn_redirect",
@@ -3786,7 +3822,37 @@ class HermesACPAgent(acp.Agent):
                 with state.runtime_lock:
                     state.is_running = False
                     state.current_prompt_text = ""
-                await self._send_turn_status_update(state, running=False)
+                    completion_entries = []
+                    retained_entries = []
+                    for entry in state.queued_prompts:
+                        if (
+                            isinstance(entry, QueuedPrompt)
+                            and isinstance(entry.completion_sink, _TurnCompletionSink)
+                        ):
+                            completion_entries.append(entry)
+                        else:
+                            retained_entries.append(entry)
+                    state.queued_prompts = retained_entries
+                if completion_sink is not None:
+                    completion_sink(
+                        "",
+                        False,
+                        "failed",
+                        "The ACP executor could not start the spawned turn.",
+                    )
+                _fail_queued_completion_sinks(
+                    completion_entries,
+                    interrupted=False,
+                    error="The ACP executor failed before queued spawned work could run.",
+                )
+                try:
+                    await self._send_turn_status_update(state, running=False)
+                except Exception:
+                    logger.debug(
+                        "Could not emit idle status after executor failure for %s",
+                        session_id,
+                        exc_info=True,
+                    )
                 return PromptResponse(stop_reason="end_turn")
 
             # Absolute index of this turn's user message in the post-turn history,

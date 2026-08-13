@@ -3657,6 +3657,156 @@ class TestNotificationDelivery:
         assert sink.queued is False
         assert delivered[0][1] is True
         assert state.queued_prompts == ["ordinary queued user prompt"]
+
+    @pytest.mark.asyncio
+    async def test_executor_error_resolves_own_and_queued_completion_sinks(self, agent):
+        from acp_adapter.server import _TurnCompletionSink
+
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        delivered = []
+        own_sink = _TurnCompletionSink(
+            lambda *args: delivered.append(("own", args))
+        )
+        queued_sink = _TurnCompletionSink(
+            lambda *args: delivered.append(("queued", args)),
+            queued=True,
+        )
+        state.queued_prompts.extend(
+            [
+                QueuedPrompt(text="queued child", completion_sink=queued_sink),
+                "ordinary queued user prompt",
+            ]
+        )
+        broken_executor = MagicMock()
+        broken_executor.submit.side_effect = RuntimeError("executor closed")
+        agent._conn = None
+        agent._send_turn_status_update = AsyncMock(
+            side_effect=[None, RuntimeError("client disconnected")]
+        )
+
+        with patch("acp_adapter.server._executor", broken_executor):
+            response = await agent.prompt(
+                prompt=[TextContentBlock(type="text", text="spawned turn")],
+                session_id=new_resp.session_id,
+                _turn_completion_sink=own_sink,
+            )
+
+        assert response.stop_reason == "end_turn"
+        assert {name for name, _ in delivered} == {"own", "queued"}
+        assert all(args[2] == "failed" for _, args in delivered)
+        assert own_sink.delivery_emitted and queued_sink.delivery_emitted
+        assert state.queued_prompts == ["ordinary queued user prompt"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("prompt_text", "expected_error"),
+        [
+            ("", "empty"),
+            ("/help", "slash command"),
+        ],
+    )
+    async def test_early_return_resolves_completion_sink(
+        self,
+        agent,
+        prompt_text,
+        expected_error,
+    ):
+        from acp_adapter.server import _TurnCompletionSink
+
+        new_resp = await agent.new_session(cwd=".")
+        delivered = []
+        sink = _TurnCompletionSink(lambda *args: delivered.append(args))
+        agent._conn = None
+
+        response = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text=prompt_text)],
+            session_id=new_resp.session_id,
+            _turn_completion_sink=sink,
+        )
+
+        assert response.stop_reason == "end_turn"
+        assert sink.delivery_emitted is True
+        assert delivered[0][2] == "failed"
+        assert expected_error in delivered[0][3].lower()
+
+    @pytest.mark.asyncio
+    async def test_missing_session_resolves_completion_sink(self, agent):
+        from acp_adapter.server import _TurnCompletionSink
+
+        delivered = []
+        sink = _TurnCompletionSink(lambda *args: delivered.append(args))
+
+        response = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="spawned turn")],
+            session_id="missing-session",
+            _turn_completion_sink=sink,
+        )
+
+        assert response.stop_reason == "refusal"
+        assert sink.delivery_emitted is True
+        assert delivered[0][2] == "failed"
+        assert "not found" in delivered[0][3].lower()
+
+    @pytest.mark.asyncio
+    async def test_completion_sink_disables_active_turn_redirect(self, agent):
+        from acp_adapter.server import _TurnCompletionSink
+
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        state.is_running = True
+        state.agent._supports_active_turn_redirect = True
+        state.agent.redirect = MagicMock(return_value=True)
+        sink = _TurnCompletionSink(lambda *_args: None)
+        agent._conn = None
+
+        response = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="spawned turn")],
+            session_id=new_resp.session_id,
+            _turn_completion_sink=sink,
+        )
+
+        assert response.stop_reason == "end_turn"
+        state.agent.redirect.assert_not_called()
+        assert sink.queued is True
+        assert state.queued_prompts == [
+            QueuedPrompt(text="spawned turn", completion_sink=sink)
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("prompt_text", "is_running", "expected_error"),
+        [
+            ("", False, "empty prompt"),
+            ("spawned turn", True, "cannot rewind"),
+        ],
+    )
+    async def test_keep_history_validation_resolves_completion_sink(
+        self,
+        agent,
+        prompt_text,
+        is_running,
+        expected_error,
+    ):
+        from acp_adapter.server import _TurnCompletionSink
+
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        state.is_running = is_running
+        delivered = []
+        sink = _TurnCompletionSink(lambda *args: delivered.append(args))
+
+        with pytest.raises(acp.RequestError):
+            await agent.prompt(
+                prompt=[TextContentBlock(type="text", text=prompt_text)],
+                session_id=new_resp.session_id,
+                _turn_completion_sink=sink,
+                hermes={"keepHistory": 0},
+            )
+
+        assert sink.delivery_emitted is True
+        assert delivered[0][2] == "failed"
+        assert expected_error in delivered[0][3].lower()
     @pytest.mark.asyncio
     async def test_queued_notification_survives_drain_echo_failure(self, agent):
         """M1: a client disconnect during the post-turn drain's user-message
