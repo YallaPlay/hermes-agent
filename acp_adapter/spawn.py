@@ -20,6 +20,7 @@ spawn script remains correct for walk-away durability.
 from __future__ import annotations
 
 import json
+import inspect
 import logging
 from contextvars import ContextVar, Token
 from typing import Any, Callable, Optional
@@ -38,8 +39,10 @@ SPAWN_SESSION_TOOL_SCHEMA: dict[str, Any] = {
             "running ACP server and start its first turn immediately in the "
             "background. The new session is visibly linked to this parent but "
             "does not copy its conversation history. "
-            "Returns the new session id right away — do not wait for the "
-            "spawned turn to finish. The session appears in the VS Code "
+            "Returns the new session id right away. By default, the spawned "
+            "first-turn result is delivered back to this parent automatically; "
+            "set deliver_result_to_parent=false only for a child-owned handoff. "
+            "Do not poll for completion. The session appears in the VS Code "
             "sessions sidebar with live streaming and steer support. Use for "
             "handoff/continuation sessions that should stay visible in this "
             "window. NOT durable across a window reload: the spawned turn "
@@ -91,16 +94,21 @@ SPAWN_SESSION_TOOL_SCHEMA: dict[str, Any] = {
                         "session's model."
                     ),
                 },
+                "deliver_result_to_parent": {
+                    "type": "boolean",
+                    "description": (
+                        "Return the spawned first-turn result to the parent "
+                        "session. Defaults to true; set false only for a "
+                        "child-owned handoff."
+                    ),
+                },
             },
             "required": ["prompt"],
         },
     },
 }
 
-# (prompt, cwd, title, provider, model) -> new session id. Raises on failure.
-SpawnSessionRequester = Callable[
-    [str, Optional[str], Optional[str], Optional[str], Optional[str]], str
-]
+SpawnSessionRequester = Callable[..., str]
 
 _SPAWN_SESSION_REQUESTER: ContextVar[SpawnSessionRequester | None] = ContextVar(
     "ACP_SPAWN_SESSION_REQUESTER",
@@ -197,9 +205,36 @@ def maybe_dispatch_spawn_session(
     provider = str(provider).strip() if provider else None
     model = arguments.get("model")
     model = str(model).strip() if model else None
+    delivery_value = arguments.get("deliver_result_to_parent", True)
+    if not isinstance(delivery_value, bool):
+        return json.dumps(
+            {"error": "deliver_result_to_parent must be a boolean"},
+            ensure_ascii=False,
+        )
+    delivery_supported = True
 
     try:
-        session_id = requester(prompt_text, cwd, title, provider, model)
+        try:
+            signature = inspect.signature(requester)
+            parameters = signature.parameters.values()
+            supports_delivery = (
+                "deliver_result_to_parent" in signature.parameters
+                or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters)
+            )
+        except (TypeError, ValueError):
+            supports_delivery = True
+        if supports_delivery:
+            session_id = requester(
+                prompt_text,
+                cwd,
+                title,
+                provider,
+                model,
+                deliver_result_to_parent=delivery_value,
+            )
+        else:
+            session_id = requester(prompt_text, cwd, title, provider, model)
+            delivery_supported = False
     except Exception as exc:
         logger.warning("ACP spawn_session requester failed: %s", exc)
         return json.dumps(
@@ -211,9 +246,16 @@ def maybe_dispatch_spawn_session(
             "success": True,
             "session_id": session_id,
             "note": (
-                "Derived clean-context session created in this ACP server; "
-                "its first turn is running in the background. It will appear "
-                "in the sessions sidebar. Do not wait for it here."
+                "Derived clean-context session created; its first-turn result "
+                "will return automatically to this parent. Do not poll it."
+                if delivery_value and delivery_supported
+                else (
+                    "Derived clean-context session created, but automatic parent "
+                    "delivery is unavailable for this legacy requester. Inspect "
+                    "the child session directly."
+                    if delivery_value
+                    else "Derived child-owned session created; no parent completion will be sent."
+                )
             ),
         },
         ensure_ascii=False,

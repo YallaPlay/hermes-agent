@@ -12,6 +12,7 @@ Covers the two-layer fix for the 2026-07-15 concurrent-writers incident:
 """
 
 import asyncio
+import inspect
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -33,6 +34,7 @@ from acp_adapter.spawn import (
     reset_spawn_session_requester,
     set_spawn_session_requester,
 )
+from tools.process_registry import process_registry
 
 
 @pytest.fixture()
@@ -200,6 +202,7 @@ class TestSpawnToolInjection:
         properties = fake.tools[0]["function"]["parameters"]["properties"]
         assert properties["provider"]["type"] == "string"
         assert properties["model"]["type"] == "string"
+        assert properties["deliver_result_to_parent"]["type"] == "boolean"
 
     def test_inject_is_idempotent(self):
         fake = MagicMock()
@@ -245,12 +248,21 @@ class TestSpawnDispatch:
     def test_dispatch_returns_session_id(self):
         captured = {}
 
-        def _requester(prompt_text, cwd, title, provider=None, model=None):
+        def _requester(
+            prompt_text,
+            cwd,
+            title,
+            provider=None,
+            model=None,
+            *,
+            deliver_result_to_parent=True,
+        ):
             captured["prompt"] = prompt_text
             captured["cwd"] = cwd
             captured["title"] = title
             captured["provider"] = provider
             captured["model"] = model
+            captured["deliver_result_to_parent"] = deliver_result_to_parent
             return "new-session-id"
 
         token = set_spawn_session_requester(_requester)
@@ -272,7 +284,75 @@ class TestSpawnDispatch:
             "title": None,
             "provider": None,
             "model": None,
+            "deliver_result_to_parent": True,
         }
+        assert "return automatically" in payload["note"]
+
+    def test_dispatch_forwards_explicit_child_only_mode(self):
+        captured = {}
+
+        def _requester(
+            prompt_text,
+            cwd,
+            title,
+            provider=None,
+            model=None,
+            *,
+            deliver_result_to_parent=True,
+        ):
+            captured["deliver_result_to_parent"] = deliver_result_to_parent
+            return "child-only-id"
+
+        token = set_spawn_session_requester(_requester)
+        try:
+            payload = _loads(
+                maybe_dispatch_spawn_session(
+                    SPAWN_SESSION_TOOL_NAME,
+                    {"prompt": "take over", "deliver_result_to_parent": False},
+                )
+            )
+        finally:
+            reset_spawn_session_requester(token)
+
+        assert captured["deliver_result_to_parent"] is False
+        assert "no parent completion" in payload["note"].lower()
+
+    @pytest.mark.parametrize("invalid", ["false", 0, 1, None, [], {}])
+    def test_dispatch_rejects_non_boolean_delivery_mode(self, invalid):
+        requester = MagicMock(return_value="should-not-run")
+        token = set_spawn_session_requester(requester)
+        try:
+            payload = _loads(
+                maybe_dispatch_spawn_session(
+                    SPAWN_SESSION_TOOL_NAME,
+                    {"prompt": "go", "deliver_result_to_parent": invalid},
+                )
+            )
+        finally:
+            reset_spawn_session_requester(token)
+
+        assert payload["error"] == "deliver_result_to_parent must be a boolean"
+        requester.assert_not_called()
+
+    def test_legacy_requester_runs_once_and_reports_delivery_unavailable(self):
+        requester = MagicMock(return_value="legacy-child")
+        requester.__signature__ = inspect.Signature(
+            [
+                inspect.Parameter(name, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+                for name in ("prompt_text", "cwd", "title", "provider", "model")
+            ]
+        )
+        token = set_spawn_session_requester(requester)
+        try:
+            payload = _loads(
+                maybe_dispatch_spawn_session(SPAWN_SESSION_TOOL_NAME, {"prompt": "go"})
+            )
+        finally:
+            reset_spawn_session_requester(token)
+
+        requester.assert_called_once_with("go", None, None, None, None)
+        assert payload["session_id"] == "legacy-child"
+        assert "unavailable" in payload["note"].lower()
 
     def test_dispatch_forwards_title(self):
         captured = {}
@@ -363,9 +443,16 @@ class TestServerSpawnRequester:
         started = asyncio.Event()
         spawned = {}
 
-        async def _fake_first_turn(session_id, prompt_text):
+        async def _fake_first_turn(
+            session_id,
+            prompt_text,
+            parent_session_id,
+            deliver_result_to_parent,
+        ):
             spawned["session_id"] = session_id
             spawned["prompt"] = prompt_text
+            spawned["parent_session_id"] = parent_session_id
+            spawned["deliver_result_to_parent"] = deliver_result_to_parent
             started.set()
 
         agent._run_spawned_first_turn = _fake_first_turn
@@ -379,6 +466,8 @@ class TestServerSpawnRequester:
 
         assert spawned["session_id"] == new_id
         assert spawned["prompt"] == "carry on"
+        assert spawned["parent_session_id"] == parent_state.session_id
+        assert spawned["deliver_result_to_parent"] is True
         child = agent.session_manager.get_session(new_id)
         assert child is not None
         assert child.session_id != parent_state.session_id
@@ -649,6 +738,62 @@ class TestServerSpawnRequester:
                        "session_update", None) == "user_message_chunk"
         ]
         assert user_echoes, "spawned prompt was not echoed as a user message"
+
+    @pytest.mark.asyncio
+    async def test_spawned_first_turn_enqueues_result_for_exact_parent(self, agent):
+        parent_resp = await agent.new_session(cwd=".")
+        child_resp = await agent.new_session(cwd=".")
+        child_state = agent.session_manager.get_session(child_resp.session_id)
+        child_state.agent.run_conversation = MagicMock(
+            return_value={
+                "final_response": "verified result",
+                "messages": [
+                    {"role": "user", "content": "spawned work"},
+                    {"role": "assistant", "content": "verified result"},
+                ],
+            }
+        )
+        agent._ensure_notification_watcher = MagicMock()
+        agent._conn = None
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+        await agent._run_spawned_first_turn(
+            child_resp.session_id,
+            "spawned work",
+            parent_resp.session_id,
+            True,
+        )
+
+        event = process_registry.completion_queue.get_nowait()
+        assert event["type"] == "acp_spawn_completion"
+        assert event["session_key"] == parent_resp.session_id
+        assert event["child_session_id"] == child_resp.session_id
+        assert event["result"] == "verified result"
+        assert event["status"] == "completed"
+        assert agent._resolve_notification_session(event) == parent_resp.session_id
+
+    @pytest.mark.asyncio
+    async def test_spawned_first_turn_enqueues_failure_for_parent(self, agent):
+        parent_resp = await agent.new_session(cwd=".")
+        child_resp = await agent.new_session(cwd=".")
+        agent._ensure_notification_watcher = MagicMock()
+        agent._conn = None
+        agent.prompt = AsyncMock(side_effect=RuntimeError("provider exploded"))
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+        await agent._run_spawned_first_turn(
+            child_resp.session_id,
+            "spawned work",
+            parent_resp.session_id,
+            True,
+        )
+
+        event = process_registry.completion_queue.get_nowait()
+        assert event["status"] == "failed"
+        assert "provider exploded" in event["error"]
+        assert event["session_key"] == parent_resp.session_id
 
     @pytest.mark.asyncio
     async def test_prompt_injects_spawn_tool_on_acp_agent(self, agent):

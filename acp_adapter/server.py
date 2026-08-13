@@ -12,6 +12,7 @@ import os
 import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Deque, Optional
 from urllib.parse import unquote, urlparse
@@ -78,6 +79,7 @@ from acp_adapter.events import (
 from acp_adapter.permissions import make_approval_callback
 from acp_adapter.provenance import session_provenance_meta
 from acp_adapter.session import (
+    QueuedPrompt,
     SessionManager,
     SessionState,
     _agent_provider_identity,
@@ -101,6 +103,30 @@ from tools.approval import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _TurnCompletionSink:
+    """Exactly-once callback retained with one prompt across queueing."""
+
+    callback: Any
+    delivery_emitted: bool = False
+    queued: bool = False
+
+    def __call__(
+        self,
+        final_response: str,
+        interrupted: bool,
+        stop_reason: str,
+        error: str | None = None,
+    ) -> None:
+        if self.delivery_emitted:
+            return
+        self.delivery_emitted = True
+        try:
+            self.callback(final_response, interrupted, stop_reason, error)
+        except Exception:
+            logger.exception("ACP spawned-turn completion sink failed")
 
 
 def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, str]]]]:
@@ -2719,7 +2745,13 @@ class HermesACPAgent(acp.Agent):
 
     # ---- Prompt (core) ------------------------------------------------------
 
-    async def _run_spawned_first_turn(self, session_id: str, prompt_text: str) -> None:
+    async def _run_spawned_first_turn(
+        self,
+        session_id: str,
+        prompt_text: str,
+        parent_session_id: str | None = None,
+        deliver_result_to_parent: bool = False,
+    ) -> None:
         """Run a freshly spawned session's first turn as a background task.
 
         Echoes the prompt as a user-message update first (mirrors the queued-
@@ -2729,17 +2761,72 @@ class HermesACPAgent(acp.Agent):
         turn. Exceptions are logged, never raised: the spawning session's
         tool call already returned.
         """
+        sink: _TurnCompletionSink | None = None
+        if deliver_result_to_parent:
+            def _emit_completion(
+                final_response: str,
+                interrupted: bool,
+                stop_reason: str,
+                error: str | None,
+            ) -> None:
+                status = "cancelled" if interrupted or stop_reason == "cancelled" else "completed"
+                result_text = str(final_response or "")
+                if status == "completed" and not result_text.strip():
+                    status = "failed"
+                    error = error or "No final assistant response was produced."
+                child_title = self.session_manager.get_session_title(session_id)
+                try:
+                    from tools.process_registry import process_registry
+                    from tools.session_search_tool import _session_link
+
+                    process_registry.completion_queue.put(
+                        {
+                            "type": "acp_spawn_completion",
+                            "session_key": parent_session_id,
+                            "child_session_id": session_id,
+                            "child_title": child_title,
+                            "child_session_link": _session_link(session_id),
+                            "status": status,
+                            "result": result_text,
+                            "error": error,
+                        }
+                    )
+                except Exception:
+                    logger.exception(
+                        "acp_spawn_session: could not enqueue completion for %s",
+                        session_id,
+                    )
+
+            sink = _TurnCompletionSink(_emit_completion)
+
         try:
             if self._conn:
                 await self._conn.session_update(
                     session_id, acp.update_user_message_text(prompt_text)
                 )
-            await self.prompt(
+            response = await self.prompt(
                 prompt=[TextContentBlock(type="text", text=prompt_text)],
                 session_id=session_id,
+                _turn_completion_sink=sink,
             )
-        except Exception:
+            stop_reason = getattr(response, "stop_reason", "end_turn")
+            stop_reason = getattr(stop_reason, "value", stop_reason)
+            if sink is not None and not sink.delivery_emitted and not sink.queued:
+                sink(
+                    "",
+                    stop_reason == "cancelled",
+                    str(stop_reason),
+                    "The spawned turn ended before producing a final assistant response.",
+                )
+        except asyncio.CancelledError:
+            if sink is not None and not sink.delivery_emitted and not sink.queued:
+                sink("", True, "cancelled", "The spawned turn was cancelled.")
+            raise
+        except Exception as exc:
             logger.exception("Spawned ACP session %s first turn failed", session_id)
+            if sink is not None and not sink.delivery_emitted and not sink.queued:
+                detail = f"{type(exc).__name__}: {exc}"
+                sink("", False, "failed", detail[:1000])
 
     async def _deliver_notification(self, session_id: str, text: str) -> None:
         """Deliver a background-completion notification to a session.
@@ -2798,7 +2885,9 @@ class HermesACPAgent(acp.Agent):
             text = "[notification] " + text
         with state.runtime_lock:
             if state.is_running:
-                state.queued_prompts.append(text)
+                state.queued_prompts.append(
+                    QueuedPrompt(text=text, synthetic_notification=True)
+                )
                 return
         try:
             # The echo is best-effort on its own: an attached-but-dying conn
@@ -2976,6 +3065,8 @@ class HermesACPAgent(acp.Agent):
             title: str | None = None,
             provider: str | None = None,
             model: str | None = None,
+            *,
+            deliver_result_to_parent: bool = True,
         ) -> str:
             from agent.async_utils import safe_schedule_threadsafe
 
@@ -3037,7 +3128,12 @@ class HermesACPAgent(acp.Agent):
                             exc_info=True,
                         )
             future = safe_schedule_threadsafe(
-                self._run_spawned_first_turn(new_state.session_id, prompt_text),
+                self._run_spawned_first_turn(
+                    new_state.session_id,
+                    prompt_text,
+                    parent_state.session_id,
+                    deliver_result_to_parent,
+                ),
                 loop,
                 logger=logger,
                 log_message="acp_spawn_session: failed to schedule first turn",
@@ -3129,6 +3225,9 @@ class HermesACPAgent(acp.Agent):
           with the "/" neutralization in ``_deliver_notification``).
         """
         synthetic_notification = bool(kwargs.pop("_synthetic_notification", False))
+        completion_sink = kwargs.pop("_turn_completion_sink", None)
+        if not callable(completion_sink):
+            completion_sink = None
         # Defensive resurrection: if the watcher task ever died (or on_connect
         # ran without a loop), the first prompt from loop context restarts it.
         self._ensure_notification_watcher()
@@ -3291,7 +3390,15 @@ class HermesACPAgent(acp.Agent):
                         )
                 if not redirected:
                     queued_text = user_text or "[Image attachment]"
-                    state.queued_prompts.append(queued_text)
+                    if isinstance(completion_sink, _TurnCompletionSink):
+                        completion_sink.queued = True
+                    state.queued_prompts.append(
+                        QueuedPrompt(
+                            text=queued_text,
+                            synthetic_notification=synthetic_notification,
+                            completion_sink=completion_sink,
+                        )
+                    )
                     queued_depth = len(state.queued_prompts)
             else:
                 state.is_running = True
@@ -3730,6 +3837,12 @@ class HermesACPAgent(acp.Agent):
                     # so makes the NEXT, unrelated prompt replay finished work.
                     with state.runtime_lock:
                         state.response_delivered = True
+                if completion_sink is not None:
+                    completion_sink(
+                        final_response,
+                        interrupted,
+                        "cancelled" if interrupted else "end_turn",
+                    )
                 if (
                     final_response
                     and conn
@@ -3756,7 +3869,7 @@ class HermesACPAgent(acp.Agent):
                 # matching running=True update above). Inside the finally so a
                 # tail exception can't strand a client in steer mode.
                 await self._send_turn_status_update(state, running=False)
-        except BaseException:
+        except BaseException as exc:
             # Reset (idempotent if an inner handler already did) and flip any
             # attached panel back to idle, then let the error propagate —
             # prompt() has no business swallowing setup failures.
@@ -3767,13 +3880,29 @@ class HermesACPAgent(acp.Agent):
                 await self._send_turn_status_update(state, running=False)
             except Exception:
                 pass  # best-effort; never mask the original error
+            if completion_sink is not None:
+                interrupted = isinstance(exc, asyncio.CancelledError)
+                completion_sink(
+                    "",
+                    interrupted,
+                    "cancelled" if interrupted else "failed",
+                    f"{type(exc).__name__}: {exc}"[:1000],
+                )
             raise
 
         while True:
             with state.runtime_lock:
                 if not state.queued_prompts:
                     break
-                next_prompt = state.queued_prompts.pop(0)
+                queued_entry = state.queued_prompts.pop(0)
+            if isinstance(queued_entry, QueuedPrompt):
+                next_prompt = queued_entry.text
+                queued_synthetic = queued_entry.synthetic_notification
+                queued_sink = queued_entry.completion_sink
+            else:
+                next_prompt = str(queued_entry)
+                queued_synthetic = False
+                queued_sink = None
             # The echo is best-effort: the text was already popped from the
             # queue, so a raise here (e.g. ConnectionResetError from a client
             # that disconnected mid-turn) escaping prompt() would LOSE it —
@@ -3795,6 +3924,8 @@ class HermesACPAgent(acp.Agent):
             await self.prompt(
                 prompt=[TextContentBlock(type="text", text=next_prompt)],
                 session_id=session_id,
+                _synthetic_notification=queued_synthetic,
+                _turn_completion_sink=queued_sink,
             )
 
         usage = None

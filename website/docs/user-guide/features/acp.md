@@ -95,6 +95,23 @@ What it does:
 
 The bootstrap is idempotent — re-running it is fast and skips work that's already done.
 
+## Spawn a derived session
+
+ACP sessions expose `acp_spawn_session` for work that should run in a separate,
+clean-context session while remaining visible in the same editor window. The
+tool returns the child session ID immediately, and the child appears in the
+session sidebar with live streaming and steer support.
+
+By default, the child's first-turn result is delivered back to the parent
+session automatically. The parent receives the child result, validates it in
+the current conversation, and then presents the substantive answer or artifact;
+there is no need to poll the child session. Set
+`deliver_result_to_parent=false` only for a handoff where the child session owns
+the follow-up and the parent should not resume automatically.
+
+This mechanism is process-local. Closing or reloading the ACP host can terminate
+an in-flight spawned turn; use a detached CLI session for walk-away durability.
+
 ## Host setup
 
 ### Buzz channels (relay bridge)

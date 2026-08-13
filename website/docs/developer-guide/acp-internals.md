@@ -163,6 +163,21 @@ The event bridge tracks tool IDs FIFO per tool name, not just one ID per name. T
 
 Without FIFO queues, completion events would attach to the wrong tool invocation.
 
+## Derived-session completion delivery
+
+`acp_spawn_session` creates the child session immediately and runs its first
+turn in a background task. Parent delivery defaults on. A per-turn completion
+sink captures the finalized assistant response (or a bounded failure/cancel
+description) exactly once and enqueues an `acp_spawn_completion` event on the
+existing process notification queue, keyed to the exact parent ACP session.
+
+The standard ACP notification watcher owns, resolves, formats, and schedules
+the parent follow-up. If the parent is already running, the synthetic prompt is
+queued with its synthetic-notification metadata intact; the drain preserves
+that metadata so completion delivery never redirects a live user turn or merges
+cancelled user text. Child output is wrapped as untrusted payload and escaped
+before the parent model sees it.
+
 ## Approval callback restoration
 
 ACP temporarily installs an approval callback on the terminal tool during prompt execution, then restores the previous callback afterward. This avoids leaving ACP session-specific approval handlers installed globally forever.

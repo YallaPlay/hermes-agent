@@ -271,6 +271,15 @@ def _clear_task_cwd(task_id: str) -> None:
 
 
 @dataclass
+class QueuedPrompt:
+    """A prompt deferred until the current ACP turn becomes idle."""
+
+    text: str
+    synthetic_notification: bool = False
+    completion_sink: Any = None
+
+
+@dataclass
 class SessionState:
     """Tracks per-session state for an ACP-managed Hermes agent."""
 
@@ -304,7 +313,8 @@ class SessionState:
     history: List[Dict[str, Any]] = field(default_factory=list)
     cancel_event: Any = None  # threading.Event
     is_running: bool = False
-    queued_prompts: List[str] = field(default_factory=list)
+    # Plain strings are normalized by the drain for backward compatibility.
+    queued_prompts: List[Any] = field(default_factory=list)
     runtime_lock: Any = field(default_factory=Lock)
     current_prompt_text: str = ""
     interrupted_prompt_text: str = ""

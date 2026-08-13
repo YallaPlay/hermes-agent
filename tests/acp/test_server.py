@@ -5,6 +5,7 @@ import asyncio
 import base64
 import os
 import re
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
@@ -46,6 +47,7 @@ from acp_adapter.server import (
     HERMES_VERSION,
 )
 from acp_adapter.session import SessionManager
+from acp_adapter.session import QueuedPrompt
 from hermes_state import SessionDB
 
 
@@ -3333,7 +3335,11 @@ class TestNotificationDelivery:
 
         await agent._deliver_notification("sess-busy", self.NOTIFY_TEXT)
 
-        assert state.queued_prompts == [self.NOTIFY_TEXT]
+        assert len(state.queued_prompts) == 1
+        queued = state.queued_prompts[0]
+        assert isinstance(queued, QueuedPrompt)
+        assert queued.text == self.NOTIFY_TEXT
+        assert queued.synthetic_notification is True
         mock_conn.session_update.assert_not_awaited()
         agent.prompt.assert_not_awaited()
 
@@ -3432,7 +3438,11 @@ class TestNotificationDelivery:
         # Invariant: synthetic events must never interrupt/steer a running
         # turn. Worst case for the race is a silent queue.
         state.agent.redirect.assert_not_called()
-        assert state.queued_prompts == [self.NOTIFY_TEXT]
+        assert len(state.queued_prompts) == 1
+        queued = state.queued_prompts[0]
+        assert isinstance(queued, QueuedPrompt)
+        assert queued.text == self.NOTIFY_TEXT
+        assert queued.synthetic_notification is True
         for call in mock_conn.session_update.await_args_list:
             update = self._update_of(call)
             text = getattr(getattr(update, "content", None), "text", "") or ""
@@ -3507,8 +3517,45 @@ class TestNotificationDelivery:
             new_resp.session_id, "/compress the universe"
         )
         assert state.queued_prompts, "busy delivery did not queue"
-        assert not state.queued_prompts[-1].lstrip().startswith("/")
-        assert "/compress the universe" in state.queued_prompts[-1]
+        assert not state.queued_prompts[-1].text.lstrip().startswith("/")
+        assert "/compress the universe" in state.queued_prompts[-1].text
+
+    @pytest.mark.asyncio
+    async def test_busy_notification_drain_preserves_synthetic_semantics(self, agent):
+        """Queued internal delivery must not merge abandoned user text."""
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        cancelled_text = "deploy the abandoned change"
+        state.interrupted_prompt_text = cancelled_text
+        state.interrupted_prompt_at = time.monotonic()
+
+        captured = []
+
+        def _run(**kwargs):
+            captured.append(kwargs["user_message"])
+            if len(captured) == 1:
+                with state.runtime_lock:
+                    state.queued_prompts.append(
+                        QueuedPrompt(
+                            text=self.NOTIFY_TEXT,
+                            synthetic_notification=True,
+                        )
+                    )
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = MagicMock(side_effect=_run)
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="regular user turn")],
+            session_id=new_resp.session_id,
+        )
+
+        assert len(captured) == 2
+        assert self.NOTIFY_TEXT in captured[1]
+        assert cancelled_text not in captured[1]
     @pytest.mark.asyncio
     async def test_queued_notification_survives_drain_echo_failure(self, agent):
         """M1: a client disconnect during the post-turn drain's user-message
