@@ -796,6 +796,36 @@ class TestServerSpawnRequester:
         assert event["session_key"] == parent_resp.session_id
 
     @pytest.mark.asyncio
+    async def test_spawned_first_turn_bounds_parent_result_payload(self, agent):
+        from acp_adapter.server import _ACP_SPAWN_RESULT_MAX_CHARS
+
+        parent_resp = await agent.new_session(cwd=".")
+        child_resp = await agent.new_session(cwd=".")
+        child_state = agent.session_manager.get_session(child_resp.session_id)
+        child_state.agent.run_conversation = MagicMock(
+            return_value={
+                "final_response": "x" * (_ACP_SPAWN_RESULT_MAX_CHARS + 50),
+                "messages": [],
+            }
+        )
+        agent._ensure_notification_watcher = MagicMock()
+        agent._conn = None
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+        await agent._run_spawned_first_turn(
+            child_resp.session_id,
+            "spawned work",
+            parent_resp.session_id,
+            True,
+        )
+
+        event = process_registry.completion_queue.get_nowait()
+        assert event["status"] == "completed"
+        assert len(event["result"]) < _ACP_SPAWN_RESULT_MAX_CHARS + 200
+        assert "truncated for parent delivery" in event["result"]
+
+    @pytest.mark.asyncio
     async def test_prompt_injects_spawn_tool_on_acp_agent(self, agent):
         """A normal prompt() run advertises acp_spawn_session on the agent's
         tool surface (ACP sessions only)."""

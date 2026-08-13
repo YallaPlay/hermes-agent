@@ -104,6 +104,8 @@ from tools.approval import (
 
 logger = logging.getLogger(__name__)
 
+_ACP_SPAWN_RESULT_MAX_CHARS = 100_000
+
 
 @dataclass
 class _TurnCompletionSink:
@@ -127,6 +129,28 @@ class _TurnCompletionSink:
             self.callback(final_response, interrupted, stop_reason, error)
         except Exception:
             logger.exception("ACP spawned-turn completion sink failed")
+
+
+def _fail_queued_completion_sinks(
+    entries: list[Any],
+    *,
+    interrupted: bool,
+    error: str,
+) -> None:
+    """Resolve completion sinks on queued prompts that will not be drained."""
+    for entry in entries:
+        if not isinstance(entry, QueuedPrompt):
+            continue
+        sink = entry.completion_sink
+        if not isinstance(sink, _TurnCompletionSink) or sink.delivery_emitted:
+            continue
+        sink.queued = False
+        sink(
+            "",
+            interrupted,
+            "cancelled" if interrupted else "failed",
+            error,
+        )
 
 
 def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, str]]]]:
@@ -2774,6 +2798,11 @@ class HermesACPAgent(acp.Agent):
                 if status == "completed" and not result_text.strip():
                     status = "failed"
                     error = error or "No final assistant response was produced."
+                if len(result_text) > _ACP_SPAWN_RESULT_MAX_CHARS:
+                    result_text = (
+                        result_text[:_ACP_SPAWN_RESULT_MAX_CHARS]
+                        + "\n\n[Child result truncated for parent delivery; inspect the child session for the full response.]"
+                    )
                 child_title = self.session_manager.get_session_title(session_id)
                 try:
                     from tools.process_registry import process_registry
@@ -3876,6 +3905,17 @@ class HermesACPAgent(acp.Agent):
             with state.runtime_lock:
                 state.is_running = False
                 state.current_prompt_text = ""
+                completion_entries = []
+                retained_entries = []
+                for entry in state.queued_prompts:
+                    if (
+                        isinstance(entry, QueuedPrompt)
+                        and isinstance(entry.completion_sink, _TurnCompletionSink)
+                    ):
+                        completion_entries.append(entry)
+                    else:
+                        retained_entries.append(entry)
+                state.queued_prompts = retained_entries
             try:
                 await self._send_turn_status_update(state, running=False)
             except Exception:
@@ -3888,6 +3928,16 @@ class HermesACPAgent(acp.Agent):
                     "cancelled" if interrupted else "failed",
                     f"{type(exc).__name__}: {exc}"[:1000],
                 )
+            interrupted = isinstance(exc, asyncio.CancelledError)
+            _fail_queued_completion_sinks(
+                completion_entries,
+                interrupted=interrupted,
+                error=(
+                    "The queued spawned turn was cancelled before delivery."
+                    if interrupted
+                    else f"Queued spawned turn failed: {type(exc).__name__}: {exc}"[:1000]
+                ),
+            )
             raise
 
         while True:
@@ -3899,6 +3949,8 @@ class HermesACPAgent(acp.Agent):
                 next_prompt = queued_entry.text
                 queued_synthetic = queued_entry.synthetic_notification
                 queued_sink = queued_entry.completion_sink
+                if isinstance(queued_sink, _TurnCompletionSink):
+                    queued_sink.queued = False
             else:
                 next_prompt = str(queued_entry)
                 queued_synthetic = False
@@ -3921,12 +3973,37 @@ class HermesACPAgent(acp.Agent):
                         session_id,
                         exc_info=True,
                     )
-            await self.prompt(
-                prompt=[TextContentBlock(type="text", text=next_prompt)],
-                session_id=session_id,
-                _synthetic_notification=queued_synthetic,
-                _turn_completion_sink=queued_sink,
-            )
+            try:
+                await self.prompt(
+                    prompt=[TextContentBlock(type="text", text=next_prompt)],
+                    session_id=session_id,
+                    _synthetic_notification=queued_synthetic,
+                    _turn_completion_sink=queued_sink,
+                )
+            except BaseException as exc:
+                interrupted = isinstance(exc, asyncio.CancelledError)
+                completion_entries = [queued_entry]
+                with state.runtime_lock:
+                    retained_entries = []
+                    for entry in state.queued_prompts:
+                        if (
+                            isinstance(entry, QueuedPrompt)
+                            and isinstance(entry.completion_sink, _TurnCompletionSink)
+                        ):
+                            completion_entries.append(entry)
+                        else:
+                            retained_entries.append(entry)
+                    state.queued_prompts = retained_entries
+                _fail_queued_completion_sinks(
+                    completion_entries,
+                    interrupted=interrupted,
+                    error=(
+                        "The queued spawned turn was cancelled before delivery."
+                        if interrupted
+                        else f"Queued spawned turn failed: {type(exc).__name__}: {exc}"[:1000]
+                    ),
+                )
+                raise
 
         usage = None
         if any(result.get(key) is not None for key in ("prompt_tokens", "completion_tokens", "total_tokens")):

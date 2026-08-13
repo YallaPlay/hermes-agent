@@ -3556,6 +3556,107 @@ class TestNotificationDelivery:
         assert len(captured) == 2
         assert self.NOTIFY_TEXT in captured[1]
         assert cancelled_text not in captured[1]
+
+    @pytest.mark.asyncio
+    async def test_queued_completion_sink_clears_queued_state_when_drained(self, agent):
+        from acp_adapter.server import _TurnCompletionSink
+
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        delivered = []
+        sink = _TurnCompletionSink(lambda *args: delivered.append(args), queued=True)
+        state.queued_prompts.append(
+            QueuedPrompt(text="queued child work", completion_sink=sink)
+        )
+        state.agent.run_conversation = MagicMock(
+            return_value={"final_response": "parent turn done", "messages": []}
+        )
+        agent._conn = None
+
+        await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="parent turn")],
+            session_id=new_resp.session_id,
+        )
+
+        assert sink.queued is False
+        assert sink.delivery_emitted is True
+        assert delivered[0][0] == "parent turn done"
+
+    @pytest.mark.asyncio
+    async def test_queued_completion_sinks_fail_if_drain_is_cancelled(self, agent):
+        from acp_adapter.server import _TurnCompletionSink
+
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        delivered = []
+        first = _TurnCompletionSink(lambda *args: delivered.append(("first", args)), queued=True)
+        second = _TurnCompletionSink(lambda *args: delivered.append(("second", args)), queued=True)
+        state.queued_prompts.extend(
+            [
+                QueuedPrompt(text="first", completion_sink=first),
+                QueuedPrompt(text="second", completion_sink=second),
+            ]
+        )
+        state.agent.run_conversation = MagicMock(
+            return_value={"final_response": "parent done", "messages": []}
+        )
+        real_prompt = agent.prompt
+        calls = 0
+
+        async def _cancel_first_drain(*args, **kwargs):
+            nonlocal calls
+            if kwargs.get("_turn_completion_sink") is not None:
+                calls += 1
+                raise asyncio.CancelledError()
+            return await real_prompt(*args, **kwargs)
+
+        agent.prompt = _cancel_first_drain
+        agent._conn = None
+
+        with pytest.raises(asyncio.CancelledError):
+            await agent.prompt(
+                prompt=[TextContentBlock(type="text", text="parent turn")],
+                session_id=new_resp.session_id,
+            )
+
+        assert calls == 1
+        assert {name for name, _ in delivered} == {"first", "second"}
+        assert all(args[1] is True for _, args in delivered)
+        assert first.delivery_emitted and second.delivery_emitted
+        assert state.queued_prompts == []
+
+    @pytest.mark.asyncio
+    async def test_queued_completion_sinks_fail_if_parent_turn_is_cancelled(self, agent):
+        from acp_adapter.server import _TurnCompletionSink
+
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        delivered = []
+        sink = _TurnCompletionSink(lambda *args: delivered.append(args), queued=True)
+        state.queued_prompts.extend(
+            [
+                QueuedPrompt(text="queued child", completion_sink=sink),
+                "ordinary queued user prompt",
+            ]
+        )
+
+        async def _cancel_on_running(_state, *, running):
+            if running:
+                raise asyncio.CancelledError()
+
+        agent._send_turn_status_update = _cancel_on_running
+        agent._conn = None
+
+        with pytest.raises(asyncio.CancelledError):
+            await agent.prompt(
+                prompt=[TextContentBlock(type="text", text="parent turn")],
+                session_id=new_resp.session_id,
+            )
+
+        assert sink.delivery_emitted is True
+        assert sink.queued is False
+        assert delivered[0][1] is True
+        assert state.queued_prompts == ["ordinary queued user prompt"]
     @pytest.mark.asyncio
     async def test_queued_notification_survives_drain_echo_failure(self, agent):
         """M1: a client disconnect during the post-turn drain's user-message
