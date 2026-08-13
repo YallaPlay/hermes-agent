@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shlex
 import signal
 import subprocess
@@ -2785,9 +2786,22 @@ def _format_async_delegation(evt: dict) -> str:
 def _neutralize_acp_spawn_field(value: object, *, multiline: bool = False) -> str:
     """Keep child-controlled text inside a passive, unambiguous envelope."""
     text = str(value or "").replace("\r", "")
-    text = text.replace("[OUT-OF-BAND USER MESSAGE", "[child output marker removed")
-    text = text.replace("[ACP SPAWNED SESSION COMPLETE", "[child header removed")
-    text = text.replace("--- END UNTRUSTED CHILD RESULT ---", "--- child delimiter removed ---")
+    substitutions = (
+        (
+            r"\[\s*/?\s*out[\W_]*of[\W_]*band[\W_]+user[\W_]+message",
+            "[child output marker removed",
+        ),
+        (
+            r"\[\s*acp[\W_]+spawned[\W_]+session[\W_]+complete",
+            "[child header removed",
+        ),
+        (
+            r"[-=]*\s*(?:begin|end)[\W_]+untrusted[\W_]+child[\W_]+result\s*[-=]*",
+            "--- child delimiter removed ---",
+        ),
+    )
+    for pattern, replacement in substitutions:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
     if not multiline:
         text = " ".join(text.splitlines())
     return text
