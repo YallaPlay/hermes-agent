@@ -139,6 +139,49 @@ async def test_acp_steer_slash_command_injects_into_running_agent():
     assert fake.runs == []
 
 
+@pytest.mark.asyncio
+async def test_acp_leftover_steer_runs_as_follow_up_turn():
+    acp_agent, state, fake, _conn = make_agent_and_state()
+    original_run = fake.run_conversation
+
+    def run_with_leftover(**kwargs):
+        result = original_run(**kwargs)
+        if len(fake.runs) == 1:
+            result["pending_steer"] = "also check the logs"
+        return result
+
+    fake.run_conversation = run_with_leftover
+
+    await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="inspect the service")],
+    )
+
+    assert fake.runs == ["inspect the service", "also check the logs"]
+
+
+@pytest.mark.asyncio
+async def test_acp_queued_prompts_run_before_leftover_steer():
+    acp_agent, state, fake, _conn = make_agent_and_state()
+    original_run = fake.run_conversation
+
+    def run_with_leftover(**kwargs):
+        result = original_run(**kwargs)
+        if len(fake.runs) == 1:
+            result["pending_steer"] = "late steer"
+            state.queued_prompts.append("already queued")
+        return result
+
+    fake.run_conversation = run_with_leftover
+
+    await acp_agent.prompt(
+        session_id=state.session_id,
+        prompt=[TextContentBlock(type="text", text="original request")],
+    )
+
+    assert fake.runs == ["original request", "already queued", "late steer"]
+
+
 
 
 
