@@ -3855,6 +3855,8 @@ class HermesACPAgent(acp.Agent):
                     )
                 return PromptResponse(stop_reason="end_turn")
 
+            leftover_steer = result.get("pending_steer")
+
             # Absolute index of this turn's user message in the post-turn history,
             # in the same coordinate space ``fork_session`` slices and history
             # replay stamps as ``_meta.hermes.historyIndex``. Returned to the client
@@ -4070,6 +4072,16 @@ class HermesACPAgent(acp.Agent):
                     ),
                 )
                 raise
+
+        # A steer arriving after the final tool batch cannot be injected into a
+        # tool result. Run it as a follow-up after already-queued prompts instead
+        # of dropping it at the ACP boundary. Do not echo it again: the client
+        # already rendered the steer bubble when it sent the command.
+        if isinstance(leftover_steer, str) and leftover_steer.strip():
+            await self.prompt(
+                prompt=[TextContentBlock(type="text", text=leftover_steer)],
+                session_id=session_id,
+            )
 
         usage = None
         if any(result.get(key) is not None for key in ("prompt_tokens", "completion_tokens", "total_tokens")):
