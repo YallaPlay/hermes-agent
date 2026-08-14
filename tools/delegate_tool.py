@@ -4,8 +4,9 @@ Delegate Tool -- Subagent Architecture
 
 Spawns child AIAgent instances with isolated context, inherited toolsets,
 and their own terminal sessions. Supports single-task and batch (parallel)
-modes. Top-level model calls run in the background; orchestrator children
-wait for their own workers so they can synthesize the results.
+modes. Top-level model calls wait for required results by default and may
+explicitly defer optional work; orchestrator children always wait for their
+own workers so they can synthesize the results.
 
 Each child gets:
   - A fresh conversation (no parent history)
@@ -4134,10 +4135,12 @@ def _build_top_level_description() -> str:
         "terminal session, and toolset, and only its final summary returns to "
         "you. Provide 'goal' for a single task or 'tasks' for a parallel batch "
         "(limits and nesting rules are in the parameter descriptions).\n\n"
-        "Runs in the background: dispatch returns immediately with live "
-        "transcript paths, and the completed result (one consolidated message "
-        "for a batch) re-enters the conversation on its own. Do NOT wait or "
-        "poll; continue other work.\n\n"
+        "Required results return in this tool call by default, so use them "
+        "before finalizing. Set completion_policy='deferred' only when your "
+        "current answer does not depend on the result. Deferred work runs in "
+        "the background: dispatch returns immediately with live transcript "
+        "paths, and the completed result re-enters the conversation on its "
+        "own. Do NOT wait or poll for deferred work.\n\n"
         "USE FOR: reasoning-heavy subtasks, work that would flood your context "
         "with intermediate data, or independent parallel workstreams.\n"
         "DO NOT USE FOR (use these instead):\n"
@@ -4323,16 +4326,16 @@ DELEGATE_TASK_SCHEMA = {
                     "(same semantics as tasks[].output_schema)."
                 ),
             },
-            "background": {
-                "type": "boolean",
+            "completion_policy": {
+                "type": "string",
+                "enum": ["required", "deferred"],
+                "default": "required",
                 "description": (
-                    "DEPRECATED / IGNORED. Top-level single and batch "
-                    "delegations run in the background automatically — you do "
-                    "not need to (and cannot) opt in or out. A single result or "
-                    "consolidated batch result re-enters the conversation when "
-                    "the work finishes; just continue working in the meantime. "
-                    "Setting this has no effect; the parameter remains only for "
-                    "backward compatibility."
+                    "Whether the current answer requires the result. 'required' "
+                    "(default) waits for the single result or consolidated batch "
+                    "result in this tool call. 'deferred' returns immediately and "
+                    "delivers the completed result in a later turn; use it only "
+                    "when the current answer is already complete without it."
                 ),
             },
         },
@@ -4348,18 +4351,15 @@ from tools.registry import registry, tool_error
 def _model_background_value(args: dict, parent_agent=None) -> bool:
     """Background flag for the MODEL-facing dispatch path (registry fallback).
 
-    Delegations from the top-level agent always run in the background — the
-    model does not choose. This applies to both a single task and a fan-out
-    batch (the whole batch is one async unit that joins on all children and
-    returns one consolidated result). The one
-    exception is a delegation from an orchestrator subagent (depth > 0), which
-    needs its workers' results within its own turn. The live path is
-    ``run_agent._dispatch_delegate_task``; this lambda mirrors it for the rare
-    case the intercept is bypassed. Direct Python callers of ``delegate_task``
-    keep the historical synchronous default.
+    Required work stays synchronous so its result is available before the
+    parent finalizes. Only explicitly deferred top-level work is backgrounded.
+    Orchestrator subagents always wait for workers in their current turn. The
+    live path is ``run_agent._dispatch_delegate_task``; this helper mirrors it
+    for the rare case the intercept is bypassed. Direct Python callers of
+    ``delegate_task`` keep the historical synchronous default.
     """
     is_subagent = getattr(parent_agent, "_delegate_depth", 0) > 0
-    return not is_subagent
+    return not is_subagent and args.get("completion_policy", "required") == "deferred"
 
 
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}

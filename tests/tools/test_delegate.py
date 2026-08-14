@@ -64,6 +64,12 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("goal", props)
         self.assertIn("tasks", props)
         self.assertIn("context", props)
+        self.assertNotIn("background", props)
+        self.assertEqual(
+            props["completion_policy"]["enum"],
+            ["required", "deferred"],
+        )
+        self.assertEqual(props["completion_policy"]["default"], "required")
         # toolsets is intentionally NOT exposed to the model — subagents always
         # inherit the parent's toolsets. Letting the model name toolsets was a
         # capability-selection surface the model should not control.
@@ -1301,6 +1307,97 @@ class TestDelegationReasoningEffort(unittest.TestCase):
 
 class TestDispatchDelegateTask(unittest.TestCase):
     """Tests for the _dispatch_delegate_task helper and full param forwarding."""
+
+    def test_registry_fallback_uses_the_same_completion_policy(self):
+        from tools.delegate_tool import _model_background_value
+
+        top_level = _make_mock_parent(depth=0)
+        orchestrator = _make_mock_parent(depth=1)
+
+        self.assertIs(_model_background_value({}, top_level), False)
+        self.assertIs(
+            _model_background_value(
+                {"completion_policy": "deferred"},
+                top_level,
+            ),
+            True,
+        )
+        self.assertIs(
+            _model_background_value(
+                {"completion_policy": "deferred"},
+                orchestrator,
+            ),
+            False,
+        )
+
+    def test_required_completion_is_the_default(self):
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(parent, {"goal": "test"})
+
+        self.assertIs(captured["background"], False)
+
+    def test_deferred_completion_runs_in_the_background(self):
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {"goal": "test", "completion_policy": "deferred"},
+            )
+
+        self.assertIs(captured["background"], True)
+
+    def test_unknown_completion_policy_fails_closed(self):
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {"goal": "test", "completion_policy": "unexpected"},
+            )
+
+        self.assertIs(captured["background"], False)
+
+    def test_orchestrator_waits_even_when_deferred_is_requested(self):
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=1)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {"goal": "test", "completion_policy": "deferred"},
+            )
+
+        self.assertIs(captured["background"], False)
 
     def test_model_acp_args_not_forwarded(self):
         """The live model dispatch path strips hidden ACP transport args."""

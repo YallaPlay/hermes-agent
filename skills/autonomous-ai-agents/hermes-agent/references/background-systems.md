@@ -8,12 +8,15 @@ here; full developer notes live in `AGENTS.md`, user-facing docs under
 
 Spawn a subagent with an isolated context + terminal session.
 
-- **Single:** `delegate_task(goal, context)`.
+- **Single:** `delegate_task(goal, context)` waits for the required result in
+  the current tool call.
 - **Batch:** `delegate_task(tasks=[{goal, ...}, ...])` runs children in
-  parallel, capped by `delegation.max_concurrent_children` (default 3).
-- **Background:** `delegate_task(background=true)` returns a handle
-  immediately and keeps the parent loop going; the child's result
-  re-enters the conversation as a new turn when it finishes.
+  parallel, capped by `delegation.max_concurrent_children` (default 3), and
+  returns one consolidated result.
+- **Deferred:** `delegate_task(completion_policy="deferred")` returns a
+  background handle immediately; use it only when the current answer does not
+  depend on the result. The result re-enters the conversation as a new turn
+  when it finishes.
 - **Roles:** `leaf` (default; cannot re-delegate) vs `orchestrator`
   (can spawn its own workers, bounded by `delegation.max_spawn_depth`).
 - **Not durable.** A backgrounded child is still process-local — if the

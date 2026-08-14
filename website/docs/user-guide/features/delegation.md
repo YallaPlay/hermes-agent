@@ -8,7 +8,7 @@ description: "Spawn isolated child agents for parallel workstreams with delegate
 
 The `delegate_task` tool spawns child AIAgent instances with isolated context, inherited tool access, and their own terminal sessions. Each child gets a fresh conversation and works independently — only its final summary enters the parent's context.
 
-Top-level model calls run in the background automatically. Hermes returns a handle immediately so the conversation can continue, then posts the result back as a new message. An orchestrator subagent waits for its own workers so it can synthesize their results before returning.
+Top-level model calls wait for required results by default, preventing the parent from finalizing before evidence that may change its answer arrives. Work that is genuinely optional for the current answer can use `completion_policy="deferred"`; Hermes then returns a handle immediately and posts the result back as a new message. An orchestrator subagent always waits for its own workers so it can synthesize their results before returning.
 
 ## Single Task
 
@@ -29,6 +29,22 @@ delegate_task(tasks=[
     {"goal": "Research topic B", "context": "Compare the leading explanations"},
     {"goal": "Fix the build", "context": "Project root: /home/user/project"}
 ])
+```
+
+## Completion Policy
+
+`completion_policy` describes whether the current answer depends on the delegated result:
+
+- `required` (default) — wait for the single result or consolidated batch result in the current tool call. Use this whenever a child finding could change the parent's answer.
+- `deferred` — return a background handle immediately and deliver the result in a later turn. Use this only when the current answer is already complete without the result.
+
+```python
+# Optional follow-up that must not delay the current answer
+delegate_task(
+    goal="Collect additional examples for a later follow-up",
+    context="The current answer is complete; this research is optional.",
+    completion_policy="deferred",
+)
 ```
 
 ## How Subagent Context Works
@@ -115,13 +131,13 @@ delegate_task(
 
 ## Batch Mode Details
 
-When a top-level agent provides a `tasks` array, Hermes returns one background handle, runs the subagents in parallel, and posts one consolidated result after every child finishes. An orchestrator subagent waits for its batch in the current turn so it can synthesize the results.
+When a top-level agent provides a `tasks` array, Hermes runs the subagents in parallel and returns one consolidated result after every child finishes. Required batches return that result in the current tool call. Deferred batches return one background handle immediately and post the consolidated result in a later turn. An orchestrator subagent always waits for its batch in the current turn so it can synthesize the results.
 
 - **Maximum concurrency:** 3 tasks by default (configurable via `delegation.max_concurrent_children` or the `DELEGATION_MAX_CONCURRENT_CHILDREN` env var; floor of 1, no hard ceiling). Batches larger than the limit return a tool error rather than being silently truncated.
 - **Thread pool:** Uses `ThreadPoolExecutor` with the configured concurrency limit as max workers
 - **Progress display:** In CLI mode, a tree-view shows tool calls from each subagent in real-time with per-task completion lines. In gateway mode, progress is batched and relayed to the parent's progress callback
 - **Result ordering:** Results are sorted by task index to match input order regardless of completion order
-- **Cancellation:** Follow-up messages do not cancel a top-level background batch. `/stop` or closing/resetting the owning session cancels its active children. Synchronous orchestrator children still follow their parent's interrupt state
+- **Cancellation:** Follow-up messages do not cancel a deferred top-level batch. `/stop` or closing/resetting the owning session cancels its active children. Required delegations and synchronous orchestrator children follow their parent's interrupt state
 
 Synchronous single-task delegation from an orchestrator runs directly without thread pool overhead.
 
@@ -225,7 +241,7 @@ With a hard cap configured, if a subagent times out having made **zero** API cal
 
 ## Stall Detection for Background Subagents
 
-Background delegations (`delegate_task(background=true)`) are watched by a
+Deferred delegations (`delegate_task(completion_policy="deferred")`) are watched by a
 **progress-based stall monitor** — on by default, zero config. Unlike a
 wall-clock timeout, it never touches a child that is making progress, no
 matter how long it runs.
@@ -343,10 +359,10 @@ delegate_task(
 ## Lifetime and Durability
 
 :::warning Background completion durability is not durable execution
-Top-level model-facing `delegate_task` calls run in the background automatically where the session supports later delivery. Hermes returns a handle immediately, and the result re-enters the conversation after the child or batch finishes. Orchestrator subagents wait for their workers in the current turn because they must synthesize those results before returning. Stateless request/response endpoints fall back to synchronous execution when they cannot deliver a detached result later.
+Top-level model-facing `delegate_task` calls wait for required results by default. With `completion_policy="deferred"`, Hermes returns a handle immediately and the result re-enters the conversation after the child or batch finishes where the session supports later delivery. Orchestrator subagents always wait for their workers in the current turn because they must synthesize those results before returning. Stateless request/response endpoints fall back to synchronous execution when they cannot deliver a detached result later.
 
-- Normal follow-up messages do not cancel background children. `/stop` cancels running background delegations, and closing or resetting the owning session discards its active children.
-- Explicit session close/reset interrupts that session's background children. Closing a TUI viewer of a gateway-owned session does not kill the gateway's work.
+- Normal follow-up messages do not cancel deferred children. `/stop` cancels running deferred delegations, and closing or resetting the owning session discards its active children.
+- Explicit session close/reset interrupts that session's deferred children. Closing a TUI viewer of a gateway-owned session does not kill the gateway's work.
 - A Hermes process restart does **not** resume a running child. Its attempt becomes `unknown` because Hermes cannot prove which side effects happened.
 - A child that completed before restart but whose result was not delivered is restored and routed back through the owning session's normal checks.
 - Cancelled children return a structured result (`status="interrupted"`, `exit_reason="interrupted"`), but because the parent was interrupted too, that result often never makes it into a user-visible reply.
@@ -363,7 +379,7 @@ For **durable execution** that must survive session closure or process restart, 
 - Subagents inherit the parent's enabled toolsets; the model cannot select or widen them per call
 - **Nested delegation is opt-in** — only `role="orchestrator"` children can delegate further, and only when `max_spawn_depth` is raised from its default of 1 (flat). Disable globally with `orchestrator_enabled: false`.
 - Leaf subagents **cannot** call: `delegate_task`, `clarify`, `memory`, `send_message`, `cronjob`. Orchestrator subagents retain `delegate_task` but keep the other blocks. Both roles retain `execute_code` (programmatic tool calling) so children can batch mechanical work instead of burning reasoning iterations.
-- **Cancellation follows ownership** — `/stop` or closing/resetting the owning session cancels its background children; synchronous descendants under orchestrators follow their parent's interrupt state
+- **Cancellation follows ownership** — `/stop` or closing/resetting the owning session cancels its deferred children; required delegations and synchronous descendants under orchestrators follow their parent's interrupt state
 - Only the final summary enters the parent's context, keeping token usage efficient
 - Subagents inherit the parent's **API key, provider configuration, and credential pool** (enabling key rotation on rate limits)
 
