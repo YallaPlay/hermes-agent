@@ -2530,6 +2530,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # not GC'd without close() — that would leak tracked fds in
         # _live_connections.  close() drains this set.
         self._read_conns: "set[sqlite3.Connection]" = set()
+        # conn -> owning Thread object, so _get_read_conn can sweep
+        # connections whose thread has died. Without the sweep, a
+        # long-lived shared SessionDB (gateway / ACP worker) leaks one
+        # read connection (db + -wal fds) per short-lived turn thread
+        # until the process hits its fd limit (seen 2026-08-14: ACP
+        # worker at 1024/1024 fds, Errno 24 on session/new).
+        self._read_conn_owners: "dict[sqlite3.Connection, threading.Thread]" = {}
         self._read_conns_lock = threading.Lock()
         # Set when close() begins.  _get_read_conn checks this under the
         # lock so a reader that finishes opening after the drain finds the
@@ -2808,7 +2815,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     conn.close()
                     self._read_local.failed = True
                     return None
+                # Sweep connections owned by dead threads before
+                # registering a new one — the only other release point is
+                # close(), which never runs on shared long-lived instances.
+                dead = [
+                    c for c, t in self._read_conn_owners.items()
+                    if not t.is_alive()
+                ]
+                for c in dead:
+                    self._read_conns.discard(c)
+                    self._read_conn_owners.pop(c, None)
+                    try:
+                        c.close()
+                    except Exception:
+                        pass
                 self._read_conns.add(conn)
+                self._read_conn_owners[conn] = threading.current_thread()
         except sqlite3.Error:
             # Mark this thread failed so we don't retry the open on every
             # query; the locked writer connection still serves reads.
@@ -3410,6 +3432,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._read_conns_closed = True
             read_conns = list(self._read_conns)
             self._read_conns.clear()
+            self._read_conn_owners.clear()
         for conn in read_conns:
             try:
                 conn.close()

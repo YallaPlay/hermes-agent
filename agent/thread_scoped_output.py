@@ -30,6 +30,9 @@ _install_lock = threading.Lock()
 # Maps the proxy we installed for a given attribute ("stdout"/"stderr") so we
 # never double-wrap and so we can recover the original stream.
 _installed: dict[str, "_ThreadRoutingStream"] = {}
+# Shared devnull sinks, one per attribute ("stdout"/"stderr"); reused across
+# proxy reinstalls so repeated installs don't leak fds.
+_sinks: dict[str, TextIO] = {}
 
 
 class _ThreadRoutingStream:
@@ -115,7 +118,14 @@ def _ensure_installed(attr: str, passthrough: TextIO) -> "_ThreadRoutingStream":
         # global redirect_stdout is active, route non-silenced threads to that
         # stream to preserve the old behavior.
         passthrough = current if current is not None else passthrough
-        sink = open(os.devnull, "w", encoding="utf-8")
+        # One shared devnull sink per attribute, reused across reinstalls.
+        # A fresh open() per reinstall leaked one /dev/null fd every time
+        # something else had swapped sys.stdout/stderr (e.g. background
+        # review's redirect); seen at 440 leaked fds on the ACP worker.
+        sink = _sinks.get(attr)
+        if sink is None or sink.closed:
+            sink = open(os.devnull, "w", encoding="utf-8")
+            _sinks[attr] = sink
         proxy = _ThreadRoutingStream(passthrough, sink)
         setattr(sys, attr, proxy)
         _installed[attr] = proxy
