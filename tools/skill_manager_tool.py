@@ -36,6 +36,7 @@ import json
 import logging
 import re
 import shutil
+import threading as _threading
 import contextvars as _ctxvars
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -52,9 +53,30 @@ from agent.skill_utils import (
 
 logger = logging.getLogger(__name__)
 
-_background_review_read_paths: "_ctxvars.ContextVar[frozenset[str]]" = _ctxvars.ContextVar(
-    "background_review_read_paths", default=frozenset()
-)
+# Read-before-write marks for background-review forks, keyed by fork id.
+#
+# PROCESS-GLOBAL ON PURPOSE (issue: curator stuck in an unwinnable
+# view→patch→refused loop). These marks were originally a ContextVar, but
+# agent.tool_executor dispatches every tool call on a worker thread whose
+# context is a propagate_context_to_thread() SNAPSHOT of the loop thread's
+# context: a ContextVar.set() inside skill_view mutated only that snapshot
+# and was discarded when the tool returned. The next skill_manage call got a
+# fresh snapshot with an empty read-set, so the read-before-write guard could
+# never be satisfied and the review fork burned its whole iteration budget
+# retrying. Marks must therefore live in cross-thread storage; isolation
+# between concurrent review forks comes from keying on the fork id that
+# turn_context binds per fork (falling back to a shared key when absent).
+_background_review_read_lock = _threading.Lock()
+_background_review_read_paths_by_fork: Dict[str, "set[str]"] = {}
+_FALLBACK_REVIEW_FORK_KEY = "background_review"
+
+
+def _current_review_fork_key() -> str:
+    try:
+        from tools.skill_provenance import get_current_review_fork_id
+        return get_current_review_fork_id() or _FALLBACK_REVIEW_FORK_KEY
+    except Exception:
+        return _FALLBACK_REVIEW_FORK_KEY
 
 
 def mark_background_review_skill_read(path: Path) -> None:
@@ -77,9 +99,9 @@ def mark_background_review_skill_read(path: Path) -> None:
         resolved = str(path.resolve())
     except Exception:
         resolved = str(path)
-    current = set(_background_review_read_paths.get())
-    current.add(resolved)
-    _background_review_read_paths.set(frozenset(current))
+    key = _current_review_fork_key()
+    with _background_review_read_lock:
+        _background_review_read_paths_by_fork.setdefault(key, set()).add(resolved)
 
 
 def _background_review_has_read(path: Path) -> bool:
@@ -87,12 +109,27 @@ def _background_review_has_read(path: Path) -> bool:
         resolved = str(path.resolve())
     except Exception:
         resolved = str(path)
-    return resolved in _background_review_read_paths.get()
+    key = _current_review_fork_key()
+    with _background_review_read_lock:
+        return resolved in _background_review_read_paths_by_fork.get(key, ())
+
+
+def clear_background_review_read_marks(fork_id: Optional[str] = None) -> None:
+    """Drop a review fork's read marks (its whole entry) when it finishes.
+
+    background_review.py calls this from the review thread's finally with the
+    fork's key so entries never outlive their fork; with no argument the
+    current context's fork entry is cleared.
+    """
+    key = fork_id or _current_review_fork_key()
+    with _background_review_read_lock:
+        _background_review_read_paths_by_fork.pop(key, None)
 
 
 def _reset_background_review_read_marks() -> None:
-    """Test helper: clear read-before-write marks for the current context."""
-    _background_review_read_paths.set(frozenset())
+    """Test helper: clear all read-before-write marks."""
+    with _background_review_read_lock:
+        _background_review_read_paths_by_fork.clear()
 
 # Import security scanner — external hub installs always get scanned;
 # agent-created skills only get scanned when skills.guard_agent_created is on.

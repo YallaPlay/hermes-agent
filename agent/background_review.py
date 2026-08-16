@@ -890,6 +890,7 @@ def _run_review_in_thread(
         pass
 
     review_agent = None
+    review_fork_key: Optional[str] = None
     review_messages: List[Dict] = []
     review_usage: Dict[str, Any] = {}
 
@@ -1036,6 +1037,13 @@ def _run_review_in_thread(
             )
             review_agent._memory_write_origin = "background_review"
             review_agent._memory_write_context = "background_review"
+            # Futile-loop circuit breaker: the review runs unattended, so a
+            # tool that keeps failing identically (e.g. a guard refusal the
+            # model can't satisfy) would otherwise be retried until the
+            # 16-iteration budget is gone — each retry a full-context
+            # inference call keeping the local GPU pinned. Three identical
+            # consecutive failures of the same tool abort the review.
+            review_agent._repeated_tool_failure_limit = 3
             # The review fork pins the parent's cached system prompt and keeps
             # ``tools[]`` byte-identical to the parent so its outbound request
             # hits the same provider cache prefix (see the toolset-parity note
@@ -1165,10 +1173,16 @@ def _run_review_in_thread(
                     "{tool_name}. Only memory/skill tools are allowed."
                 ),
             )
+            # Start this fork's read-before-write ledger from a clean slate.
+            # The marks live in a process-global store keyed by the fork id
+            # (turn_context binds str(id(agent)) for every turn this fork
+            # runs); remember the key so the outer finally can drop the entry
+            # even after review_agent itself is torn down.
+            review_fork_key = str(id(review_agent))
             try:
-                from tools.skill_manager_tool import _reset_background_review_read_marks
+                from tools.skill_manager_tool import clear_background_review_read_marks
 
-                _reset_background_review_read_marks()
+                clear_background_review_read_marks(review_fork_key)
             except Exception:
                 pass
 
@@ -1272,6 +1286,17 @@ def _run_review_in_thread(
                     )
                 except Exception:
                     pass
+        elif str(getattr(agent, "memory_notifications", "on") or "on").lower() != "off":
+            # Close the loop opened by the spawn announcement in
+            # _spawn_background_review: an empty review used to end in total
+            # silence, leaving the user no way to tell when the model (and a
+            # local GPU serving it) was actually free again. Best-effort — a
+            # print failure must not fall into the outer except and be
+            # miscounted as a failed review.
+            try:
+                agent._safe_print("  💭 Background review finished (no changes).")
+            except Exception:
+                pass
 
     except Exception as e:
         logger.warning("Background memory/skill review failed: %s", e)
@@ -1291,6 +1316,15 @@ def _run_review_in_thread(
         # so calling it again here after the primary call site already ran is
         # a harmless no-op.
         _unregister_review_agent(review_agent)
+        # Drop this fork's read-before-write marks from the process-global
+        # store so entries never outlive their fork.
+        if review_fork_key is not None:
+            try:
+                from tools.skill_manager_tool import clear_background_review_read_marks
+
+                clear_background_review_read_marks(review_fork_key)
+            except Exception:
+                pass
         if review_agent is not None:
             try:
                 with thread_scoped_silence():

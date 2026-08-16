@@ -39,6 +39,18 @@ _write_origin: contextvars.ContextVar[str] = contextvars.ContextVar(
     default="foreground",
 )
 
+# Identity of the active background-review fork, bound alongside the write
+# origin at turn setup. Tool dispatch runs each call on a worker thread with a
+# *snapshot* of the loop thread's context (propagate_context_to_thread), so
+# any per-fork state a tool needs to persist across calls must live in
+# process-global storage keyed by this id — ContextVar writes made inside a
+# worker die with the snapshot. The read-before-write marks in
+# skill_manager_tool are the canonical consumer.
+_review_fork_id: contextvars.ContextVar["str | None"] = contextvars.ContextVar(
+    "skill_review_fork_id",
+    default=None,
+)
+
 # The sentinel value the background review fork uses; mirrors
 # run_agent.py's AIAgent._memory_write_origin override in
 # _spawn_background_review().
@@ -76,3 +88,17 @@ def is_background_review() -> bool:
     """Convenience: True iff the current write origin is the background
     review fork."""
     return get_current_write_origin() == BACKGROUND_REVIEW
+
+
+def set_current_review_fork_id(fork_id: "str | None") -> "contextvars.Token[str | None]":
+    """Bind the active review fork's identity to the current context.
+
+    Pass a stable per-fork value (turn_context uses ``str(id(agent))``) when
+    the origin is ``background_review``, or ``None`` for foreground turns.
+    """
+    return _review_fork_id.set(fork_id)
+
+
+def get_current_review_fork_id() -> "str | None":
+    """Return the active review fork id, or None outside a review fork."""
+    return _review_fork_id.get()

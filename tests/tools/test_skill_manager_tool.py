@@ -947,3 +947,107 @@ class TestCuratorConsolidationDeleteGuard:
             assert allowed["success"] is True, allowed
 
         _reset_background_review_read_marks()
+
+    @staticmethod
+    def _run_in_worker_snapshot(fn, *args, **kwargs):
+        """Mimic agent.tool_executor dispatch: run one tool call on its own
+        worker thread inside a copy_context() snapshot of the caller's
+        context (what propagate_context_to_thread installs), so ContextVar
+        writes made by the call are discarded when it returns."""
+        import contextvars
+        import threading
+
+        ctx = contextvars.copy_context()
+        out = {}
+
+        def _target():
+            out["result"] = ctx.run(fn, *args, **kwargs)
+
+        t = threading.Thread(target=_target)
+        t.start()
+        t.join()
+        return out["result"]
+
+    def test_read_marks_survive_worker_thread_dispatch(self, tmp_path, monkeypatch):
+        """Regression: every tool call runs on a worker thread with a SNAPSHOT
+        of the loop thread's context, so a ContextVar-backed read ledger lost
+        skill_view's mark the moment the call returned — the read-before-write
+        guard became unsatisfiable and the review fork burned its entire
+        iteration budget in a view→patch→refused loop. The marks must survive
+        across per-call context snapshots."""
+        from tools.skills_tool import skill_view
+        from tools.skill_manager_tool import _reset_background_review_read_marks
+
+        _reset_background_review_read_marks()
+        with _curator_pass(tmp_path, monkeypatch=monkeypatch):
+            _create_curator_skill("reviewed", _skill_content("reviewed"))
+
+            viewed = json.loads(self._run_in_worker_snapshot(skill_view, "reviewed"))
+            assert viewed["success"] is True
+
+            edited = json.loads(self._run_in_worker_snapshot(
+                skill_manage,
+                action="edit",
+                name="reviewed",
+                content=_skill_content("reviewed") + "\nUpdated by review.\n",
+            ))
+            assert edited["success"] is True, edited
+        _reset_background_review_read_marks()
+
+    def test_read_marks_isolated_between_forks(self, tmp_path, monkeypatch):
+        """A mark recorded by one review fork must not unlock writes for a
+        concurrently running fork — each fork must load the content its own
+        model actually saw."""
+        from tools.skills_tool import skill_view
+        from tools.skill_manager_tool import _reset_background_review_read_marks
+
+        _reset_background_review_read_marks()
+        with _curator_pass(tmp_path, monkeypatch=monkeypatch):
+            _create_curator_skill("reviewed", _skill_content("reviewed"))
+
+            with patch(
+                "tools.skill_provenance.get_current_review_fork_id",
+                return_value="fork-a",
+            ):
+                assert json.loads(skill_view("reviewed"))["success"] is True
+
+            with patch(
+                "tools.skill_provenance.get_current_review_fork_id",
+                return_value="fork-b",
+            ):
+                blocked = json.loads(skill_manage(
+                    action="edit",
+                    name="reviewed",
+                    content=_skill_content("reviewed") + "\nUpdated.\n",
+                ))
+            assert blocked["success"] is False
+            assert blocked.get("_read_before_write_required") is True
+        _reset_background_review_read_marks()
+
+    def test_clear_background_review_read_marks_drops_fork_entry(self, tmp_path, monkeypatch):
+        """background_review.py clears a finished fork's ledger entry by key;
+        a later fork that happens to reuse the key must start locked."""
+        from tools.skills_tool import skill_view
+        from tools.skill_manager_tool import (
+            _reset_background_review_read_marks,
+            clear_background_review_read_marks,
+        )
+
+        _reset_background_review_read_marks()
+        with _curator_pass(tmp_path, monkeypatch=monkeypatch):
+            _create_curator_skill("reviewed", _skill_content("reviewed"))
+
+            with patch(
+                "tools.skill_provenance.get_current_review_fork_id",
+                return_value="fork-a",
+            ):
+                assert json.loads(skill_view("reviewed"))["success"] is True
+                clear_background_review_read_marks("fork-a")
+                blocked = json.loads(skill_manage(
+                    action="edit",
+                    name="reviewed",
+                    content=_skill_content("reviewed") + "\nUpdated.\n",
+                ))
+            assert blocked["success"] is False
+            assert blocked.get("_read_before_write_required") is True
+        _reset_background_review_read_marks()

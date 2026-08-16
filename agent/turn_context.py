@@ -477,7 +477,20 @@ def build_turn_context(
     set_session_context(agent.session_id)
 
     # Bind the skill write-origin ContextVar for this thread.
-    set_current_write_origin(getattr(agent, "_memory_write_origin", "assistant_tool"))
+    _origin = getattr(agent, "_memory_write_origin", "assistant_tool")
+    set_current_write_origin(_origin)
+    # Bind the review fork's identity too, so per-fork state that must survive
+    # tool worker threads (e.g. the skill read-before-write marks) can key a
+    # process-global store instead of a ContextVar that dies with each
+    # worker's context snapshot. background_review.py clears the fork's
+    # entries with this same key when the review thread finishes.
+    try:
+        from tools.skill_provenance import BACKGROUND_REVIEW, set_current_review_fork_id
+        set_current_review_fork_id(
+            str(id(agent)) if _origin == BACKGROUND_REVIEW else None
+        )
+    except Exception:
+        pass
 
     # Restore the primary runtime if the previous turn activated fallback.
     agent._restore_primary_runtime()
