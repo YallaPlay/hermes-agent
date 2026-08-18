@@ -632,6 +632,19 @@ class SessionManager:
             seen_ids = set(self._sessions.keys())
             results = []
             for s in self._sessions.values():
+                if s.subagent:
+                    # Delegate-child mirror restored for observation (e.g. the
+                    # user opened a subagent transcript). The DB row is
+                    # authoritative for these — the subagent branch below lists
+                    # them with their real last_active and subagent flag.
+                    # Listing them here instead fabricated updated_at=now every
+                    # call (their source='subagent' row is absent from the
+                    # acp-only persisted fetch, so the wall-clock fallback
+                    # fired) and dropped the subagent marker, so hours-old
+                    # children pinned to the top of clients' recency sorts for
+                    # as long as the worker stayed alive.
+                    seen_ids.discard(s.session_id)
+                    continue
                 history_len = len(s.history)
                 if history_len <= 0:
                     # In-memory history is only assigned when a turn FINISHES,

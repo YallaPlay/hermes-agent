@@ -1040,6 +1040,45 @@ class TestPersistence:
             "child goal", "progress so far",
         ]
 
+    def test_resident_subagent_mirror_keeps_db_recency_in_listing(self, manager):
+        """A delegate child restored into memory for observation must list
+        exactly like its DB row: once, subagent-flagged, with the row's real
+        recency. Regression: the in-memory branch used to claim resident
+        mirrors and, because their source='subagent' row is absent from the
+        acp-only persisted fetch, stamped updated_at with the wall clock —
+        hours-old children rendered as "now" on every session/list for the
+        worker's lifetime and pinned to the top of recency-sorted clients."""
+        import time as _time
+
+        parent = manager.create_session(cwd="/work")
+        parent.history.append({"role": "user", "content": "delegate"})
+        manager.save_session(parent.session_id)
+
+        db = manager._get_db()
+        db.create_session(
+            "child-old-1", source="subagent",
+            parent_session_id=parent.session_id, model="test-model",
+        )
+        old = _time.time() - 19 * 3600  # transcript ended ~19h ago
+        db.append_message("child-old-1", role="user", content="child goal", timestamp=old)
+        db.append_message(
+            "child-old-1", role="assistant", content="done", timestamp=old + 60,
+        )
+
+        baseline = {
+            s["session_id"]: s for s in manager.list_sessions()
+        }["child-old-1"]
+
+        restored = manager.get_session("child-old-1")
+        assert restored is not None and restored.subagent is True
+
+        rows = [
+            s for s in manager.list_sessions() if s["session_id"] == "child-old-1"
+        ]
+        assert len(rows) == 1
+        assert rows[0].get("subagent") is True
+        assert rows[0]["updated_at"] == baseline["updated_at"]
+
     def test_persist_is_noop_for_subagent_sessions(self, manager):
         """ACP must never take write ownership of a delegate child's row:
         persisting would clobber model_config (losing the _delegate_from
