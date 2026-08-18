@@ -100,10 +100,9 @@ def test_active_context_engine_tools_survive_explicit_platform_toolsets():
             skip_memory=True,
         )
 
-    assert "stub_recover" in getattr(agent, "valid_tool_names", set())
+    assert "stub_recover" not in getattr(agent, "valid_tool_names", set())
     assert "stub_recover" in {
-        tool.get("function", {}).get("name")
-        for tool in getattr(agent, "tools", [])
+        entry.name for entry in getattr(agent, "_tool_search_catalog", [])
     }
 
 

@@ -51,6 +51,14 @@ from acp_adapter.session import QueuedPrompt
 from hermes_state import SessionDB
 
 
+def _without_row_ids(messages):
+    """Compare conversation payloads without durable SQLite row metadata."""
+    return [
+        {key: value for key, value in message.items() if key != "_row_id"}
+        for message in messages
+    ]
+
+
 @pytest.fixture()
 def mock_manager():
     """SessionManager with a mock agent factory."""
@@ -2190,7 +2198,9 @@ class TestPrompt:
             hermes={"keepHistory": 1},
         )
         forked = agent.session_manager.get_session(fork_resp.session_id)
-        assert forked.history == compressed_history[:1]
+        assert _without_row_ids(forked.history) == _without_row_ids(
+            compressed_history[:1]
+        )
 
     @pytest.mark.asyncio
     async def test_prompt_omits_user_history_index_when_message_summarized_away(self, agent):
@@ -2586,12 +2596,14 @@ class TestPromptRewind:
 
         assert resp.stop_reason == "end_turn"
         # The turn ran on the truncated prefix — the mistaken turn is gone.
-        assert captured["conversation_history"][:2] == [
+        assert _without_row_ids(captured["conversation_history"][:2]) == [
             {"role": "user", "content": "first"},
             {"role": "assistant", "content": "reply"},
         ]
         assert all(m.get("content") != "mistake" for m in state.history)
-        assert state.history[-1] == {"role": "assistant", "content": "done"}
+        assert _without_row_ids(state.history[-1:]) == [
+            {"role": "assistant", "content": "done"}
+        ]
 
     @pytest.mark.asyncio
     async def test_prompt_keep_history_router_wire_shape(self, agent):
@@ -2798,7 +2810,9 @@ class TestSlashCommands:
 
         assert "Context compressed: 4 -> 1 messages" in result
         assert "~40 -> ~12 tokens" in result
-        assert state.history == [{"role": "user", "content": "summary"}]
+        assert _without_row_ids(state.history) == [
+            {"role": "user", "content": "summary"}
+        ]
         assert state.agent._session_db is original_session_db
         state.agent._compress_context.assert_called_once_with(
             [

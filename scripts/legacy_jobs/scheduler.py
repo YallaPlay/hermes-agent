@@ -330,7 +330,15 @@ def run_command_job(spec: LegacyJobSpec, repo_dir: Path = REPO_DIR, slack_client
         deliver_output(spec, "command job has neither command nor script", "error", slack_client)
         return "error"
     try:
-        result = subprocess.run(cmd, cwd=repo_dir, capture_output=True, text=True, timeout=JOB_TIMEOUT_SEC)
+        result = subprocess.run(
+            cmd,
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=JOB_TIMEOUT_SEC,
+        )
     except subprocess.TimeoutExpired:
         deliver_output(spec, f":hourglass: job `{spec.job_id}` timed out after {JOB_TIMEOUT_SEC}s", "timeout", slack_client)
         return "timeout"
@@ -384,7 +392,15 @@ def run_agent_job(spec: LegacyJobSpec, repo_dir: Path = REPO_DIR, slack_client: 
         return "empty-body"
     prompt = build_agent_prompt(spec)
     try:
-        result = subprocess.run(hermes_command(prompt), cwd=repo_dir, capture_output=True, text=True, timeout=AGENT_TIMEOUT_SEC)
+        result = subprocess.run(
+            hermes_command(prompt),
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=AGENT_TIMEOUT_SEC,
+        )
     except subprocess.TimeoutExpired:
         deliver_output(spec, f":hourglass: job `{spec.job_id}` timed out after {AGENT_TIMEOUT_SEC}s", "timeout", slack_client)
         return "timeout"

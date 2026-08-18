@@ -79,10 +79,16 @@ def test_refresh_preserves_memory_provider_and_context_engine_tools(monkeypatch)
 
     added = mcp_tool.refresh_agent_mcp_tools(agent)
 
-    # The new MCP tool landed AND the injected families survived.
+    # The new MCP tool landed AND the injected families survived in the
+    # deferred catalog. Tool Search keeps provider/context tools off the direct
+    # model surface until the model discovers them.
     assert "mcp_new_server_tool" in agent.valid_tool_names
-    assert "memory_search" in agent.valid_tool_names   # not clobbered
-    assert "lcm_grep" in agent.valid_tool_names         # not clobbered
+    assert "memory_search" not in agent.valid_tool_names
+    assert "lcm_grep" not in agent.valid_tool_names
+    assert {entry.name for entry in agent._tool_search_catalog} >= {
+        "memory_search",
+        "lcm_grep",
+    }
     assert added == {"mcp_new_server_tool"}
 
 
