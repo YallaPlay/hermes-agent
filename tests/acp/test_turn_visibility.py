@@ -157,6 +157,46 @@ class TestTurnStatusUpdates:
         assert status_flags[-1] is False
 
     @pytest.mark.asyncio
+    async def test_turn_status_updates_are_marked_adoptable(self, agent):
+        """A real agent turn's status carriers set ``adoptableTurn``.
+
+        A durable-turn proxy uses the flag to adopt turns it did not start
+        (spawned first turns, notification deliveries, queued drains) into
+        its own per-session turn state. Without it those turns get no ring
+        buffering, no cancel-and-grace on reap, and no liveness in status
+        probes.
+        """
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        state.agent.run_conversation = MagicMock(return_value={
+            "final_response": "done",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "done"},
+            ],
+        })
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="hello")],
+            session_id=new_resp.session_id,
+        )
+
+        carriers = [
+            call.kwargs["update"].field_meta["hermes"]
+            for call in mock_conn.session_update.await_args_list
+            if getattr(call.kwargs.get("update"), "session_update", None)
+            == "session_info_update"
+            and isinstance(getattr(call.kwargs.get("update"), "field_meta", None), dict)
+            and "isRunning" in (call.kwargs["update"].field_meta.get("hermes") or {})
+        ]
+        assert carriers, "expected at least one turn-status carrier"
+        assert all(c.get("adoptableTurn") is True for c in carriers)
+
+    @pytest.mark.asyncio
     async def test_turn_ends_idle_even_when_tail_raises(self, agent):
         """The finally-guarded idle update fires even if the post-turn tail dies."""
         new_resp = await agent.new_session(cwd=".")

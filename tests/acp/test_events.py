@@ -342,6 +342,12 @@ class TestSubagentUpdateRouter:
         assert start_info.field_meta["hermes"]["currentPromptText"] == "summarize README"
         end_info = updates[-1]
         assert end_info.field_meta["hermes"]["isRunning"] is False
+        # A delegate child must NEVER be adoptable by a durable-turn proxy:
+        # the delegate tool owns the child's row and transcript, and the
+        # child's frames are relay-only by design. Only the server's own
+        # _send_turn_status_update sets the flag.
+        assert "adoptableTurn" not in start_info.field_meta["hermes"]
+        assert "adoptableTurn" not in end_info.field_meta["hermes"]
 
     def test_fifo_for_duplicate_tool_names(self, mock_conn, event_loop_fixture):
         """Two same-name tools complete in FIFO order against the right ids."""

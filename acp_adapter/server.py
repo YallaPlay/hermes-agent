@@ -1462,13 +1462,28 @@ class HermesACPAgent(acp.Agent):
         session/load) can flip its composer between running/steer and idle
         states. Clients that don't know the meta ignore a title-less info
         update. Best-effort: failures must never affect the turn.
+
+        ``adoptableTurn`` marks this as a REAL agent turn on a session this
+        server owns, which a durable-turn proxy (the YallaPlay ACP broker)
+        may adopt into its own per-session turn state when the turn was
+        started server-side rather than by a client ``turn/start`` — a
+        spawned session's first turn, a background notification delivery, a
+        queued-prompt drain. Without it those turns are invisible to the
+        proxy: no ring buffering while detached, no cancel-and-grace on
+        reap, no liveness in its status probes.
+
+        The flag is deliberately NOT inferable from ``isRunning`` alone:
+        ``SubagentUpdateRouter`` emits the same title-less isRunning
+        carriers for delegate CHILD sessions, which must never acquire proxy
+        turn state (the child's transcript is owned by the delegate tool, and
+        its frames are relay-only by design). Only this method sets it.
         """
         if not self._conn:
             return
         update = SessionInfoUpdate(
             session_update="session_info_update",
             updated_at=datetime.now(timezone.utc).isoformat(),
-            field_meta={"hermes": {"isRunning": bool(running)}},
+            field_meta={"hermes": {"isRunning": bool(running), "adoptableTurn": True}},
         )
         try:
             await self._conn.session_update(session_id=state.session_id, update=update)
