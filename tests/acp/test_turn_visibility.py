@@ -284,9 +284,39 @@ class TestSpawnDispatch:
             "title": None,
             "provider": None,
             "model": None,
-            "deliver_result_to_parent": True,
+            # Default is FALSE: a spawned session records no parent and owns its work.
+            "deliver_result_to_parent": False,
         }
-        assert "return automatically" in payload["note"]
+        assert "no parent completion" in payload["note"].lower()
+
+    def test_dispatch_forwards_explicit_parent_delivery_opt_in(self):
+        """true must still be honoured: the change is to the DEFAULT, not the capability."""
+        captured = {}
+
+        def _requester(
+            prompt_text,
+            cwd,
+            title,
+            provider=None,
+            model=None,
+            *,
+            deliver_result_to_parent=False,
+        ):
+            captured["deliver_result_to_parent"] = deliver_result_to_parent
+            return "opt-in-id"
+
+        token = set_spawn_session_requester(_requester)
+        try:
+            _loads(
+                maybe_dispatch_spawn_session(
+                    SPAWN_SESSION_TOOL_NAME,
+                    {"prompt": "probe and report", "deliver_result_to_parent": True},
+                )
+            )
+        finally:
+            reset_spawn_session_requester(token)
+
+        assert captured["deliver_result_to_parent"] is True
 
     def test_dispatch_forwards_explicit_child_only_mode(self):
         captured = {}
@@ -352,6 +382,32 @@ class TestSpawnDispatch:
 
         requester.assert_called_once_with("go", None, None, None, None)
         assert payload["session_id"] == "legacy-child"
+        # With delivery off by default, a requester that cannot deliver is no longer a
+        # degraded case: nothing was going to be delivered. The "unavailable" note is
+        # reserved for a caller that explicitly asked for delivery and cannot get it,
+        # which the next test covers.
+        assert "no parent completion" in payload["note"].lower()
+
+    def test_legacy_requester_reports_unavailable_when_delivery_requested(self):
+        """Explicit opt-in against a legacy requester must still warn, not silently drop."""
+        requester = MagicMock(return_value="legacy-child")
+        requester.__signature__ = inspect.Signature(
+            [
+                inspect.Parameter(name, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+                for name in ("prompt_text", "cwd", "title", "provider", "model")
+            ]
+        )
+        token = set_spawn_session_requester(requester)
+        try:
+            payload = _loads(
+                maybe_dispatch_spawn_session(
+                    SPAWN_SESSION_TOOL_NAME,
+                    {"prompt": "go", "deliver_result_to_parent": True},
+                )
+            )
+        finally:
+            reset_spawn_session_requester(token)
+
         assert "unavailable" in payload["note"].lower()
 
     def test_dispatch_forwards_title(self):
@@ -467,7 +523,8 @@ class TestServerSpawnRequester:
         assert spawned["session_id"] == new_id
         assert spawned["prompt"] == "carry on"
         assert spawned["parent_session_id"] == parent_state.session_id
-        assert spawned["deliver_result_to_parent"] is True
+        # Independent by default: the requester must not opt into parent delivery on its own.
+        assert spawned["deliver_result_to_parent"] is False
         child = agent.session_manager.get_session(new_id)
         assert child is not None
         assert child.session_id != parent_state.session_id

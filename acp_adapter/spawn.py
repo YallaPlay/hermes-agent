@@ -37,11 +37,14 @@ SPAWN_SESSION_TOOL_SCHEMA: dict[str, Any] = {
         "description": (
             "Spawn a NEW derived, clean-context Hermes session inside this "
             "running ACP server and start its first turn immediately in the "
-            "background. The new session is visibly linked to this parent but "
-            "does not copy its conversation history. "
-            "Returns the new session id right away. By default, the spawned "
-            "first-turn result is delivered back to this parent automatically; "
-            "set deliver_result_to_parent=false only for a child-owned handoff. "
+            "background. The new session is INDEPENDENT: it is shown next to "
+            "this one in the sidebar, but it records no parent and does not "
+            "copy this conversation history. "
+            "Returns the new session id right away. The spawned session owns "
+            "its work and reports to the user, not back here; pass "
+            "deliver_result_to_parent=true only if you deliberately need its "
+            "first-turn result returned to you. For work that must report back, "
+            "use delegate_task, whose subagents are real children. "
             "Do not poll for completion. The session appears in the VS Code "
             "sessions sidebar with live streaming and steer support. Use for "
             "handoff/continuation sessions that should stay visible in this "
@@ -97,9 +100,13 @@ SPAWN_SESSION_TOOL_SCHEMA: dict[str, Any] = {
                 "deliver_result_to_parent": {
                     "type": "boolean",
                     "description": (
-                        "Return the spawned first-turn result to the parent "
-                        "session. Defaults to true; set false only for a "
-                        "child-owned handoff."
+                        "Return the spawned first-turn result to the spawning "
+                        "session. Defaults to FALSE, because a spawned session is "
+                        "independent (parent_session_id is NULL) and owns its own "
+                        "work. Set true only when you deliberately want the first "
+                        "turn reported back, for example a spawned probe whose "
+                        "answer the spawner needs; for parented work whose result "
+                        "must return, use delegate_task instead."
                     ),
                 },
             },
@@ -205,7 +212,15 @@ def maybe_dispatch_spawn_session(
     provider = str(provider).strip() if provider else None
     model = arguments.get("model")
     model = str(model).strip() if model else None
-    delivery_value = arguments.get("deliver_result_to_parent", True)
+    # Default false. acp_spawn_session creates a session with parent_session_id = NULL: it is a
+# NEW independent session, not a subagent and not a fork. Routing its first-turn result back to
+# the spawning session therefore creates a dependency the data model denies, and in practice it
+# makes handoff children ask the spawner for approval and end their turn on a question that
+# nobody can answer, because ACP cannot inject a reply into a finished turn (observed
+# 2026-08-19: a continuation session stalled this way and a third session had to be spawned to
+# resume it). Callers who genuinely want the result back must ask for it explicitly.
+# delegate_task is the tool for parented work whose result returns to its caller.
+    delivery_value = arguments.get("deliver_result_to_parent", False)
     if not isinstance(delivery_value, bool):
         return json.dumps(
             {"error": "deliver_result_to_parent must be a boolean"},

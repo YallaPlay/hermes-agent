@@ -3095,7 +3095,9 @@ class HermesACPAgent(acp.Agent):
             provider: str | None = None,
             model: str | None = None,
             *,
-            deliver_result_to_parent: bool = True,
+            # False by default: a spawned session records no parent and owns its work.
+            # See acp_adapter/spawn.py for why routing the result back is wrong here.
+            deliver_result_to_parent: bool = False,
         ) -> str:
             from agent.async_utils import safe_schedule_threadsafe
 

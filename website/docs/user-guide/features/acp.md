@@ -102,12 +102,21 @@ clean-context session while remaining visible in the same editor window. The
 tool returns the child session ID immediately, and the child appears in the
 session sidebar with live streaming and steer support.
 
-By default, the child's first-turn result is delivered back to the parent
-session automatically. The parent receives the child result, validates it in
-the current conversation, and then presents the substantive answer or artifact;
-there is no need to poll the child session. Set
-`deliver_result_to_parent=false` only for a handoff where the child session owns
-the follow-up and the parent should not resume automatically.
+A spawned session is **independent**. It records no `parent_session_id`, copies
+no conversation history, and owns the work it was given. By default its
+first-turn result is **not** returned to the spawning session: it reports to the
+user, like any other session.
+
+Set `deliver_result_to_parent=true` when you deliberately want the first turn
+reported back, for example a spawned probe whose answer the spawning session
+needs in order to continue. For work that is genuinely a subtask and must return
+a result to its caller, prefer `delegate_task`, whose subagents are real children
+with a recorded parent.
+
+The default used to be `true`. It was changed because routing a result back
+created a dependency the data model denies, and because a handoff child would end
+its first turn asking the spawning session for approval — a question ACP cannot
+answer, since it cannot inject a reply into a finished turn.
 
 This mechanism is process-local. Closing or reloading the ACP host can terminate
 an in-flight spawned turn; use a detached CLI session for walk-away durability.
