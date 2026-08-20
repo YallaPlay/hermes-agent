@@ -4093,6 +4093,42 @@ class TestNotificationWatcher:
         assert self._pop_requeued(evt), "busy-target event was not requeued"
 
     @pytest.mark.asyncio
+    async def test_busy_process_completion_consumed_by_wait_is_not_delivered(self, agent):
+        """A process completion must remain retractable while its turn is busy."""
+        self._attach_conn(agent)
+        state = self._insert_state(
+            agent.session_manager, "sess-process-busy", is_running=True
+        )
+        evt = {
+            "type": "completion",
+            "session_id": "proc-consumed-by-wait",
+            "origin_ui_session_id": "sess-process-busy",
+        }
+        agent._deliver_notification = AsyncMock()
+        from tools.process_registry import process_registry
+
+        process_registry._completion_consumed.discard("proc-consumed-by-wait")
+        try:
+            process_registry.completion_queue.put(evt)
+
+            await agent._drain_notification_cycle()
+
+            agent._deliver_notification.assert_not_awaited()
+            assert self._pop_requeued(evt), "busy completion was not requeued"
+
+            process_registry._completion_consumed.add("proc-consumed-by-wait")
+            state.is_running = False
+            process_registry.completion_queue.put(evt)
+
+            await agent._drain_notification_cycle()
+
+            agent._deliver_notification.assert_not_awaited()
+            assert not self._pop_requeued(evt)
+        finally:
+            process_registry._completion_consumed.discard("proc-consumed-by-wait")
+            self._pop_requeued(evt)
+
+    @pytest.mark.asyncio
     async def test_delegation_completes_claim_before_delivery_turn(self, agent):
         """MAJOR-1: the durable claim must be held for milliseconds — claim,
         complete, THEN run the (potentially minutes-long) delivery turn.

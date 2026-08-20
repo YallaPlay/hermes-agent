@@ -2966,11 +2966,11 @@ class HermesACPAgent(acp.Agent):
         ``drain_notifications`` itself) and delivers each into its session
         via ``_deliver_notification``.
 
-        Delegation-event protocol (at-most-once): resolve target from
-        ownership → require the target IDLE → claim → complete → deliver.
-        Busy or unresolvable targets are NOT claimed; their events are
-        requeued and retried on the next 2s cycle. See the inline comments
-        for why each step is ordered this way.
+        Delivery protocol: resolve target from ownership → require the target
+        IDLE → deliver. Busy targets are requeued so process wait/log can
+        still consume ordinary completions before they become synthetic turns.
+        Delegation events then claim → complete → deliver for at-most-once
+        delivery. See the inline comments for why each step is ordered this way.
         """
         if not self._conn:
             # No client attached — leave events queued for when one is.
@@ -3003,6 +3003,14 @@ class HermesACPAgent(acp.Agent):
                 # No fast-spin: the next pop happens next cycle (2s later).
                 process_registry.completion_queue.put(evt)
                 continue
+            state = self.session_manager.get_in_memory(target)
+            if state is not None and state.is_running:
+                # Keep the raw event retractable while its target turn runs.
+                # In particular, process wait/log may consume a completion
+                # before the next drain; drain_notifications can then suppress
+                # it instead of leaving a stale synthetic queued prompt.
+                process_registry.completion_queue.put(evt)
+                continue
             if evt.get("type") == "async_delegation":
                 # Durable delegation completions can be restored into EVERY
                 # process's completion_queue at registry startup, so the
@@ -3010,17 +3018,6 @@ class HermesACPAgent(acp.Agent):
                 # deliver one without a successful claim. claim=None means
                 # another process holds (or already completed) delivery —
                 # skip silently.
-                state = self.session_manager.get_in_memory(target)
-                if state is not None and state.is_running:
-                    # Busy target: do NOT claim. Claiming now would force a
-                    # completion whose only delivery path is the RAM-only
-                    # state.queued_prompts list — an editor close before the
-                    # post-turn drain would lose the result forever while the
-                    # durable row says 'delivered'. Leave the row pending/
-                    # claimable, requeue the event, and let the next 2s cycle
-                    # retry once the turn ends and the session is idle.
-                    process_registry.completion_queue.put(evt)
-                    continue
                 claim = claim_event_delivery(evt, consumer)
                 if claim is None:
                     continue
@@ -3045,8 +3042,8 @@ class HermesACPAgent(acp.Agent):
             else:
                 # Plain completion/watch_match/watch_disabled events are
                 # in-process only — no cross-process race, no durable row,
-                # no claim needed; queue-on-busy in RAM inside
-                # _deliver_notification is their established semantic.
+                # no claim needed. The shared busy check above keeps completion
+                # events retractable until the target session is idle.
                 await self._deliver_notification(target, text)
 
     async def _notification_watcher(self) -> None:
