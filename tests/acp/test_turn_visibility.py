@@ -592,6 +592,19 @@ class TestServerSpawnRequester:
 
         child = agent.session_manager.get_session(new_id)
         assert child.cwd == str(tmp_path)
+        row = agent.session_manager._get_db().get_session(new_id)
+        assert row["cwd"] == str(tmp_path)
+
+        parent_state.history.append({"role": "user", "content": "parent"})
+        child.history.append({"role": "user", "content": "child"})
+        agent.session_manager.save_session(parent_state.session_id)
+        agent.session_manager.save_session(child.session_id)
+        listed_ids = {
+            item["session_id"]
+            for item in agent.session_manager.list_sessions(cwd=parent_state.cwd)
+        }
+        assert parent_state.session_id in listed_ids
+        assert child.session_id in listed_ids
 
     @pytest.mark.asyncio
     async def test_requester_stamps_caller_title(self, agent):

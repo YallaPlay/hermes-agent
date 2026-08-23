@@ -140,15 +140,19 @@ class TestPersistRoundTrip:
         manager = SessionManager(agent_factory=_mock_agent, db=db)
 
         state = manager.create_session(cwd="/original")
-        assert db.get_session(state.session_id) is not None
+        created = db.get_session(state.session_id)
+        assert created is not None
+        assert created["cwd"] == "/original"
 
         # Simulate cwd change and save
         state.cwd = "/updated"
         manager.save_session(state.session_id)
 
         row = db.get_session(state.session_id)
+        assert row is not None
         mc = json.loads(row["model_config"])
         assert mc["cwd"] == "/updated"
+        assert row["cwd"] == "/updated"
 
     def test_model_persisted_via_update_session_meta(self, tmp_path):
         db = _tmp_db(tmp_path)

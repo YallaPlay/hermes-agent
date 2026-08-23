@@ -950,6 +950,35 @@ class TestPersistence:
         assert keep.session_id in ids
         assert drop.session_id not in ids
 
+    def test_list_sessions_keeps_derived_session_visible_with_parent_workspace(self, tmp_path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        manager = SessionManager(agent_factory=_mock_agent, db=db)
+        parent = manager.create_session(cwd="/workspace")
+        parent.history.append({"role": "user", "content": "parent"})
+        manager.save_session(parent.session_id)
+        child = manager.create_session(cwd="/other-worktree", parent_id=parent.session_id)
+        child.history.append({"role": "user", "content": "child"})
+        manager.save_session(child.session_id)
+        unrelated = manager.create_session(cwd="/other-worktree")
+        unrelated.history.append({"role": "user", "content": "unrelated"})
+        manager.save_session(unrelated.session_id)
+
+        listed = manager.list_sessions(cwd="/workspace")
+        ids = {item["session_id"] for item in listed}
+
+        assert parent.session_id in ids
+        assert child.session_id in ids
+        assert unrelated.session_id not in ids
+
+        # Completed spawned sessions use the persisted branch after restart.
+        restored = SessionManager(agent_factory=_mock_agent, db=db)
+        restored_ids = {
+            item["session_id"] for item in restored.list_sessions(cwd="/workspace")
+        }
+        assert parent.session_id in restored_ids
+        assert child.session_id in restored_ids
+        assert unrelated.session_id not in restored_ids
+
     def test_list_sessions_includes_subagent_children_of_acp_parents(self, manager):
         """Delegate children (source='subagent', parent_session_id set) of a
         visible ACP session are listed with parent linkage; subagents of

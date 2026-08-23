@@ -622,6 +622,37 @@ class SessionManager:
             except Exception:
                 logger.debug("Failed to load ACP sessions from DB", exc_info=True)
 
+        cwd_visible_ids: set[str] = set()
+        if normalized_cwd:
+            def _row_cwd(row: dict[str, Any]) -> str:
+                model_config = row.get("model_config")
+                if model_config:
+                    try:
+                        return json.loads(model_config).get("cwd", ".")
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                return row.get("cwd") or "."
+
+            cwd_visible_ids = {
+                sid
+                for sid, row in persisted_rows.items()
+                if _normalize_cwd_for_compare(_row_cwd(row)) == normalized_cwd
+            }
+            # Derived ACP sessions stay in the visible conversation family
+            # even when they execute in another worktree. This matches the
+            # delegate-child contract below and keeps acp_spawn_session output
+            # next to its visible parent in workspace-filtered clients.
+            changed = True
+            while changed:
+                changed = False
+                for sid, row in persisted_rows.items():
+                    if sid in cwd_visible_ids:
+                        continue
+                    parent_id = _forked_from_marker(row.get("model_config"))
+                    if parent_id and parent_id in cwd_visible_ids:
+                        cwd_visible_ids.add(sid)
+                        changed = True
+
         def _admits(row_archived: bool) -> bool:
             if archived_only:
                 return row_archived
@@ -664,7 +695,7 @@ class SessionManager:
                 row_archived = bool(persisted.get("archived"))
                 if not _admits(row_archived):
                     continue
-                if normalized_cwd and _normalize_cwd_for_compare(s.cwd) != normalized_cwd:
+                if normalized_cwd and s.session_id not in cwd_visible_ids:
                     continue
                 if owner_filter:
                     # Mirror the DB filter for in-memory rows: STRICT ownership —
@@ -735,7 +766,7 @@ class SessionManager:
                     session_cwd = json.loads(mc).get("cwd", ".")
                 except (json.JSONDecodeError, TypeError):
                     pass
-            if normalized_cwd and _normalize_cwd_for_compare(session_cwd) != normalized_cwd:
+            if normalized_cwd and sid not in cwd_visible_ids:
                 continue
             parent_id = _forked_from_marker(mc)
             results.append({
@@ -946,11 +977,13 @@ class SessionManager:
                     model=model_str,
                     model_config=session_meta,
                     user_id=getattr(state, "owner", None),
+                    cwd=state.cwd,
                 )
             else:
-                # Update model_config (contains cwd) if changed.
                 try:
-                    db.update_session_meta(state.session_id, cwd_json, model_str)
+                    db.update_session_meta(
+                        state.session_id, cwd_json, model_str, cwd=state.cwd
+                    )
                 except Exception:
                     logger.debug("Failed to update ACP session metadata", exc_info=True)
 

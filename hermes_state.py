@@ -6874,20 +6874,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         model_config_json: str,
         model: Optional[str] = None,
+        cwd: Optional[str] = None,
     ) -> None:
-        """Update model_config and optionally model for an existing session.
+        """Update model_config and optional canonical columns for a session.
 
-        Uses COALESCE so that passing model=None leaves the stored model
-        column unchanged.  Routes through _execute_write for the standard
-        BEGIN IMMEDIATE + jitter-retry + lock guarantee.
+        Uses COALESCE so passing model/cwd=None leaves the stored value
+        unchanged. Routes through _execute_write for the standard BEGIN
+        IMMEDIATE + jitter-retry + lock guarantee.
         """
         # Barrier against queued token deltas — see update_session_model.
         self.flush_token_counts()
 
         def _do(conn):
             conn.execute(
-                "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
-                (model_config_json, model, session_id),
+                """UPDATE sessions
+                      SET model_config = ?,
+                          model = COALESCE(?, model),
+                          cwd = COALESCE(?, cwd)
+                    WHERE id = ?""",
+                (model_config_json, model, cwd, session_id),
             )
         self._execute_write(_do)
 
