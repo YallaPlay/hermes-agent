@@ -25,6 +25,10 @@ Behaviour (all behaviours selectable via env var ``MOCK_LSP_SCRIPT``):
   ``didChange`` sleeps ``MOCK_LSP_PUSH_DELAY`` seconds (default 1.0)
   and then pushes EMPTY diagnostics.  Models a server that fixes
   the ghost if you actually wait for it.  Pull endpoint rejects.
+- ``"process_tree_exit"`` — spawns a child that ignores SIGTERM, then
+  exits normally when the client sends the LSP exit notification.
+- ``"process_tree_hang"`` — spawns the same child but keeps the leader
+  alive after the exit notification.
 
 The script writes JSON-RPC framed messages to stdout and reads from
 stdin.  No third-party dependencies — uses only stdlib so it runs
@@ -34,6 +38,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -64,6 +69,25 @@ def write_message(obj):
 
 def main():
     script = os.environ.get("MOCK_LSP_SCRIPT", "clean")
+    if script.startswith("process_tree_"):
+        child_pid_file = os.environ["MOCK_LSP_CHILD_PID_FILE"]
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os, pathlib, signal, sys, time; "
+                    "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                    "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
+                    "time.sleep(300)"
+                ),
+                child_pid_file,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
 
     while True:
         msg = read_message()
@@ -188,6 +212,8 @@ def main():
             continue
 
         if msg.get("method") == "exit":
+            if script == "process_tree_hang":
+                continue
             return 0
 
         # Unknown request: respond with method-not-found.

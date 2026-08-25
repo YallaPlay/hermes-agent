@@ -50,6 +50,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -212,6 +213,7 @@ class LSPClient:
 
         # Process + streams
         self._proc: Optional[asyncio.subprocess.Process] = None
+        self._process_group_id: Optional[int] = None
         self._stderr_task: Optional[asyncio.Task] = None
         self._reader_task: Optional[asyncio.Task] = None
 
@@ -318,6 +320,9 @@ class LSPClient:
             # gateway's child set, it captures the LSP PID, records the
             # inherited pgid, and killpg() then kills the TUI parent itself.
             # See tui_gateway_crash.log "killpg → SIGTERM received" stacks.
+            spawn_kwargs: Dict[str, Any] = {}
+            if sys.platform != "win32":
+                spawn_kwargs["start_new_session"] = True
             self._proc = await asyncio.create_subprocess_exec(
                 cmd[0],
                 *cmd[1:],
@@ -326,9 +331,11 @@ class LSPClient:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=self._cwd,
-                start_new_session=True,
                 creationflags=creationflags,
+                **spawn_kwargs,
             )
+            if sys.platform != "win32":
+                self._process_group_id = self._proc.pid
         except FileNotFoundError as e:
             raise LSPProtocolError(
                 f"LSP server binary not found: {cmd[0]} ({e})"
@@ -494,8 +501,13 @@ class LSPClient:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
         proc = self._proc
+        process_group_id = self._process_group_id
         self._proc = None
+        self._process_group_id = None
         if proc is None:
+            return
+        if process_group_id is not None:
+            await self._cleanup_process_group(proc, process_group_id)
             return
         if proc.returncode is None:
             try:
@@ -510,6 +522,50 @@ class LSPClient:
                         pass
             except ProcessLookupError:
                 pass
+
+    @staticmethod
+    def _process_group_exists(process_group_id: int) -> bool:
+        try:
+            os.killpg(process_group_id, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    async def _cleanup_process_group(
+        self,
+        proc: asyncio.subprocess.Process,
+        process_group_id: int,
+    ) -> None:
+        """Terminate the isolated LSP process group, including descendants."""
+        try:
+            os.killpg(process_group_id, signal.SIGTERM)
+        except ProcessLookupError:
+            if proc.returncode is None:
+                await proc.wait()
+            return
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + SHUTDOWN_GRACE
+        while self._process_group_exists(process_group_id) and loop.time() < deadline:
+            await asyncio.sleep(0.05)
+
+        if self._process_group_exists(process_group_id):
+            try:
+                os.killpg(process_group_id, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+        if proc.returncode is None:
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass
 
     # ------------------------------------------------------------------
     # request / notification plumbing
