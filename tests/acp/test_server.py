@@ -3,6 +3,7 @@
 import contextlib
 import asyncio
 import base64
+import json
 import os
 import re
 import time
@@ -3984,6 +3985,279 @@ class TestNotificationWatcher:
         )
         agent._deliver_notification.assert_awaited_once_with(
             "sess-abc", "[IMPORTANT: done]"
+        )
+
+    @pytest.mark.asyncio
+    async def test_completion_output_already_seen_after_spawn_is_suppressed(self, agent):
+        """Do not wake the model when the same process output is already in context."""
+        self._attach_conn(agent)
+        state = self._insert_state(agent.session_manager, "sess-duplicate")
+        process_id = "proc_duplicate123"
+        status_line = '{"state":"complete","exit_code":0,"cell":"stage_b_latency"}'
+        output = (
+            'To run a command as administrator (user "root"), use "sudo <command>".\n'
+            'See "man sudo_root" for details.\n\n'
+            f"{status_line}\n\n"
+            "--- stage_b_latency\nstdout.log 5417\nstderr.log 0"
+        )
+        state.agent._session_messages = [
+            {
+                "role": "tool",
+                "content": json.dumps({"session_id": process_id}),
+            },
+            {
+                "role": "tool",
+                "content": json.dumps({"output": status_line}),
+            },
+        ]
+        evt = {
+            "type": "completion",
+            "session_key": "sess-duplicate",
+            "session_id": process_id,
+            "exit_code": 0,
+            "output": output,
+        }
+        agent._deliver_notification = AsyncMock()
+        from tools.process_registry import process_registry
+
+        with patch.object(
+            process_registry,
+            "drain_notifications",
+            return_value=[(evt, "[IMPORTANT: done]")],
+        ):
+            await agent._drain_notification_cycle()
+
+        agent._deliver_notification.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_exact_arbitrary_output_after_spawn_is_suppressed(self, agent):
+        """Exact output duplication is safe without a structured status line."""
+        self._attach_conn(agent)
+        state = self._insert_state(agent.session_manager, "sess-exact")
+        process_id = "proc_exact123"
+        output = "artifact checksum 08f621b7dfeae791cb0ed7705ba0921cde0248135"
+        state.agent._session_messages = [
+            {"role": "tool", "content": json.dumps({"session_id": process_id})},
+            {"role": "tool", "content": json.dumps({"output": output})},
+        ]
+        evt = {
+            "type": "completion",
+            "session_key": "sess-exact",
+            "session_id": process_id,
+            "exit_code": 0,
+            "output": output,
+        }
+        agent._deliver_notification = AsyncMock()
+        from tools.process_registry import process_registry
+
+        with patch.object(
+            process_registry,
+            "drain_notifications",
+            return_value=[(evt, "[IMPORTANT: done]")],
+        ):
+            await agent._drain_notification_cycle()
+
+        agent._deliver_notification.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_arbitrary_partial_output_overlap_does_not_suppress(self, agent):
+        """One shared diagnostic line does not prove the result was handled."""
+        self._attach_conn(agent)
+        state = self._insert_state(agent.session_manager, "sess-partial")
+        process_id = "proc_partial123"
+        seen_line = "processed 125000 rows for campaign 20260825"
+        output = f"{seen_line}\nnew verdict material follows"
+        state.agent._session_messages = [
+            {"role": "tool", "content": json.dumps({"session_id": process_id})},
+            {"role": "tool", "content": json.dumps({"output": seen_line})},
+        ]
+        evt = {
+            "type": "completion",
+            "session_key": "sess-partial",
+            "session_id": process_id,
+            "exit_code": 0,
+            "output": output,
+        }
+        agent._deliver_notification = AsyncMock()
+        from tools.process_registry import process_registry
+
+        with patch.object(
+            process_registry,
+            "drain_notifications",
+            return_value=[(evt, "[IMPORTANT: done]")],
+        ):
+            await agent._drain_notification_cycle()
+
+        agent._deliver_notification.assert_awaited_once_with(
+            "sess-partial", "[IMPORTANT: done]"
+        )
+
+    @pytest.mark.asyncio
+    async def test_matching_output_before_spawn_does_not_suppress(self, agent):
+        """Old matching text is not proof that this process result was handled."""
+        self._attach_conn(agent)
+        state = self._insert_state(agent.session_manager, "sess-old-output")
+        process_id = "proc_new123"
+        output = '{"state":"complete","exit_code":0,"cell":"stage_b_latency"}'
+        state.agent._session_messages = [
+            {"role": "tool", "content": json.dumps({"output": output})},
+            {"role": "tool", "content": json.dumps({"session_id": process_id})},
+        ]
+        evt = {
+            "type": "completion",
+            "session_key": "sess-old-output",
+            "session_id": process_id,
+            "exit_code": 0,
+            "output": output,
+        }
+        agent._deliver_notification = AsyncMock()
+        from tools.process_registry import process_registry
+
+        with patch.object(
+            process_registry,
+            "drain_notifications",
+            return_value=[(evt, "[IMPORTANT: done]")],
+        ):
+            await agent._drain_notification_cycle()
+
+        agent._deliver_notification.assert_awaited_once_with(
+            "sess-old-output", "[IMPORTANT: done]"
+        )
+
+    @pytest.mark.asyncio
+    async def test_matching_assistant_text_after_spawn_does_not_suppress(self, agent):
+        """Only tool evidence can prove the agent fetched the process output."""
+        self._attach_conn(agent)
+        state = self._insert_state(agent.session_manager, "sess-prose")
+        process_id = "proc_prose123"
+        output = '{"state":"complete","exit_code":0,"cell":"stage_b_latency"}'
+        state.agent._session_messages = [
+            {"role": "tool", "content": json.dumps({"session_id": process_id})},
+            {"role": "assistant", "content": output},
+        ]
+        evt = {
+            "type": "completion",
+            "session_key": "sess-prose",
+            "session_id": process_id,
+            "exit_code": 0,
+            "output": output,
+        }
+        agent._deliver_notification = AsyncMock()
+        from tools.process_registry import process_registry
+
+        with patch.object(
+            process_registry,
+            "drain_notifications",
+            return_value=[(evt, "[IMPORTANT: done]")],
+        ):
+            await agent._drain_notification_cycle()
+
+        agent._deliver_notification.assert_awaited_once_with(
+            "sess-prose", "[IMPORTANT: done]"
+        )
+
+    @pytest.mark.asyncio
+    async def test_generic_shell_banner_match_does_not_suppress(self, agent):
+        """Common SSH boilerplate is not distinctive completion evidence."""
+        self._attach_conn(agent)
+        state = self._insert_state(agent.session_manager, "sess-banner")
+        process_id = "proc_banner123"
+        output = (
+            'To run a command as administrator (user "root"), use "sudo <command>".\n'
+            'See "man sudo_root" for details.\n\nDONE'
+        )
+        state.agent._session_messages = [
+            {"role": "tool", "content": json.dumps({"session_id": process_id})},
+            {
+                "role": "tool",
+                "content": json.dumps({"output": output.rsplit("\n", 1)[0]}),
+            },
+        ]
+        evt = {
+            "type": "completion",
+            "session_key": "sess-banner",
+            "session_id": process_id,
+            "exit_code": 0,
+            "output": output,
+        }
+        agent._deliver_notification = AsyncMock()
+        from tools.process_registry import process_registry
+
+        with patch.object(
+            process_registry,
+            "drain_notifications",
+            return_value=[(evt, "[IMPORTANT: done]")],
+        ):
+            await agent._drain_notification_cycle()
+
+        agent._deliver_notification.assert_awaited_once_with(
+            "sess-banner", "[IMPORTANT: done]"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cyclic_tool_content_cannot_break_completion_delivery(self, agent):
+        """Malformed in-memory tool content must fail open to normal delivery."""
+        self._attach_conn(agent)
+        state = self._insert_state(agent.session_manager, "sess-cyclic")
+        process_id = "proc_cyclic123"
+        cyclic = []
+        cyclic.append(cyclic)
+        output = '{"state":"complete","exit_code":0,"cell":"stage_b_latency"}'
+        state.agent._session_messages = [
+            {"role": "tool", "content": json.dumps({"session_id": process_id})},
+            {"role": "tool", "content": cyclic},
+        ]
+        evt = {
+            "type": "completion",
+            "session_key": "sess-cyclic",
+            "session_id": process_id,
+            "exit_code": 0,
+            "output": output,
+        }
+        agent._deliver_notification = AsyncMock()
+        from tools.process_registry import process_registry
+
+        with patch.object(
+            process_registry,
+            "drain_notifications",
+            return_value=[(evt, "[IMPORTANT: done]")],
+        ):
+            await agent._drain_notification_cycle()
+
+        agent._deliver_notification.assert_awaited_once_with(
+            "sess-cyclic", "[IMPORTANT: done]"
+        )
+
+    @pytest.mark.asyncio
+    async def test_failed_completion_is_not_suppressed_by_matching_output(self, agent):
+        """Failures remain actionable even when their output was read separately."""
+        self._attach_conn(agent)
+        state = self._insert_state(agent.session_manager, "sess-failed")
+        process_id = "proc_failed123"
+        output = '{"state":"failed","exit_code":1,"cell":"stage_b_latency"}'
+        state.agent._session_messages = [
+            {"role": "tool", "content": json.dumps({"session_id": process_id})},
+            {"role": "tool", "content": json.dumps({"output": output})},
+        ]
+        evt = {
+            "type": "completion",
+            "session_key": "sess-failed",
+            "session_id": process_id,
+            "exit_code": 1,
+            "output": output,
+        }
+        agent._deliver_notification = AsyncMock()
+        from tools.process_registry import process_registry
+
+        with patch.object(
+            process_registry,
+            "drain_notifications",
+            return_value=[(evt, "[IMPORTANT: failed]")],
+        ):
+            await agent._drain_notification_cycle()
+
+        agent._deliver_notification.assert_awaited_once_with(
+            "sess-failed", "[IMPORTANT: failed]"
         )
 
     @pytest.mark.asyncio
