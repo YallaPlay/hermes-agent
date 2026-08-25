@@ -7,6 +7,7 @@ on.
 """
 from __future__ import annotations
 
+import asyncio
 import sys
 import time
 from pathlib import Path
@@ -171,6 +172,42 @@ def test_reused_client_refreshes_last_used_and_survives_reap(mock_pyright):
         svc._loop.run(svc._reap_idle_once(), timeout=5.0)
         assert key in svc._clients
         assert svc.get_status()["clients"]
+    finally:
+        svc.shutdown()
+
+
+def test_reaper_removes_recent_client_when_workspace_is_deleted(tmp_path):
+    """A deleted workspace must be reaped without waiting for idle timeout."""
+
+    class _Client:
+        def __init__(self, workspace_root: str):
+            self.server_id = "typescript"
+            self.workspace_root = workspace_root
+            self.shutdown_calls = 0
+
+        async def shutdown(self):
+            self.shutdown_calls += 1
+
+    workspace = tmp_path / "deleted-workspace"
+    workspace.mkdir()
+    key = ("typescript", str(workspace))
+    client = _Client(str(workspace))
+    svc = LSPService(
+        enabled=False,
+        wait_mode="document",
+        wait_timeout=1.0,
+        install_strategy="manual",
+        idle_timeout=60.0,
+    )
+    svc._clients[key] = client  # type: ignore[assignment]
+    svc._last_used[key] = time.time()
+    workspace.rmdir()
+
+    try:
+        asyncio.run(svc._reap_idle_once())
+        assert key not in svc._clients
+        assert key not in svc._last_used
+        assert client.shutdown_calls == 1
     finally:
         svc.shutdown()
 

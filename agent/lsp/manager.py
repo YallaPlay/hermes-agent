@@ -827,6 +827,7 @@ class LSPService:
                 key
                 for key in self._clients
                 if self._last_used.get(key, 0) < cutoff
+                or not os.path.isdir(key[1])
             ]
             clients = [self._clients.pop(key) for key in idle_keys]
             for key in idle_keys:
