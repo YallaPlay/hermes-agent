@@ -2466,6 +2466,20 @@ class HermesACPAgent(acp.Agent):
             if ok:
                 await self._send_session_info_update(session_id)
             return {"ok": bool(ok)}
+        if method == "promoteSession":
+            # Detach a nested ACP fork from its display parent. This preserves
+            # the full transcript and routing; it only removes fork lineage so
+            # session/list returns the row as a top-level session.
+            session_id = params.get("sessionId")
+            if not session_id:
+                return {"ok": False, "error": "sessionId required"}
+            try:
+                ok = self.session_manager.promote_session(session_id)
+            except ValueError as exc:
+                return {"ok": False, "error": str(exc)}
+            if ok:
+                await self._send_session_info_update(session_id)
+            return {"ok": bool(ok)}
         if method == "setTitle":
             # Set (or clear, with an empty string) a session's CANONICAL title in
             # state.db — the thing session/list, the web UI, sessions-list CLI,

@@ -1181,6 +1181,37 @@ class SessionManager:
             logger.debug("Failed to set owner on %s", session_id, exc_info=True)
             return False
 
+    def promote_session(self, session_id: str) -> bool:
+        """Detach an idle ACP fork from its display parent.
+
+        Fork lineage is display-only and lives in ``model_config._forked_from``.
+        Removing that marker makes the session a normal top-level ACP session
+        without changing its transcript, owner, title, or runtime routing.
+        Delegate children remain read-only subagents and cannot be promoted by
+        this path.
+        """
+        db = self._get_db()
+        if db is None:
+            return False
+        row = db.get_session(session_id)
+        if row is None:
+            return False
+        if row.get("source") != "acp":
+            raise ValueError("Only ACP fork sessions can be promoted")
+        if not _forked_from_marker(row.get("model_config")):
+            return False
+
+        with self._lock:
+            state = self._sessions.get(session_id)
+            if state is not None:
+                if state.is_running:
+                    raise ValueError("Wait for the session turn to finish before promoting it")
+                state.parent_id = None
+
+        db.patch_session_model_config(session_id, {"_forked_from": None})
+        updated = db.get_session(session_id)
+        return updated is not None and not _forked_from_marker(updated.get("model_config"))
+
     def set_session_title(self, session_id: str, title: str) -> bool:
         """Set (or clear, when *title* is empty/whitespace) a session's canonical
         title in state.db. Returns True when a row was updated.

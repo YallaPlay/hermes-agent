@@ -400,6 +400,48 @@ class TestForkSession:
         assert restored is not None
         assert restored.parent_id == original.session_id
 
+    def test_promote_session_removes_fork_lineage_in_memory_and_on_disk(self, manager):
+        original = manager.create_session(cwd="/a")
+        original.history.append({"role": "user", "content": "hello"})
+        manager.save_session(original.session_id)
+        forked = manager.fork_session(original.session_id, cwd="/a")
+
+        assert manager.promote_session(forked.session_id) is True
+        assert forked.parent_id is None
+
+        row = manager._get_db().get_session(forked.session_id)
+        model_config = json.loads(row["model_config"])
+        assert "_forked_from" not in model_config
+        listing = {s["session_id"]: s for s in manager.list_sessions()}
+        assert listing[forked.session_id]["parent_id"] is None
+
+    def test_promote_session_works_after_process_restart(self, manager):
+        original = manager.create_session(cwd="/a")
+        original.history.append({"role": "user", "content": "hello"})
+        manager.save_session(original.session_id)
+        forked = manager.fork_session(original.session_id, cwd="/a")
+        fid = forked.session_id
+        manager.save_session(fid)
+        with manager._lock:
+            del manager._sessions[fid]
+
+        assert manager.promote_session(fid) is True
+        listing = {s["session_id"]: s for s in manager.list_sessions()}
+        assert listing[fid]["parent_id"] is None
+
+    def test_promote_session_rejects_delegate_children(self, manager):
+        db = manager._get_db()
+        db.create_session(session_id="parent", source="acp")
+        db.create_session(
+            session_id="child",
+            source="subagent",
+            model_config={"_delegate_from": "parent"},
+            parent_session_id="parent",
+        )
+
+        with pytest.raises(ValueError, match="Only ACP fork sessions"):
+            manager.promote_session("child")
+
     def test_archive_in_memory_fork_hides_it_from_active_list(self, manager):
         """Regression: archiving a fork looked like a no-op in VS Code.
 

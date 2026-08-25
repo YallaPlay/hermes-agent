@@ -1818,6 +1818,28 @@ class TestListAndFork:
         assert result["ok"] is False
 
     @pytest.mark.asyncio
+    async def test_ext_method_promote_session_delegates_and_emits(self, agent):
+        with patch.object(
+            agent.session_manager, "promote_session", return_value=True
+        ) as mock_promote, patch.object(agent, "_send_session_info_update") as mock_emit:
+            result = await agent.ext_method("promoteSession", {"sessionId": "s1"})
+        assert result == {"ok": True}
+        mock_promote.assert_called_once_with("s1")
+        mock_emit.assert_awaited_once_with("s1")
+
+    @pytest.mark.asyncio
+    async def test_ext_method_promote_session_surfaces_validation_error(self, agent):
+        with patch.object(
+            agent.session_manager,
+            "promote_session",
+            side_effect=ValueError("Only ACP fork sessions can be promoted"),
+        ), patch.object(agent, "_send_session_info_update") as mock_emit:
+            result = await agent.ext_method("promoteSession", {"sessionId": "s1"})
+        assert result["ok"] is False
+        assert result["error"] == "Only ACP fork sessions can be promoted"
+        mock_emit.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_list_sessions_owner_only_forwards_owner(self, agent):
         with patch.object(
             agent.session_manager, "list_sessions",
