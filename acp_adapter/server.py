@@ -1384,9 +1384,30 @@ class HermesACPAgent(acp.Agent):
             from hermes_cli.models import detect_provider_for_model, parse_model_input
 
             stripped = new_model
-            target_provider, new_model = parse_model_input(new_model, current_provider)
-            # A consumed provider prefix means the caller named the provider.
-            explicitly_qualified = new_model != stripped
+            explicitly_qualified = False
+            # ACP choice IDs encode named endpoints as
+            # ``custom:<name>:<model>``.  Resolve against the same catalog that
+            # built the picker before falling back to the shared config parser;
+            # the ACP catalog may be available even when a test or remote
+            # client has no local providers block loaded yet.
+            lowered = stripped.lower()
+            try:
+                named_provider_ids = [
+                    provider_id for provider_id, _label, _models in _named_custom_provider_catalogs()
+                ]
+            except Exception:
+                named_provider_ids = []
+            for provider_id in sorted(named_provider_ids, key=len, reverse=True):
+                prefix = f"{provider_id}:"
+                if lowered.startswith(prefix.lower()):
+                    target_provider = provider_id
+                    new_model = stripped[len(prefix) :].strip()
+                    explicitly_qualified = bool(new_model)
+                    break
+            else:
+                target_provider, new_model = parse_model_input(new_model, current_provider)
+                # A consumed provider prefix means the caller named the provider.
+                explicitly_qualified = new_model != stripped
             if (
                 target_provider == current_provider
                 and not explicitly_qualified
