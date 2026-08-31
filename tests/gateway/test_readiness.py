@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 from pathlib import Path
+from unittest.mock import patch
 
 from gateway.readiness import collect_runtime_readiness
 
@@ -19,15 +20,16 @@ def test_collect_runtime_readiness_reports_healthy_local_runtime(tmp_path, monke
         conn.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
     monkeypatch.setenv("HERMES_HOME", str(home))
 
-    result = collect_runtime_readiness(
-        configured_model="test/model",
-        runtime_status={
-            "gateway_state": "running",
-            "platforms": {"telegram": {"state": "connected"}},
-            "updated_at": "2026-07-09T00:00:00Z",
-        },
-        active_api_runs=2,
-    )
+    with patch("gateway.readiness._probe_disk", return_value={"status": "ok"}):
+        result = collect_runtime_readiness(
+            configured_model="test/model",
+            runtime_status={
+                "gateway_state": "running",
+                "platforms": {"telegram": {"state": "connected"}},
+                "updated_at": "2026-07-09T00:00:00Z",
+            },
+            active_api_runs=2,
+        )
 
     assert result["status"] == "ok"
     assert result["checks"]["state_db"]["status"] == "ok"
