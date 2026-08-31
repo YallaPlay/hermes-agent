@@ -137,6 +137,7 @@ def _fake_agent(stall_guards=True):
         _tool_guardrails=ToolCallGuardrailController(),
         _stall_guards=stall_guards,
         _tool_guardrail_halt_decision=None,
+        _note_tool_failure_repetition=lambda *_args, **_kwargs: None,
     )
     agent._stall_guards_enabled = lambda: AIAgent._stall_guards_enabled(agent)
     agent._set_tool_guardrail_halt = (
