@@ -198,6 +198,7 @@ class TestBedrockRegionRouting:
 
         with patch("agent.bedrock_adapter.has_aws_credentials", return_value=True), \
              patch("agent.bedrock_adapter.discover_bedrock_models", side_effect=_mock_discover), \
+             patch("hermes_cli.config.load_config_readonly", return_value={}), \
              _mock_botocore_session(return_value=mock_session):
             providers = list_authenticated_providers(current_provider="bedrock")
 

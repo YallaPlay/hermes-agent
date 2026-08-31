@@ -1162,6 +1162,7 @@ def _run_review_in_thread(
             _set_approval_callback(None)
         except Exception:
             pass
+        finish_background_review_run(agent, review_run)
         return
 
     review_agent = None

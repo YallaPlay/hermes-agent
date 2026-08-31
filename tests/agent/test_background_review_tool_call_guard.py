@@ -77,6 +77,30 @@ def test_fork_is_skipped_when_the_provider_cannot_emit_tool_calls(caplog):
     assert "auxiliary.background_review" in caplog.text
 
 
+def test_skipped_fork_finishes_the_installed_review_run():
+    client = MagicMock()
+    client.SUPPORTS_HERMES_TOOL_CALLS = False
+    agent = _fake_parent(client)
+    review_run = bg.prepare_background_review_run(agent)
+
+    assert review_run is not None
+    with (
+        patch("hermes_cli.config.load_config", return_value={}),
+        patch("run_agent.AIAgent") as mock_aiagent,
+        patch("tools.terminal_tool.set_approval_callback"),
+    ):
+        bg._run_review_in_thread(
+            agent,
+            [{"role": "user", "content": "hi"}],
+            "review please",
+            review_run=review_run,
+        )
+
+    mock_aiagent.assert_not_called()
+    assert review_run.request_done.is_set()
+    assert agent._background_review_run is None
+
+
 def test_fork_is_spawned_when_the_provider_can_emit_tool_calls():
     client = MagicMock()
     client.SUPPORTS_HERMES_TOOL_CALLS = True
