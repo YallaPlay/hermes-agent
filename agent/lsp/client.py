@@ -557,7 +557,7 @@ class LSPClient:
     @staticmethod
     def _process_group_exists(process_group_id: int) -> bool:
         try:
-            os.killpg(process_group_id, 0)
+            os.killpg(process_group_id, 0)  # windows-footgun: ok -- POSIX group only
         except ProcessLookupError:
             return False
         except PermissionError:
@@ -571,7 +571,9 @@ class LSPClient:
     ) -> None:
         """Terminate the isolated LSP process group, including descendants."""
         try:
-            os.killpg(process_group_id, signal.SIGTERM)
+            os.killpg(  # windows-footgun: ok -- POSIX group only
+                process_group_id, signal.SIGTERM
+            )
         except ProcessLookupError:
             if proc.returncode is None:
                 await proc.wait()
@@ -584,7 +586,10 @@ class LSPClient:
 
         if self._process_group_exists(process_group_id):
             try:
-                os.killpg(process_group_id, signal.SIGKILL)
+                os.killpg(  # windows-footgun: ok -- POSIX group only
+                    process_group_id,
+                    signal.SIGKILL,  # windows-footgun: ok -- POSIX group only
+                )
             except ProcessLookupError:
                 pass
 
