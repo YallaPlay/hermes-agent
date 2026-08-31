@@ -53,30 +53,46 @@ from agent.skill_utils import (
 
 logger = logging.getLogger(__name__)
 
-# Read-before-write marks for background-review forks, keyed by fork id.
+class _BackgroundReviewReadMarks:
+    """Read marks shared by copied tool contexts within one review run."""
+
+    def __init__(self) -> None:
+        self._lock = _threading.Lock()
+        self._paths: set[str] = set()
+
+    def add(self, path: str) -> None:
+        with self._lock:
+            self._paths.add(path)
+
+    def contains(self, path: str) -> bool:
+        with self._lock:
+            return path in self._paths
+
+
+# Read-before-write marks have two complementary storage paths:
 #
-# PROCESS-GLOBAL ON PURPOSE (issue: curator stuck in an unwinnable
-# view→patch→refused loop). These marks were originally a ContextVar, but
-# agent.tool_executor dispatches every tool call on a worker thread whose
-# context is a propagate_context_to_thread() SNAPSHOT of the loop thread's
-# context: a ContextVar.set() inside skill_view mutated only that snapshot
-# and was discarded when the tool returned. The next skill_manage call got a
-# fresh snapshot with an empty read-set, so the read-before-write guard could
-# never be satisfied and the review fork burned its whole iteration budget
-# retrying. Marks must therefore live in cross-thread storage; isolation
-# between concurrent review forks comes from keying on the fork id that
-# turn_context binds per fork (falling back to a shared key when absent).
+# * Real background-review forks bind a stable fork id in turn_context. Their
+#   marks live in a process-global, lock-protected map keyed by that id, because
+#   every tool call runs in a separate worker-thread context snapshot.
+# * Direct/test callers without a fork id use upstream's ContextVar-held mutable
+#   ledger. Initializing it before copy_context() lets copied tool contexts share
+#   one ledger while separate review contexts remain isolated.
+#
+# This hybrid preserves the fork's production worker-thread fix and cleanup
+# contract while retaining upstream's context-isolation behavior.
 _background_review_read_lock = _threading.Lock()
 _background_review_read_paths_by_fork: Dict[str, "set[str]"] = {}
-_FALLBACK_REVIEW_FORK_KEY = "background_review"
+_background_review_read_paths: (
+    "_ctxvars.ContextVar[Optional[_BackgroundReviewReadMarks]]"
+) = _ctxvars.ContextVar("background_review_read_paths", default=None)
 
 
-def _current_review_fork_key() -> str:
+def _current_review_fork_key() -> Optional[str]:
     try:
         from tools.skill_provenance import get_current_review_fork_id
-        return get_current_review_fork_id() or _FALLBACK_REVIEW_FORK_KEY
+        return get_current_review_fork_id()
     except Exception:
-        return _FALLBACK_REVIEW_FORK_KEY
+        return None
 
 
 def mark_background_review_skill_read(path: Path) -> None:
@@ -100,8 +116,15 @@ def mark_background_review_skill_read(path: Path) -> None:
     except Exception:
         resolved = str(path)
     key = _current_review_fork_key()
-    with _background_review_read_lock:
-        _background_review_read_paths_by_fork.setdefault(key, set()).add(resolved)
+    if key is not None:
+        with _background_review_read_lock:
+            _background_review_read_paths_by_fork.setdefault(key, set()).add(resolved)
+        return
+    marks = _background_review_read_paths.get()
+    if marks is None:
+        marks = _BackgroundReviewReadMarks()
+        _background_review_read_paths.set(marks)
+    marks.add(resolved)
 
 
 def _background_review_has_read(path: Path) -> bool:
@@ -110,8 +133,11 @@ def _background_review_has_read(path: Path) -> bool:
     except Exception:
         resolved = str(path)
     key = _current_review_fork_key()
-    with _background_review_read_lock:
-        return resolved in _background_review_read_paths_by_fork.get(key, ())
+    if key is not None:
+        with _background_review_read_lock:
+            return resolved in _background_review_read_paths_by_fork.get(key, ())
+    marks = _background_review_read_paths.get()
+    return marks is not None and marks.contains(resolved)
 
 
 def clear_background_review_read_marks(fork_id: Optional[str] = None) -> None:
@@ -122,12 +148,16 @@ def clear_background_review_read_marks(fork_id: Optional[str] = None) -> None:
     current context's fork entry is cleared.
     """
     key = fork_id or _current_review_fork_key()
-    with _background_review_read_lock:
-        _background_review_read_paths_by_fork.pop(key, None)
+    if key is not None:
+        with _background_review_read_lock:
+            _background_review_read_paths_by_fork.pop(key, None)
+    else:
+        _background_review_read_paths.set(_BackgroundReviewReadMarks())
 
 
 def _reset_background_review_read_marks() -> None:
-    """Test helper: clear all read-before-write marks."""
+    """Start a fresh context ledger and clear process-global fork marks."""
+    _background_review_read_paths.set(_BackgroundReviewReadMarks())
     with _background_review_read_lock:
         _background_review_read_paths_by_fork.clear()
 
@@ -309,16 +339,30 @@ def _validate_delete_target(skill_dir: Path) -> Optional[str]:
 
 
 def _pinned_guard(name: str) -> Optional[str]:
-    """Return a refusal message if *name* is pinned, else None.
+    """Return a refusal message if *name* is pinned or essential, else None.
 
     Pin protects a skill from **deletion** — both the curator's auto-archive
     passes and the agent's ``skill_manage(action="delete")`` tool call. The
     agent can still patch/edit pinned skills; pin only guards against
     irrecoverable loss, not against content evolution.
 
+    Essential skills (``agent/skill_utils.ESSENTIAL_SKILLS``, e.g.
+    ``hermes-agent``) are treated as permanently pinned: the system prompt
+    always references them, so deleting one leaves a dangling instruction.
+
     Best-effort: if the sidecar is unreadable we let the delete through
     rather than block on a broken telemetry file.
     """
+    try:
+        from agent.skill_utils import ESSENTIAL_SKILLS
+        if name in ESSENTIAL_SKILLS:
+            return (
+                f"Skill '{name}' is essential to Hermes (the agent's own "
+                f"operating manual referenced by the system prompt) and "
+                f"cannot be deleted. Patches and edits are still allowed."
+            )
+    except Exception:
+        logger.debug("essential-guard lookup failed for %s", name, exc_info=True)
     try:
         from tools import skill_usage
         rec = skill_usage.get_record(name)
@@ -974,9 +1018,10 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     skill_dir = _resolve_skill_dir(name, category)
     skill_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write SKILL.md atomically
+    # Write instructional documents with a readable mode while preserving
+    # the mode of an existing file across the atomic replacement.
     skill_md = skill_dir / "SKILL.md"
-    atomic_write_text(skill_md, content)
+    atomic_write_text(skill_md, content, preserve_mode=True, create_mode=0o644)
 
     # Security scan — roll back on block
     scan_error = _security_scan_skill(skill_dir)
@@ -1069,13 +1114,13 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
 
     # Back up original content for rollback
     original_content = skill_md.read_text(encoding="utf-8") if skill_md.exists() else None
-    atomic_write_text(skill_md, content)
+    atomic_write_text(skill_md, content, preserve_mode=True, create_mode=0o644)
 
     # Security scan — roll back on block
     scan_error = _security_scan_skill(existing["path"])
     if scan_error:
         if original_content is not None:
-            atomic_write_text(skill_md, original_content)
+            atomic_write_text(skill_md, original_content, preserve_mode=True)
         return {"success": False, "error": scan_error}
 
     # Extract description from new content for verbose notifications
@@ -1198,12 +1243,12 @@ def _patch_skill(
             }
 
     original_content = content  # for rollback
-    atomic_write_text(target, new_content)
+    atomic_write_text(target, new_content, preserve_mode=True, create_mode=0o644)
 
     # Security scan — roll back on block
     scan_error = _security_scan_skill(skill_dir)
     if scan_error:
-        atomic_write_text(target, original_content)
+        atomic_write_text(target, original_content, preserve_mode=True)
         return {"success": False, "error": scan_error}
 
     result = {
@@ -1377,13 +1422,13 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     target.parent.mkdir(parents=True, exist_ok=True)
     # Back up for rollback
     original_content = target.read_text(encoding="utf-8") if target.exists() else None
-    atomic_write_text(target, file_content)
+    atomic_write_text(target, file_content, preserve_mode=True, create_mode=0o644)
 
     # Security scan — roll back on block
     scan_error = _security_scan_skill(existing["path"])
     if scan_error:
         if original_content is not None:
-            atomic_write_text(target, original_content)
+            atomic_write_text(target, original_content, preserve_mode=True)
         else:
             target.unlink(missing_ok=True)
         return {"success": False, "error": scan_error}
@@ -1633,16 +1678,34 @@ def skill_manage(
         result = _create_skill(name, content, category)
 
     elif action == "edit":
+        # Legacy alias for a full rewrite (kept for old transcripts/callers;
+        # no longer advertised in the schema — use patch with `content`).
         if not content:
-            return tool_error("content is required for 'edit'. Provide the full updated SKILL.md text.", success=False)
+            return tool_error("content is required for a full rewrite. Provide the full updated SKILL.md text.", success=False)
         result = _edit_skill(name, content)
 
     elif action == "patch":
-        if not old_string:
-            return tool_error("old_string is required for 'patch'. Provide the text to find.", success=False)
-        if new_string is None:
-            return tool_error("new_string is required for 'patch'. Use empty string to delete matched text.", success=False)
-        result = _patch_skill(name, old_string, new_string, file_path, replace_all)
+        # Two shapes: old_string/new_string = targeted replacement;
+        # content (alone) = full SKILL.md rewrite (absorbs the old 'edit').
+        if content and (old_string or new_string is not None):
+            return tool_error(
+                "Pass EITHER content (full SKILL.md rewrite) OR "
+                "old_string/new_string (targeted replacement), not both.",
+                success=False,
+            )
+        if content:
+            result = _edit_skill(name, content)
+        else:
+            if not old_string:
+                return tool_error(
+                    "patch needs old_string/new_string for a targeted "
+                    "replacement, or content for a full SKILL.md rewrite "
+                    "(read it first with skill_view()).",
+                    success=False,
+                )
+            if new_string is None:
+                return tool_error("new_string is required for 'patch'. Use empty string to delete matched text.", success=False)
+            result = _patch_skill(name, old_string, new_string, file_path, replace_all)
 
     elif action == "delete":
         result = _delete_skill(name, absorbed_into=absorbed_into)
@@ -1746,45 +1809,24 @@ def skill_manage(
 SKILL_MANAGE_SCHEMA = {
     "name": "skill_manage",
     "description": (
-        "Manage skills (create, update, delete). Skills are your procedural "
-        "memory — reusable approaches for recurring task types. "
-        f"New skills go to {display_hermes_home()}/skills/; existing skills can be modified wherever they live.\n\n"
-        "Actions: create (full SKILL.md + optional category), "
-        "patch (old_string/new_string — preferred for fixes), "
-        "edit (full SKILL.md rewrite — major overhauls only), "
-        "delete, write_file, remove_file.\n\n"
-        "On delete, pass `absorbed_into=<umbrella>` when you're merging this "
-        "skill's content into another one, or `absorbed_into=\"\"` when you're "
-        "pruning it with no forwarding target. This lets the curator tell "
-        "consolidation from pruning without guessing, so downstream consumers "
-        "(cron jobs that reference the old skill name, etc.) get updated "
-        "correctly. The target you name in `absorbed_into` must already "
-        "exist — create/patch the umbrella first, then delete.\n\n"
-        "Create when: complex task succeeded (5+ calls), errors overcome, "
-        "user-corrected approach worked, non-trivial workflow discovered, "
-        "or user asks you to remember a procedure.\n"
-        "Update when: instructions stale/wrong, OS-specific failures, "
-        "missing steps or pitfalls found during use. "
-        "If you used a skill and hit issues not covered by it, patch it immediately.\n\n"
-        "After difficult/iterative tasks, offer to save as a skill. "
-        "Skip for simple one-offs. Confirm with user before creating/deleting.\n\n"
-        "Good skills: trigger conditions, numbered steps with exact commands, "
-        "pitfalls section, verification steps. Use skill_view() to see format examples.\n\n"
-        "Description: long descriptions are truncated to the first 57 chars "
-        "plus '...' in the system prompt skill index; longer text is visible "
-        "via skills_list/skill_view. Keep the trigger self-contained in that "
-        "first 57-char window: 'Use when <trigger>. <one-line behavior>.'\n\n"
-        "Pinned skills are protected from deletion only — skill_manage(action='delete') "
-        "will refuse with a message pointing the user to `hermes curator unpin <name>`. "
-        "Patches and edits go through on pinned skills so you can still improve them as "
-        "pitfalls come up; pin only guards against irrecoverable loss."
+        "Create, update, or delete skills — your procedural memory for "
+        "recurring task types. Actions: create (full SKILL.md + optional "
+        f"category; lands in {display_hermes_home()}/skills/), patch "
+        "(old_string/new_string for a targeted fix — preferred; OR content "
+        "alone for a full SKILL.md rewrite), delete, write_file/remove_file "
+        "(supporting files). Existing skills are modified wherever they "
+        "live. Good skills: a self-contained trigger in the description's "
+        "first 57 chars ('Use when <trigger>. <one-line behavior>.'), "
+        "numbered steps with exact commands, pitfalls, verification (see "
+        "skill_view() for format). Confirm with the user before "
+        "create/delete."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["create", "patch", "edit", "delete", "write_file", "remove_file"],
+                "enum": ["create", "patch", "delete", "write_file", "remove_file"],
                 "description": "The action to perform."
             },
             "name": {
@@ -1798,8 +1840,9 @@ SKILL_MANAGE_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Full SKILL.md content (YAML frontmatter + markdown body). "
-                    "Required for 'create' and 'edit'. For 'edit', read the skill "
-                    "first with skill_view() and provide the complete updated text."
+                    "Required for 'create'; on 'patch' it performs a full "
+                    "rewrite (major overhauls only — read the skill first with "
+                    "skill_view(), and don't combine with old_string)."
                 )
             },
             "old_string": {
@@ -1842,20 +1885,13 @@ SKILL_MANAGE_SCHEMA = {
                 "type": "string",
                 "description": "Content for the file. Required for 'write_file'."
             },
-            "absorbed_into": {
-                "type": "string",
-                "description": (
-                    "For 'delete' only — declares intent so the curator can "
-                    "tell consolidation from pruning without guessing. "
-                    "Pass the umbrella skill name when this skill's content "
-                    "was merged into another (the target must already exist). "
-                    "Pass an empty string when the skill is truly stale and "
-                    "being pruned with no forwarding target. Omitting the arg "
-                    "on delete is supported for backward compatibility but "
-                    "downstream tooling (e.g. cron-job skill reference "
-                    "rewriting) will have to guess at intent."
-                )
-            },
+            # NOTE: the handler also accepts `absorbed_into` on delete — the
+            # curator's consolidation pass declares merge-vs-prune intent with
+            # it. Deliberately NOT advertised in this schema: only curator
+            # sessions need it, the curator's own prompt documents it, and the
+            # curator-context delete guard's error re-teaches it on omission
+            # (_curator_consolidation_delete_guard). Keeping it out saves
+            # ~100 tokens on every call of every other session.
         },
         "required": ["action", "name"],
     },
