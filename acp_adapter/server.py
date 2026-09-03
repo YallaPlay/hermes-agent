@@ -891,6 +891,26 @@ def _content_blocks_to_openai_user_content(
     return parts
 
 
+def _prompt_has_content(user_text: str, user_content: str | list[dict[str, Any]]) -> bool:
+    """True when the converted prompt carries anything worth a turn.
+
+    ``user_text`` only sees TextContentBlocks. A prompt that is ONLY a
+    non-image attachment (e.g. a .docx uploaded from the composer with no
+    caption) converts to a plain text STRING — the ``[Attached file: ...]``
+    header plus inlined body or saved-to-cache note — so checking
+    ``isinstance(user_content, list)`` alone silently dropped the turn
+    (bitten 2026-09-03: .docx uploads vanished with no client feedback).
+    Any non-blank converted content, string or structured, is a real prompt.
+    Whitespace-only text (``"   "``) stays empty so a blank submit or a
+    rewind-without-resend is still refused.
+    """
+    if user_text:
+        return True
+    if isinstance(user_content, str):
+        return bool(user_content.strip())
+    return bool(user_content)
+
+
 class HermesACPAgent(acp.Agent):
     """ACP Agent implementation wrapping Hermes AIAgent."""
 
@@ -3582,9 +3602,7 @@ class HermesACPAgent(acp.Agent):
         # return so an invalid rewind never silently no-ops.
         keep_history = self._keep_history_meta(kwargs)
         text_only_prompt = all(isinstance(block, TextContentBlock) for block in prompt)
-        has_content = bool(user_text) or (
-            isinstance(user_content, list) and bool(user_content)
-        )
+        has_content = _prompt_has_content(user_text, user_content)
         if not has_content:
             if keep_history is not None:
                 # A truncate with nothing to resend is not a supported shape —
