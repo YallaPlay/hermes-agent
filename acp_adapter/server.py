@@ -2471,7 +2471,10 @@ class HermesACPAgent(acp.Agent):
         mcp_servers: list | None = None,
         **kwargs: Any,
     ) -> LoadSessionResponse | None:
-        state = self.session_manager.update_cwd(session_id, cwd)
+        # Loading must not wait on a contested SQLite metadata write. The
+        # in-memory cwd is authoritative for this process and the next turn's
+        # normal session save persists it.
+        state = self.session_manager.update_cwd(session_id, cwd, persist=False)
         if state is None:
             logger.warning("load_session: session %s not found", session_id)
             return None
@@ -2530,7 +2533,7 @@ class HermesACPAgent(acp.Agent):
         mcp_servers: list | None = None,
         **kwargs: Any,
     ) -> ResumeSessionResponse:
-        state = self.session_manager.update_cwd(session_id, cwd)
+        state = self.session_manager.update_cwd(session_id, cwd, persist=False)
         if state is None:
             logger.warning("resume_session: session %s not found, creating new", session_id)
             state = self.session_manager.create_session(cwd=cwd)

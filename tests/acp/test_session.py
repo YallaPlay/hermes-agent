@@ -280,6 +280,21 @@ class TestWslCwdTranslation:
         assert updated is not None
         assert updated.cwd == "/mnt/c/Users/foo/project"
 
+    def test_update_cwd_persists_metadata_without_rewriting_history(self, manager):
+        state = manager.create_session(cwd="/tmp/old")
+        state.history = [{"role": "user", "content": "keep this row"}]
+        manager.save_session(state.session_id)
+        db = manager._get_db()
+
+        with patch.object(db, "replace_messages", wraps=db.replace_messages) as replace:
+            updated = manager.update_cwd(state.session_id, cwd="/tmp/new")
+
+        assert updated is not None
+        assert updated.cwd == "/tmp/new"
+        replace.assert_not_called()
+        persisted = db.get_session(state.session_id)
+        assert persisted["cwd"] == "/tmp/new"
+
 # ---------------------------------------------------------------------------
 # fork
 # ---------------------------------------------------------------------------

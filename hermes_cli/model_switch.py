@@ -2224,11 +2224,31 @@ def _credential_pool_is_usable(provider: str, *, raw_pool_present: bool = False)
     try:
         from agent.credential_pool import load_pool
 
-        pool = load_pool(provider)
+        # Copilot singleton refresh exchanges the raw GitHub token for an API
+        # token. That exchange retries for up to ~35 seconds during a network
+        # failure. Provider listing only needs an availability signal, so read
+        # the persisted pool without refreshing external sources.
+        pool = load_pool(provider, refresh_sources=provider != "copilot")
         if pool.has_credentials():
             return pool.has_available()
     except Exception:
         pass
+
+    if provider == "copilot":
+        try:
+            from hermes_cli.auth import is_source_suppressed
+            from hermes_cli.copilot_auth import COPILOT_ENV_VARS, resolve_copilot_token
+
+            possible_sources = ["gh_cli"] + [f"env:{name}" for name in COPILOT_ENV_VARS]
+            if all(is_source_suppressed(provider, source) for source in possible_sources):
+                return False
+            token, source = resolve_copilot_token()
+            if not token:
+                return False
+            source_name = "gh_cli" if source == "gh auth token" else f"env:{source}"
+            return not is_source_suppressed(provider, source_name)
+        except Exception:
+            return False
     return raw_pool_present
 
 

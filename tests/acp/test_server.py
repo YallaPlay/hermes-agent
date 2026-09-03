@@ -558,6 +558,27 @@ class TestSessionOps:
         assert assistant_calls and all("hermes" not in c.kwargs for c in assistant_calls)
 
     @pytest.mark.asyncio
+    async def test_load_session_updates_cwd_without_blocking_persistence(self, agent):
+        new_resp = await agent.new_session(cwd="/tmp/old")
+
+        with patch.object(
+            agent.session_manager,
+            "update_cwd",
+            wraps=agent.session_manager.update_cwd,
+        ) as update_cwd:
+            response = await agent.load_session(
+                cwd="/tmp/new",
+                session_id=new_resp.session_id,
+            )
+
+        assert response is not None
+        update_cwd.assert_called_once_with(
+            new_resp.session_id,
+            "/tmp/new",
+            persist=False,
+        )
+
+    @pytest.mark.asyncio
     async def test_load_session_flags_compaction_summary_on_replayed_user_chunk(self, agent):
         """A replayed compaction summary must carry _meta.hermes.compactionSummary.
 

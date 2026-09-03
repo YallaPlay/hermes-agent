@@ -845,7 +845,13 @@ class SessionManager:
                 )
         return results
 
-    def update_cwd(self, session_id: str, cwd: str) -> Optional[SessionState]:
+    def update_cwd(
+        self,
+        session_id: str,
+        cwd: str,
+        *,
+        persist: bool = True,
+    ) -> Optional[SessionState]:
         """Update the working directory for a session and its tool overrides."""
         cwd = _translate_acp_cwd(cwd)
         state = self.get_session(session_id)  # checks DB too
@@ -853,7 +859,10 @@ class SessionManager:
             return None
         state.cwd = cwd
         _register_task_cwd(session_id, cwd)
-        self._persist(state)
+        if persist:
+            # Persist only metadata here. Rewriting the full transcript can
+            # take tens of seconds and creates inactive duplicate rows.
+            self._persist(state, persist_messages=False)
         return state
 
     def cleanup(self) -> None:
@@ -911,11 +920,11 @@ class SessionManager:
             logger.debug("SessionDB unavailable for ACP persistence", exc_info=True)
             return None
 
-    def _persist(self, state: SessionState) -> None:
+    def _persist(self, state: SessionState, *, persist_messages: bool = True) -> None:
         """Write session state to the database.
 
-        Creates the session record if it doesn't exist, then replaces all
-        stored messages with the current in-memory history.
+        Create the session record if needed and update its metadata. Replace
+        stored messages only when ``persist_messages`` is true.
         """
         # Delegate children are observation-only: the child agent owns the
         # row and flushes its own transcript. Persisting here would rewrite
@@ -986,6 +995,9 @@ class SessionManager:
                     )
                 except Exception:
                     logger.debug("Failed to update ACP session metadata", exc_info=True)
+
+            if not persist_messages:
+                return
 
             # When the agent owns persistence to this same SessionDB it has
             # already flushed the live transcript incrementally during

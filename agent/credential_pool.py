@@ -3305,7 +3305,13 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
     return changed, active_sources
 
 
-def load_pool(provider: str) -> CredentialPool:
+def load_pool(provider: str, *, refresh_sources: bool = True) -> CredentialPool:
+    """Load a provider pool, optionally without external credential discovery.
+
+    ``refresh_sources=False`` is for latency-sensitive availability checks.
+    It reads persisted entries only and does not run singleton or environment
+    discovery, which can include network-backed token exchange.
+    """
     provider = (provider or "").strip().lower()
     raw_entries = read_credential_pool(provider)
     disk_ids = {
@@ -3319,6 +3325,9 @@ def load_pool(provider: str) -> CredentialPool:
         for payload in raw_entries
     )
     entries = [PooledCredential.from_dict(provider, payload) for payload in raw_entries]
+    if not refresh_sources:
+        return CredentialPool(provider, entries)
+
     raw_needs_auth_normalization = any(
         isinstance(payload, dict)
         and _normalize_pool_auth_type(

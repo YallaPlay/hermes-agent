@@ -1,9 +1,57 @@
 """Tests for GitHub Copilot entries shown in the /model picker."""
 
 import os
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-from hermes_cli.model_switch import list_authenticated_providers
+from hermes_cli.model_switch import (
+    _credential_pool_is_usable,
+    list_authenticated_providers,
+)
+
+
+def test_copilot_picker_checks_persisted_pool_without_refreshing_sources():
+    pool = MagicMock()
+    pool.has_credentials.return_value = True
+    pool.has_available.return_value = True
+
+    with patch("agent.credential_pool.load_pool", return_value=pool) as load_pool:
+        assert _credential_pool_is_usable("copilot") is True
+
+    load_pool.assert_called_once_with("copilot", refresh_sources=False)
+
+
+def test_copilot_picker_uses_raw_token_presence_when_pool_is_empty():
+    pool = MagicMock()
+    pool.has_credentials.return_value = False
+
+    with (
+        patch("agent.credential_pool.load_pool", return_value=pool),
+        patch(
+            "hermes_cli.copilot_auth.resolve_copilot_token",
+            return_value=("raw-token", "gh auth token"),
+        ),
+        patch("hermes_cli.auth.is_source_suppressed", return_value=False),
+        patch(
+            "hermes_cli.copilot_auth.get_copilot_api_token",
+            side_effect=AssertionError("picker auth checks must not exchange tokens"),
+        ),
+    ):
+        assert _credential_pool_is_usable("copilot") is True
+
+
+def test_load_pool_can_skip_external_source_refresh():
+    with (
+        patch("agent.credential_pool.read_credential_pool", return_value=[]),
+        patch("agent.credential_pool._seed_from_singletons") as seed_singletons,
+        patch("agent.credential_pool._seed_from_env") as seed_env,
+    ):
+        from agent.credential_pool import load_pool
+
+        pool = load_pool("copilot", refresh_sources=False)
+
+    assert pool.has_credentials() is False
+    seed_singletons.assert_not_called()
+    seed_env.assert_not_called()
 
 
 @patch.dict(os.environ, {"GH_TOKEN": "test-key"}, clear=False)
