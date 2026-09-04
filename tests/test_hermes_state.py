@@ -12,6 +12,7 @@ import pytest
 import hermes_state
 from agent.session_activity import ActivityProvenance
 from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
+from hermes_state_common import _sql_session_last_active, _sql_session_last_active_by_id
 
 
 class _NoFtsCursor(sqlite3.Cursor):
@@ -2522,20 +2523,63 @@ class TestListSessionsRich:
         # last_active should be close to now (the assistant message)
         assert sessions[0]["last_active"] > sessions[0]["started_at"]
 
+    def test_fork_last_active_never_predates_its_creation(self, db):
+        db.create_session("parent", "acp")
+        db.create_session(
+            "fork",
+            "acp",
+            model_config={"_forked_from": "parent"},
+        )
+        started_at = db.get_session("fork")["started_at"]
+        db.append_message("fork", "user", "copied parent message")
+        with db._lock:
+            db._conn.execute(
+                "UPDATE messages SET timestamp = ? WHERE session_id = ?",
+                (started_at - 120.0, "fork"),
+            )
+            db._conn.execute(
+                "UPDATE sessions SET last_activity_at = NULL WHERE id = ?",
+                ("fork",),
+            )
+            db._conn.commit()
+
+        with db._read_ctx() as conn:
+            helper_row = conn.execute(
+                f"SELECT {_sql_session_last_active('s')} AS by_alias, "
+                f"{_sql_session_last_active_by_id('s.id')} AS by_id "
+                "FROM sessions s WHERE s.id = ?",
+                ("fork",),
+            ).fetchone()
+
+        expected_start = pytest.approx(started_at, rel=0, abs=1e-6)
+        assert helper_row["by_alias"] == expected_start
+        assert helper_row["by_id"] == expected_start
+
+        listed = next(
+            row for row in db.list_sessions_rich() if row["id"] == "fork"
+        )
+        ordered = next(
+            row
+            for row in db.list_sessions_rich(order_by_last_active=True)
+            if row["id"] == "fork"
+        )
+        assert listed["last_active"] == expected_start
+        assert ordered["last_active"] == expected_start
 
     def test_last_active_prefers_session_activity_heartbeat(self, db):
         """Mid-turn agent heartbeats must advance last_active without new messages (#72016)."""
         db.create_session("s1", "cli")
+        started_at = db.get_session("s1")["started_at"]
         db.append_message("s1", "user", "hello")
         with db._lock:
             db._conn.execute(
                 "UPDATE messages SET timestamp=? WHERE session_id=? AND role=?",
-                (1_700_000_000.0, "s1", "user"),
+                (started_at - 500.0, "s1", "user"),
             )
             db._conn.commit()
 
         before = db.list_sessions_rich()[0]["last_active"]
-        heartbeat = 1_700_000_500.0
+        heartbeat = started_at + 500.0
         db.touch_session_activity(
             "s1",
             heartbeat,
@@ -2589,15 +2633,17 @@ class TestListSessionsRich:
     def test_last_active_uses_newer_message_over_stale_heartbeat(self, db):
         """Rate-limited heartbeats can lag message writes; last_active must take max."""
         db.create_session("s1", "cli")
+        started_at = db.get_session("s1")["started_at"]
         db.append_message("s1", "user", "hello")
+        message_at = started_at + 800.0
         with db._lock:
             db._conn.execute(
                 "UPDATE messages SET timestamp=? WHERE session_id=?",
-                (1_700_000_800.0, "s1"),
+                (message_at, "s1"),
             )
             db._conn.commit()
-        db.touch_session_activity("s1", 1_700_000_500.0, description="api")  # older than message
-        assert db.list_sessions_rich()[0]["last_active"] == 1_700_000_800.0
+        db.touch_session_activity("s1", started_at + 500.0, description="api")
+        assert db.list_sessions_rich()[0]["last_active"] == message_at
 
     def test_list_gateway_sessions_last_active_uses_activity_heartbeat(self, db):
         db.create_session(
@@ -2607,15 +2653,16 @@ class TestListSessionsRich:
             chat_id="c1",
             chat_type="dm",
         )
+        started_at = db.get_session("gw-1")["started_at"]
         db.append_message("gw-1", "user", "ping")
         with db._lock:
             db._conn.execute(
                 "UPDATE messages SET timestamp=? WHERE session_id=?",
-                (1_700_000_000.0, "gw-1"),
+                (started_at - 500.0, "gw-1"),
             )
             db._conn.commit()
 
-        heartbeat = 1_700_000_900.0
+        heartbeat = started_at + 900.0
         db.touch_session_activity(
             "gw-1",
             heartbeat,

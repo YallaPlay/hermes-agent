@@ -2629,8 +2629,11 @@ class HermesACPAgent(acp.Agent):
         **kwargs: Any,
     ) -> ForkSessionResponse:
         keep_history = self._keep_history_meta(kwargs)
-        state = self.session_manager.fork_session(
-            session_id, cwd=cwd, keep_history=keep_history
+        state = await asyncio.to_thread(
+            self.session_manager.fork_session,
+            session_id,
+            cwd=cwd,
+            keep_history=keep_history,
         )
         new_id = state.session_id if state else ""
         if state is not None:

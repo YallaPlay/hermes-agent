@@ -362,8 +362,8 @@ def _ephemeral_child_sql(alias: str = "s") -> str:
 def _sql_session_last_active(alias: str = "s") -> str:
     """SQL expression for session recency used by list/status surfaces.
 
-    Freshest of ``last_activity_at`` (mid-turn agent activity heartbeat) and
-    the latest message timestamp, then fall back to ``started_at``.
+    Freshest of ``started_at``, ``last_activity_at`` (mid-turn agent activity
+    heartbeat), and the latest message timestamp.
 
     Must not prefer a stale heartbeat over a newer message: durable
     heartbeats are rate-limited (~60s), so after a turn writes messages
@@ -376,7 +376,9 @@ def _sql_session_last_active(alias: str = "s") -> str:
     return (
         f"COALESCE("
         f"(SELECT MAX(_act_v.v) FROM ("
-        f"SELECT {alias}.last_activity_at AS v "
+        f"SELECT {alias}.started_at AS v "
+        f"UNION ALL "
+        f"SELECT {alias}.last_activity_at "
         f"UNION ALL "
         f"SELECT {msg_max}"
         f") _act_v), "
@@ -401,7 +403,9 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     return (
         f"COALESCE("
         f"(SELECT MAX(_act_v.v) FROM ("
-        f"SELECT {activity} AS v "
+        f"SELECT {started} AS v "
+        f"UNION ALL "
+        f"SELECT {activity} "
         f"UNION ALL "
         f"SELECT {msg_max}"
         f") _act_v), "

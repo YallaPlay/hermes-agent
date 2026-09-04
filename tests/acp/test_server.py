@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -1221,6 +1222,32 @@ class TestListAndFork:
         fork_resp = await agent.fork_session(cwd="/forked", session_id=new_resp.session_id)
         assert fork_resp.session_id
         assert fork_resp.session_id != new_resp.session_id
+
+    @pytest.mark.asyncio
+    async def test_fork_session_build_keeps_event_loop_responsive(self, agent):
+        new_resp = await agent.new_session(cwd="/original")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        release_build = threading.Event()
+        heartbeat_ran = asyncio.Event()
+
+        def blocking_fork(*args, **kwargs):
+            assert release_build.wait(timeout=0.5), "event loop was blocked by fork build"
+            return state
+
+        async def heartbeat():
+            await asyncio.sleep(0)
+            heartbeat_ran.set()
+            release_build.set()
+
+        with patch.object(agent.session_manager, "fork_session", side_effect=blocking_fork):
+            heartbeat_task = asyncio.create_task(heartbeat())
+            fork_resp = await agent.fork_session(
+                cwd="/forked", session_id=new_resp.session_id
+            )
+            await heartbeat_task
+
+        assert heartbeat_ran.is_set()
+        assert fork_resp.session_id == state.session_id
 
     @pytest.mark.asyncio
     async def test_fork_session_keep_history_meta_slices_prefix(self, agent):
