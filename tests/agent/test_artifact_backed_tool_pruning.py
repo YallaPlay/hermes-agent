@@ -297,6 +297,46 @@ def test_reclaim_gate_rejection_removes_new_artifacts(tmp_path):
     assert list((tmp_path / "hermes-results").rglob("*.output.txt")) == []
 
 
+def test_incapable_store_skips_artifact_creation(tmp_path):
+    env = LocalArtifactEnv(tmp_path)
+    messages = _messages(output="output" * 2_000)
+    compressor = _compressor()
+    compressor._session_db = object()
+    compressor._session_id = "session"
+
+    with patch("tools.terminal_tool.get_active_env", return_value=env) as get_env:
+        result, count = compressor.prune_tool_results_only(
+            messages, current_tokens=10_000, task_id="task-scope"
+        )
+
+    assert result is messages
+    assert count == 0
+    get_env.assert_not_called()
+    assert list(tmp_path.rglob("*.output.txt")) == []
+
+
+def test_failed_store_commit_removes_new_artifacts(tmp_path):
+    class FailingStore:
+        def archive_and_compact(self, *args, **kwargs):
+            raise RuntimeError("fixture commit failure")
+
+    env = LocalArtifactEnv(tmp_path)
+    messages = _messages(output="output" * 2_000)
+    compressor = _compressor()
+    compressor._session_db = FailingStore()
+    compressor._session_id = "session"
+
+    with patch("tools.terminal_tool.get_active_env", return_value=env):
+        result, count = compressor.prune_tool_results_only(
+            messages, current_tokens=10_000, task_id="task-scope"
+        )
+
+    assert result is messages
+    assert count == 0
+    assert env.execute_count > 0
+    assert list(tmp_path.rglob("*.output.txt")) == []
+
+
 def test_cleanup_failure_still_fails_closed_with_original_object(tmp_path):
     env = LocalArtifactEnv(tmp_path)
     messages = _messages(output="output" * 2_000)

@@ -35,6 +35,32 @@ _CATEGORY_COLORS = {
 }
 
 
+def context_display_source(compressor: Any) -> str:
+    """Distinguish a local preflight estimate from provider-reported usage."""
+    real = getattr(compressor, "last_real_prompt_tokens", None)
+    shown = getattr(compressor, "last_prompt_tokens", 0) or 0
+    return "local_estimate" if isinstance(real, (int, float)) and shown > 0 and shown != real else "provider_usage"
+
+
+def context_usage_fields(compressor: Any) -> Dict[str, Any]:
+    """Return current context occupancy without lifetime-throughput fallbacks."""
+    used = max(0, getattr(compressor, "last_prompt_tokens", 0) or 0)
+    maximum = getattr(compressor, "context_length", 0) or 0
+    source = context_display_source(compressor)
+    if not used and getattr(compressor, "awaiting_real_usage_after_compression", False):
+        used = max(0, getattr(compressor, "last_compression_rough_tokens", 0) or 0)
+        source = "local_estimate"
+    if not used or not maximum:
+        return {}
+    return {
+        "context_used": used,
+        "context_max": maximum,
+        "context_percent": max(0, min(100, round(used / maximum * 100))),
+        "context_source": source,
+        "context_estimated": source != "provider_usage",
+    }
+
+
 def _chars_to_tokens(text: str) -> int:
     if not text:
         return 0
@@ -333,8 +359,25 @@ def compute_session_context_breakdown(
 
     comp = getattr(agent, "context_compressor", None)
     context_max = int(getattr(comp, "context_length", 0) or 0) if comp else 0
-    measured_used = int(getattr(comp, "last_prompt_tokens", 0) or 0) if comp else 0
-    context_used = measured_used if measured_used > 0 else estimated_total
+
+    # Prefer the turn-base provider anchor: later same-turn reasoning responses
+    # replay transient thinking and would otherwise inflate the durable meter.
+    from agent.usage_anchor import anchored_context_tokens
+
+    anchor = getattr(agent, "_turn_base_usage_anchor", None)
+    context_used = anchored_context_tokens(sections["messages"], anchor, charge_stale_thinking=False)
+    if context_used is None:
+        anchor = getattr(agent, "_usage_anchor", None)
+        context_used = anchored_context_tokens(sections["messages"], anchor)
+    if context_used is None:
+        measured_used = int(getattr(comp, "last_prompt_tokens", 0) or 0) if comp else 0
+        context_used = measured_used if measured_used > 0 else estimated_total
+        source = context_display_source(comp) if measured_used > 0 else "local_estimate"
+    else:
+        delta = sections["messages"][int(anchor["base_count"]):]
+        if delta and delta[0].get("role") == "assistant":
+            delta = delta[1:]
+        source = "provider_usage_plus_estimate" if delta else "provider_usage"
     context_percent = (
         max(0, min(100, round(context_used / context_max * 100)))
         if context_max
@@ -358,6 +401,8 @@ def compute_session_context_breakdown(
         "context_max": context_max,
         "context_percent": context_percent,
         "context_used": context_used,
+        "context_source": source,
+        "context_estimated": source != "provider_usage",
         "estimated_total": estimated_total,
         "model": getattr(agent, "model", "") or "",
     }

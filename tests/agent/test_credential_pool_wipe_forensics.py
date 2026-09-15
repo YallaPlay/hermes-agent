@@ -71,9 +71,10 @@ def codex_pool(tmp_path, monkeypatch):
 
     from agent.credential_pool import load_pool
     import hermes_cli.auth as auth_mod
+    import hermes_cli.auth_codex as auth_codex_mod
 
     # Deterministic: no Codex CLI recovery unless a test opts in.
-    monkeypatch.setattr(auth_mod, "_recover_codex_tokens_from_cli", lambda reason: None)
+    monkeypatch.setattr(auth_codex_mod, "_recover_codex_tokens_from_cli", lambda reason: None)
 
     def _fail(*_a, **_kw):
         raise _terminal_error()
@@ -112,13 +113,14 @@ def test_codex_terminal_refresh_recovers_from_cli_before_wiping(
 
     from agent.credential_pool import load_pool
     import hermes_cli.auth as auth_mod
+    import hermes_cli.auth_codex as auth_codex_mod
 
     recovered_tokens = {
         "access_token": "recovered-access-token",
         "refresh_token": "recovered-refresh-token",
     }
     monkeypatch.setattr(
-        auth_mod, "_recover_codex_tokens_from_cli", lambda reason: dict(recovered_tokens)
+        auth_codex_mod, "_recover_codex_tokens_from_cli", lambda reason: dict(recovered_tokens)
     )
 
     def _fail(*_a, **_kw):
@@ -177,8 +179,9 @@ def test_codex_terminal_refresh_marks_manual_entry_dead_not_removed(
 
     from agent.credential_pool import STATUS_DEAD, load_pool
     import hermes_cli.auth as auth_mod
+    import hermes_cli.auth_codex as auth_codex_mod
 
-    monkeypatch.setattr(auth_mod, "_recover_codex_tokens_from_cli", lambda reason: None)
+    monkeypatch.setattr(auth_codex_mod, "_recover_codex_tokens_from_cli", lambda reason: None)
 
     def _fail(*_a, **_kw):
         raise _terminal_error()

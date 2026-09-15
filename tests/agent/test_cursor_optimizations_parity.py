@@ -14,6 +14,8 @@ import statistics
 import sys
 import time
 
+from agent.session_persistence import _DB_PERSISTED_MARKER
+
 sys.path.insert(0, ".")
 
 random.seed(1234)
@@ -193,10 +195,10 @@ def test_parity_persist_bounded_scan():
                 for lst in (la, lb):
                     head = [dict(m) for m in lst[:3]]
                     for m in head:
-                        m.pop(ra._DB_PERSISTED_MARKER, None)
+                        m.pop(_DB_PERSISTED_MARKER, None)
                     tail = [dict(m) for m in lst[-4:]]
                     for m in tail:
-                        m.pop(ra._DB_PERSISTED_MARKER, None)
+                        m.pop(_DB_PERSISTED_MARKER, None)
                     lst[:] = head + [{"role": "user", "content": "SUMMARY"}] + tail
         A._db_flush_scan_prefix = None
         with _patch.object(ra.time, "time", return_value=_frozen_now):
@@ -236,18 +238,20 @@ def bench():
 
         # persist scan: fully-flushed list, old full walk vs bounded skip
         import run_agent as ra
+        from agent.context_compressor import _DB_PERSISTED_MARKER
+        from agent.session_persistence import _is_ephemeral_scaffolding
         flushed = copy.deepcopy(msgs)
         for m in flushed:
             if isinstance(m, dict):
-                m[ra._DB_PERSISTED_MARKER] = True
+                m[_DB_PERSISTED_MARKER] = True
 
         def old_scan():
             for _idx, m in enumerate(flushed):
                 if not isinstance(m, dict):
                     continue
-                if ra._is_ephemeral_scaffolding(m):
+                if _is_ephemeral_scaffolding(m):
                     continue
-                if m.get(ra._DB_PERSISTED_MARKER):
+                if m.get(_DB_PERSISTED_MARKER):
                     continue
 
         prefix = flushed[:]
@@ -261,9 +265,9 @@ def bench():
                 m = flushed[_idx]
                 if not isinstance(m, dict):
                     continue
-                if ra._is_ephemeral_scaffolding(m):
+                if _is_ephemeral_scaffolding(m):
                     continue
-                if m.get(ra._DB_PERSISTED_MARKER):
+                if m.get(_DB_PERSISTED_MARKER):
                     continue
 
         pold = timeit(old_scan)

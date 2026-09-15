@@ -275,3 +275,17 @@ def maybe_dispatch_spawn_session(
         },
         ensure_ascii=False,
     )
+
+
+# ACP injects this schema only into ACP-managed agents. Register the handler separately so calls
+# continue through the standard registry/middleware path after model_tools' registry-backed split.
+from tools.registry import registry
+
+registry.register(
+    name=SPAWN_SESSION_TOOL_NAME,
+    toolset="acp-internal",
+    schema=SPAWN_SESSION_TOOL_SCHEMA["function"],
+    handler=lambda args, **_kwargs: maybe_dispatch_spawn_session(
+        SPAWN_SESSION_TOOL_NAME, args
+    ),
+)

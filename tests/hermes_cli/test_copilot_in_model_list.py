@@ -1,57 +1,14 @@
 """Tests for GitHub Copilot entries shown in the /model picker."""
 
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-from hermes_cli.model_switch import (
-    _credential_pool_is_usable,
-    list_authenticated_providers,
-)
+import pytest
 
-
-def test_copilot_picker_checks_persisted_pool_without_refreshing_sources():
-    pool = MagicMock()
-    pool.has_credentials.return_value = True
-    pool.has_available.return_value = True
-
-    with patch("agent.credential_pool.load_pool", return_value=pool) as load_pool:
-        assert _credential_pool_is_usable("copilot") is True
-
-    load_pool.assert_called_once_with("copilot", refresh_sources=False)
-
-
-def test_copilot_picker_uses_raw_token_presence_when_pool_is_empty():
-    pool = MagicMock()
-    pool.has_credentials.return_value = False
-
-    with (
-        patch("agent.credential_pool.load_pool", return_value=pool),
-        patch(
-            "hermes_cli.copilot_auth.resolve_copilot_token",
-            return_value=("raw-token", "gh auth token"),
-        ),
-        patch("hermes_cli.auth.is_source_suppressed", return_value=False),
-        patch(
-            "hermes_cli.copilot_auth.get_copilot_api_token",
-            side_effect=AssertionError("picker auth checks must not exchange tokens"),
-        ),
-    ):
-        assert _credential_pool_is_usable("copilot") is True
-
-
-def test_load_pool_can_skip_external_source_refresh():
-    with (
-        patch("agent.credential_pool.read_credential_pool", return_value=[]),
-        patch("agent.credential_pool._seed_from_singletons") as seed_singletons,
-        patch("agent.credential_pool._seed_from_env") as seed_env,
-    ):
-        from agent.credential_pool import load_pool
-
-        pool = load_pool("copilot", refresh_sources=False)
-
-    assert pool.has_credentials() is False
-    seed_singletons.assert_not_called()
-    seed_env.assert_not_called()
+from hermes_cli.model_switch import list_authenticated_providers
+from hermes_cli import model_switch_providers
+from hermes_cli import models
+from hermes_cli.models import provider_model_ids
 
 
 @patch.dict(os.environ, {"GH_TOKEN": "test-key"}, clear=False)
@@ -68,3 +25,120 @@ def test_copilot_picker_uses_live_catalog_when_available():
     assert copilot is not None
     assert copilot["models"] == live_models
     assert copilot["total_models"] == len(live_models)
+
+
+# --- copilot-acp: external_process availability (#63662) -------------------
+#
+# copilot-acp holds no API key, OAuth token, or credential-pool entry by
+# design — the spawned `copilot --acp --stdio` subprocess brings its own auth.
+# The picker loop used to filter it out unconditionally (has_creds never had
+# an external_process branch), so the provider was invisible in every picker
+# even with a perfectly resolvable executable.
+
+
+@pytest.fixture()
+def _no_other_copilot_creds(monkeypatch):
+    """Make sure copilot-acp visibility comes ONLY from executable resolution:
+    no env tokens, no configured ACP endpoint, no auth-store entry, no seeded
+    credential pool."""
+    # COPILOT_ACP_BASE_URL is not a credential, but an `acp+tcp://` value marks
+    # the provider configured with no executable at all (hermes_cli/auth.py), so
+    # a host that sets it would decide the outcome instead of the test.
+    for var in ("GH_TOKEN", "GITHUB_TOKEN", "HERMES_COPILOT_ACP_COMMAND",
+                "COPILOT_CLI_PATH", "COPILOT_ACP_BASE_URL"):
+        monkeypatch.delenv(var, raising=False)
+    import hermes_cli.auth as auth
+    import hermes_cli.model_switch as model_switch
+
+    monkeypatch.setattr(auth, "_load_auth_store", lambda: {})
+    monkeypatch.setattr(model_switch_providers, "_credential_pool_is_usable", lambda *a, **k: False)
+
+
+def test_copilot_acp_listed_when_executable_resolves(tmp_path, monkeypatch, _no_other_copilot_creds):
+    fake = tmp_path / ("copilot.exe" if os.name == "nt" else "copilot")
+    fake.write_text("", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("HERMES_COPILOT_ACP_COMMAND", str(fake))
+
+    with patch("agent.models_dev.fetch_models_dev", return_value={}), \
+         patch("hermes_cli.models._resolve_copilot_catalog_api_key", return_value=None), \
+         patch("hermes_cli.models._fetch_github_models", return_value=[]):
+        providers = list_authenticated_providers(current_provider="openrouter", max_models=50)
+
+    acp = next((p for p in providers if p["slug"] == "copilot-acp"), None)
+
+    assert acp is not None, "copilot-acp must be listed when its executable resolves"
+    assert acp["models"], "copilot-acp row must offer at least the curated fallback models"
+
+
+def test_copilot_acp_hidden_when_executable_missing(monkeypatch, _no_other_copilot_creds):
+    # `copilot` may genuinely be installed on a dev machine — force the
+    # resolution miss so the test pins behaviour, not the host's PATH.
+    import hermes_cli.auth as auth
+
+    monkeypatch.setattr(auth.shutil, "which", lambda *_a, **_k: None)
+
+    with patch("agent.models_dev.fetch_models_dev", return_value={}), \
+         patch("hermes_cli.models._resolve_copilot_catalog_api_key", return_value=None), \
+         patch("hermes_cli.models._fetch_github_models", return_value=[]):
+        providers = list_authenticated_providers(current_provider="openrouter", max_models=50)
+
+    assert all(p["slug"] != "copilot-acp" for p in providers), \
+        "copilot-acp must stay hidden when no executable resolves"
+
+
+_ACP_CREDS = {"api_key": "copilot-acp", "base_url": "acp://copilot", "command": "copilot", "args": ["--acp", "--stdio"]}
+
+
+@pytest.fixture()
+def _fresh_acp_memo(monkeypatch):
+    monkeypatch.setattr(models, "_copilot_acp_session_memo", None)
+    yield
+    # Don't leak a memoized (possibly failed) probe into other tests in this process.
+    monkeypatch.setattr(models, "_copilot_acp_session_memo", None)
+
+
+@pytest.mark.parametrize(
+    ("session_probe", "github_token", "github_models", "expected"),
+    [
+        # Signed-in session, no GitHub token anywhere: the session list wins, the API is never asked.
+        ({"return_value": ["auto", "gpt-5.6-sol", "claude-sonnet-5"]}, "", [], ["auto", "gpt-5.6-sol", "claude-sonnet-5"]),
+        # Session probe fails: token-based GitHub discovery is still the next source.
+        ({"side_effect": TimeoutError("probe timeout")}, "catalog-token", ["api-fallback-model"], ["api-fallback-model"]),
+    ],
+    ids=["session-wins-without-token", "github-fallback-when-probe-fails"],
+)
+def test_copilot_acp_catalog_prefers_authenticated_session(
+        _fresh_acp_memo, session_probe, github_token, github_models, expected):
+    with patch("hermes_cli.auth.resolve_external_process_provider_credentials", return_value=_ACP_CREDS), \
+         patch("agent.copilot_acp_client.CopilotACPClient.list_models", **session_probe) as list_models, \
+         patch("hermes_cli.models._resolve_copilot_catalog_api_key", return_value=github_token), \
+         patch("hermes_cli.models._fetch_github_models", return_value=github_models) as github:
+        assert provider_model_ids("copilot-acp", force_refresh=True) == expected
+
+    list_models.assert_called_once()
+    assert github.called is bool(github_token)
+
+
+def test_copilot_acp_session_probe_is_memoized_across_model_switch_validation(_fresh_acp_memo):
+    """``/model`` validation reads the catalog uncached on every switch; each miss spawns the CLI.
+    A run of switches must pay one probe, and a failed probe must not be retried per switch."""
+    from hermes_cli.models_validate import validate_requested_model
+
+    with patch("hermes_cli.auth.resolve_external_process_provider_credentials", return_value=_ACP_CREDS), \
+         patch("agent.copilot_acp_client.CopilotACPClient.list_models", return_value=["gpt-5.6-terra"]) as list_models, \
+         patch("hermes_cli.models._resolve_copilot_catalog_api_key", return_value=""), \
+         patch("hermes_cli.models._fetch_github_models", return_value=[]):
+        for _ in range(3):
+            verdict = validate_requested_model("gpt-5.6-terra", "copilot-acp", api_key="copilot-acp", base_url="acp://copilot")
+            assert verdict["accepted"] and verdict["recognized"]
+    assert list_models.call_count == 1
+
+    models._copilot_acp_session_memo = None  # (teardown in _fresh_acp_memo restores it)
+    with patch("hermes_cli.auth.resolve_external_process_provider_credentials", return_value=_ACP_CREDS), \
+         patch("agent.copilot_acp_client.CopilotACPClient.list_models", side_effect=RuntimeError("not signed in")) as list_models, \
+         patch("hermes_cli.models._resolve_copilot_catalog_api_key", return_value=""), \
+         patch("hermes_cli.models._fetch_github_models", return_value=[]):
+        for _ in range(3):
+            provider_model_ids("copilot-acp")
+    assert list_models.call_count == 1

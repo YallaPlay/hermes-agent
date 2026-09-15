@@ -341,6 +341,14 @@ class SessionState:
     # answered and delivered, so re-attaching it to the NEXT prompt replays
     # finished work.
     response_delivered: bool = False
+    # Stable ACP identity for streamed assistant chunks. Persist across turns
+    # on the in-memory session state, but close at each turn boundary so a new
+    # turn cannot replace the previous assistant bubble.
+    message_ids: Any = None
+    # Derived work is meaningful before its first model message (lineage,
+    # route, cwd, and optional title must survive while the first turn runs).
+    # Ordinary blank editor tabs remain ephemeral.
+    persist_empty: bool = False
 
 
 class SessionManager:
@@ -413,6 +421,7 @@ class SessionManager:
             cwd=cwd,
             model=getattr(agent, "model", "") or "",
             parent_id=parent_id,
+            persist_empty=bool((parent_id or "").strip()),
             cancel_event=threading.Event(),
         )
         state.owner = (owner or "").strip() or None
@@ -564,6 +573,7 @@ class SessionManager:
             parent_id=session_id,
             history=copy.deepcopy(forked_history),
             cancel_event=threading.Event(),
+            persist_empty=True,
         )
         _apply_effort_to_agent(agent, original.effort)
         with self._lock:
@@ -912,9 +922,11 @@ class SessionManager:
         if self._db_instance is not None:
             return self._db_instance
         try:
-            from hermes_state import SessionDB
+            from hermes_state_registry import acquire
             hermes_home = get_hermes_home()
-            self._db_instance = SessionDB(db_path=hermes_home / "state.db")
+            # Share the process-wide writer with in-process tools and the agent;
+            # ACP must not open a second long-lived writer on the same state.db.
+            self._db_instance = acquire(hermes_home / "state.db")
             return self._db_instance
         except Exception:
             logger.debug("SessionDB unavailable for ACP persistence", exc_info=True)
@@ -975,6 +987,11 @@ class SessionManager:
             # Ensure the session record exists.
             existing = db.get_session(state.session_id)
             if existing is None:
+                # Fresh editor probes are in-memory drafts. Avoid durable ghost
+                # sessions until transcript content exists; copied forks still
+                # persist immediately because their history is non-empty.
+                if not state.history and not state.persist_empty:
+                    return
                 # Persist the FULL metadata blob (provider/base_url/api_mode/
                 # mode/effort/_forked_from), not just cwd — a fork or fresh
                 # session that isn't prompted again before a process restart
@@ -1038,9 +1055,11 @@ class SessionManager:
                 # replace on any DB error and can race a concurrent
                 # archive_and_compact — the same probe failure mode #80216's
                 # /retry fix (gateway/slash_commands.py) deliberately avoids.
-                db.replace_messages(
-                    state.session_id, state.history, active_only=True
-                )
+                replace_messages = getattr(db, "replace_messages", None)
+                if callable(replace_messages):
+                    replace_messages(
+                        state.session_id, state.history, active_only=True
+                    )
         except Exception:
             logger.warning("Failed to persist ACP session %s", state.session_id, exc_info=True)
 

@@ -69,6 +69,7 @@ from acp.schema import (
 
 from acp_adapter.auth import TERMINAL_SETUP_AUTH_METHOD_ID, build_auth_methods, detect_provider
 from acp_adapter.events import (
+    AssistantMessageIdAllocator,
     _build_plan_update_from_todo_result,
     make_message_cb,
     make_step_cb,
@@ -97,7 +98,7 @@ from agent.history_media import (
     inline_image_bytes_from_content,
 )
 from agent.interrupt_compat import request_hard_interrupt
-from tools.approval import (
+from tools.approval_context import (
     reset_hermes_interactive_context,
     set_hermes_interactive_context,
 )
@@ -154,139 +155,16 @@ def _fail_queued_completion_sinks(
 
 
 def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, str]]]]:
-    """Return ``(slug, label, [(model_id, description), ...])`` for named endpoints.
+    """Named endpoint catalog from the upstream shared ACP model-catalog path.
 
-    Covers both the v12 ``providers:`` mapping and the legacy
-    ``custom_providers:`` list.  These endpoints never appear in canonical
-    provider enumeration, so without this the ACP model selector hides every
-    named endpoint that the TUI ``/model`` picker already renders (#47039
-    implemented named-endpoint rows for the TUI surface only).
-
-    Model lists come from the entry's declared models (``default_model`` +
-    ``models``), refreshed from the endpoint's live ``/models`` listing when a
-    credential is available and ``discover_models`` is not disabled.  Declared
-    models are kept even when live discovery fails — some OpenAI-compatible
-    endpoints (e.g. Bedrock Mantle Responses) expose no ``/models`` route at
-    all yet serve the declared models fine.
-
-    Slugs use the ``custom:<name>`` shape that ``parse_model_input`` and
-    ``resolve_runtime_provider`` already resolve, so encoded choice ids
-    (``custom:<name>:<model>``) round-trip through ``set_session_model``
-    unchanged.
+    Keep this server-level seam for fork tests and provider-selection guards,
+    while delegating discovery/schema details so ACP and the TUI consume the
+    same v12 provider representation.
     """
-    try:
-        from hermes_cli.config import (
-            get_compatible_custom_providers,
-            is_provider_enabled,
-            load_config,
-        )
-        from hermes_cli.model_switch import (
-            _NativePickerModelList,
-            _declared_model_ids,
-            _entry_models_discovered,
-            _fetch_picker_live_models,
-            _models_config_is_allowlist,
-        )
-        from hermes_cli.models import should_use_ollama_native_catalog
-        from hermes_cli.providers import custom_provider_slug
-    except ImportError:
-        return []
+    from acp_adapter import model_catalog
 
-    try:
-        cfg = load_config()
-        entries = get_compatible_custom_providers(cfg)
-    except Exception:
-        logger.debug("Could not load named custom providers", exc_info=True)
-        return []
+    return model_catalog._named_custom_provider_catalogs()
 
-    # ``get_compatible_custom_providers`` drops the ``enabled`` flag during
-    # normalization, so collect explicitly disabled provider keys from the
-    # raw config and skip their entries below.
-    disabled_keys: set[str] = set()
-    raw_providers = cfg.get("providers") if isinstance(cfg, dict) else None
-    if isinstance(raw_providers, dict):
-        for raw_key, raw_entry in raw_providers.items():
-            if isinstance(raw_entry, dict) and not is_provider_enabled(raw_entry):
-                disabled_keys.add(str(raw_key).strip().lower())
-
-    catalogs: list[tuple[str, str, list[tuple[str, str]]]] = []
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        provider_key = str(entry.get("provider_key", "") or "").strip()
-        if provider_key.lower() in disabled_keys:
-            continue
-        name = str(entry.get("name", "") or "").strip()
-        base_url = str(entry.get("base_url", "") or "").strip()
-        if not name or not base_url:
-            continue
-        slug = custom_provider_slug(name, provider_key)
-
-        api_key = str(entry.get("api_key", "") or "").strip()
-        if not api_key:
-            key_env = str(
-                entry.get("key_env") or entry.get("api_key_env") or ""
-            ).strip()
-            api_key = os.environ.get(key_env, "").strip() if key_env else ""
-
-        declared: list[str] = []
-        default_model = str(entry.get("model", "") or "").strip()
-        if default_model:
-            declared.append(default_model)
-        models_cfg = entry.get("models")
-        for mid in _declared_model_ids(models_cfg):
-            if mid not in declared:
-                declared.append(mid)
-
-        native_headers = entry.get("extra_headers") or None
-        native_catalog_provider = (
-            provider_key
-            if provider_key.lower() in {"ollama", "custom:ollama"}
-            else "custom"
-        )
-        is_native_ollama = should_use_ollama_native_catalog(
-            native_catalog_provider, base_url, headers=native_headers
-        )
-        explicit_catalog = _models_config_is_allowlist(
-            models_cfg, _entry_models_discovered(entry)
-        )
-        if not api_key and not declared and not is_native_ollama:
-            # No credential to discover with and nothing declared:
-            # not addressable from the selector.
-            continue
-
-        model_ids = list(declared)
-        discover = entry.get("discover_models", True)
-        if isinstance(discover, str):
-            discover = discover.lower() not in {"false", "no", "0"}
-        native_catalog_provider = native_catalog_provider if is_native_ollama else "custom"
-        live = None
-        if discover and (api_key or is_native_ollama):
-            try:
-                live = _fetch_picker_live_models(
-                    api_key,
-                    base_url,
-                    native_catalog_provider,
-                    explicit_catalog,
-                    headers=native_headers,
-                    timeout=1.5,
-                    api_mode=entry.get("api_mode"),
-                )
-            except Exception:
-                live = None
-            if live is not None:
-                if isinstance(live, _NativePickerModelList):
-                    model_ids = list(live)
-                else:
-                    model_ids = declared + [m for m in live if m not in declared]
-
-        if not model_ids:
-            if isinstance(live if "live" in locals() else None, _NativePickerModelList):
-                catalogs.append((slug, name, []))
-            continue
-        catalogs.append((slug, name, [(mid, "") for mid in model_ids]))
-
-    return catalogs
 
 
 def _named_custom_provider_serves_model(provider: str | None, model: str | None) -> bool:
@@ -1754,7 +1632,7 @@ class HermesACPAgent(acp.Agent):
             return
 
         try:
-            from tools.mcp_tool import register_mcp_servers
+            from tools.mcp_tool_discovery import register_mcp_servers
 
             config_map: dict[str, dict] = {}
             for server in mcp_servers:
@@ -3458,6 +3336,7 @@ class HermesACPAgent(acp.Agent):
             # restart.
             new_state.mode = parent_state.mode
             new_state.effort = parent_state.effort
+            new_state.persist_empty = True
             _apply_effort_to_agent(new_state.agent, parent_state.effort)
             self.session_manager.save_session(new_state.session_id)
             # Stamp the caller-provided title (mirrors fork_session's lineage
@@ -3890,7 +3769,10 @@ class HermesACPAgent(acp.Agent):
                     edit_approval_policy_getter=lambda: self._edit_approval_policy_for_state(state),
                     subagent_router=subagent_router,
                 )
-                reasoning_cb = make_thinking_cb(conn, session_id, loop)
+                if state.message_ids is None:
+                    state.message_ids = AssistantMessageIdAllocator()
+                state.message_ids.close()  # each turn opens a fresh ACP message id
+                reasoning_cb = make_thinking_cb(conn, session_id, loop, state.message_ids)
                 _base_step_cb = make_step_cb(conn, session_id, loop, tool_call_ids, tool_call_meta)
 
                 def _step_with_usage(api_call_count: int, prev_tools: Any = None) -> None:
@@ -3900,7 +3782,7 @@ class HermesACPAgent(acp.Agent):
                     self._notify_midturn_usage(state, loop)
 
                 step_cb = _step_with_usage
-                message_cb = make_message_cb(conn, session_id, loop)
+                message_cb = make_message_cb(conn, session_id, loop, state.message_ids)
 
                 def stream_delta_cb(text: str) -> None:
                     nonlocal streamed_message
@@ -4206,7 +4088,10 @@ class HermesACPAgent(acp.Agent):
             # returned ``final_response=None`` and ``None.startswith(...)`` blew
             # up here. Guarantee the idle reset with try/finally.
             try:
-                if result.get("messages"):
+                if "messages" in result and result.get("messages") is not None:
+                    # An explicit empty list is authoritative (e.g. reset/transform
+                    # hooks) and must clear the ACP transcript rather than leave
+                    # stale pre-turn history behind.
                     state.history = result["messages"]
                     # Persist updated history so sessions survive process restarts.
                     self.session_manager.save_session(session_id)
@@ -4273,6 +4158,12 @@ class HermesACPAgent(acp.Agent):
                     # finished (e.g. transform_llm_output) — otherwise the appended /
                     # rewritten text never reaches the client.
                     update = acp.update_agent_message_text(final_response)
+                    if state.message_ids is not None:
+                        if streamed_message and result.get("response_transformed"):
+                            update.message_id = state.message_ids.last() or state.message_ids.current()
+                        else:
+                            update.message_id = state.message_ids.current()
+                        state.message_ids.close()
                     await conn.session_update(session_id, update)
 
             finally:
@@ -4818,44 +4709,61 @@ class HermesACPAgent(acp.Agent):
 
     # ---- Model switching (ACP protocol method) -------------------------------
 
+    def _switch_model(
+        self, state: SessionState, raw_model: str, *, keep_endpoint: bool = False
+    ) -> tuple[str | None, str, str]:
+        """Validate and apply a model switch through the shared catalog pipeline."""
+        from hermes_cli.config import get_compatible_custom_providers, load_config
+        from hermes_cli.model_switch import switch_model
+        from hermes_cli.models import parse_model_input
+
+        current_provider = _agent_provider_identity(state.agent) or getattr(state.agent, "provider", None)
+        explicit_provider, model_input = parse_model_input(raw_model, "")
+        cfg = load_config()
+        configured_providers = cfg.get("providers")
+        result = switch_model(
+            raw_input=model_input,
+            explicit_provider=explicit_provider,
+            current_provider=current_provider or "openrouter",
+            current_model=str(state.model or ""),
+            current_base_url=str(getattr(state.agent, "base_url", "") or ""),
+            current_api_key=str(getattr(state.agent, "api_key", "") or ""),
+            user_providers=configured_providers if isinstance(configured_providers, dict) else {},
+            custom_providers=get_compatible_custom_providers(cfg),
+        )
+        if not result.success:
+            raise ValueError(result.error_message or f"Cannot switch to {raw_model}")
+        target_provider, new_model = result.target_provider, result.new_model
+        state.model = new_model
+        endpoint: dict[str, Any] = {}
+        if keep_endpoint and not (current_provider and target_provider != current_provider):
+            endpoint = {
+                "base_url": getattr(state.agent, "base_url", None),
+                "api_mode": getattr(state.agent, "api_mode", None),
+            }
+        state.agent = self.session_manager._make_agent(
+            session_id=state.session_id,
+            cwd=state.cwd,
+            model=new_model,
+            requested_provider=target_provider,
+            **endpoint,
+        )
+        _apply_effort_to_agent(state.agent, getattr(state, "effort", ""))
+        self.session_manager.save_session(state.session_id)
+        return current_provider, target_provider, new_model
+
     async def set_session_model(
         self, model_id: str, session_id: str, **kwargs: Any
     ) -> SetSessionModelResponse | None:
-        """Switch the model for a session (called by ACP protocol)."""
+        """Switch model off-loop so catalog probes cannot stall other ACP sessions."""
         state = self.session_manager.get_session(session_id)
         if state:
-            # Compare against the requested (pre-canonicalization) identity:
-            # a named custom endpoint's ``provider`` attribute is bare
-            # ``custom``, which would make a switch between two named custom
-            # endpoints look like "same provider" and wrongly carry the old
-            # base_url/api_mode onto the new endpoint.
-            current_provider = _agent_provider_identity(state.agent) or getattr(
-                state.agent, "provider", None
+            _old, requested_provider, resolved_model = await asyncio.to_thread(
+                self._switch_model, state, model_id, keep_endpoint=True
             )
-            requested_provider, resolved_model = self._resolve_model_selection(
-                model_id,
-                current_provider or "openrouter",
-            )
-            state.model = resolved_model
-            provider_changed = bool(current_provider and requested_provider != current_provider)
-            current_base_url = None if provider_changed else getattr(state.agent, "base_url", None)
-            current_api_mode = None if provider_changed else getattr(state.agent, "api_mode", None)
-            state.agent = self.session_manager._make_agent(
-                session_id=session_id,
-                cwd=state.cwd,
-                model=resolved_model,
-                requested_provider=requested_provider,
-                base_url=current_base_url,
-                api_mode=current_api_mode,
-            )
-            # Carry the session's reasoning-effort override onto the fresh agent.
-            _apply_effort_to_agent(state.agent, getattr(state, "effort", ""))
-            self.session_manager.save_session(session_id)
             logger.info(
                 "Session %s: model switched to %s via provider %s",
-                session_id,
-                resolved_model,
-                requested_provider,
+                session_id, resolved_model, requested_provider,
             )
             return SetSessionModelResponse()
         logger.warning("Session %s: model switch requested for missing session", session_id)
