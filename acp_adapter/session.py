@@ -1012,6 +1012,24 @@ class SessionManager:
                     )
                 except Exception:
                     logger.debug("Failed to update ACP session metadata", exc_info=True)
+                # session/new carries the authenticated owner, but row creation
+                # is deferred until the session has history — by which time the
+                # agent's _ensure_db_session has usually created the row, and it
+                # knows nothing about the ACP owner. Without this backfill the
+                # create-time user_id write above never runs for an ordinary
+                # conversation and every session persists untagged, hidden
+                # behind the strict "My Sessions" owner filter.
+                #
+                # Fill a gap only: an owner already on the row wins, so this can
+                # never transfer ownership of a restored or re-attached session.
+                owner = str(getattr(state, "owner", "") or "").strip()
+                if owner and not str(existing.get("user_id") or "").strip():
+                    try:
+                        db.set_session_owner(state.session_id, owner)
+                    except Exception:
+                        logger.debug(
+                            "Failed to backfill ACP session owner", exc_info=True
+                        )
 
             if not persist_messages:
                 return
