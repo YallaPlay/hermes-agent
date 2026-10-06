@@ -2774,6 +2774,13 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
             mcp_names = set((CLI_CONFIG.get("mcp_servers") or {}).keys())
             invalid = [t for t in toolsets if not validate_toolset(t) and t not in mcp_names]
             if invalid:
+                # The enabled list can come from last launch's persisted plugin-key cache while
+                # background discovery is still registering plugin toolsets (e.g. lsp_navigate's
+                # "development"); join discovery before calling a name unknown.
+                from hermes_cli.plugins import discover_plugins
+                discover_plugins()
+                invalid = [t for t in invalid if not validate_toolset(t)]
+            if invalid:
                 self._console_print(f"[bold red]Warning: Unknown toolsets: {', '.join(invalid)}[/]")
 
     def _init_checkpoints_and_rules(self, checkpoints, pass_session_id, ignore_rules):
