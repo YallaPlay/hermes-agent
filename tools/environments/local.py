@@ -24,6 +24,7 @@ from tools.environments.local_env_policy import (
     _ALWAYS_STRIP_KEYS, _HERMES_PROVIDER_ENV_BLOCKLIST, _HERMES_PROVIDER_ENV_FORCE_PREFIX,
     _is_hermes_internal_secret, _is_terminal_first_party_env,
     _matches_terminal_first_party_prefix, _plugin_terminal_env_strip_keys)
+from tools.environments.local_git_identity import apply_git_identity_env
 from tools.environments.local_gitbash_probe import (
     _bash_probe_details_cache, _bash_starts, _git_bash_aslr_help,
     _looks_like_msys_spawn_failure, _mandatory_aslr_enabled)
@@ -270,6 +271,7 @@ def _finalize_child_env(env: dict) -> dict:
     Kanban scrub. Returns the (possibly new) dict."""
     _apply_profile_home(env)
     _inject_session_context_env(env)
+    apply_git_identity_env(env)
     _strip_hermes_owned_pythonpath_and_runtime_markers(env)
     _apply_windows_msys_bash_env_defaults(env)
     from agent.delegation_context import delegated_child_subprocess_env

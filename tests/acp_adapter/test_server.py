@@ -1978,6 +1978,34 @@ class TestPrompt:
         assert captured.get("child") == resp.session_id
 
     @pytest.mark.asyncio
+    async def test_prompt_binds_owner_as_session_user_id(self, agent, mock_manager):
+        """The authenticated ACP owner reaches child subprocesses as
+        ``HERMES_SESSION_USER_ID`` so git commits can be attributed to them."""
+        from tools.environments.local import _make_run_env
+
+        resp = await agent.new_session(cwd=".")
+        state = mock_manager.get_session(resp.session_id)
+        state.owner = "someone@yallaplay.com"
+        captured: dict[str, str | None] = {}
+
+        def _run(*args, **kwargs):
+            env = _make_run_env({})
+            captured["user"] = env.get("HERMES_SESSION_USER_ID")
+            captured["author"] = env.get("GIT_AUTHOR_EMAIL")
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = _run
+        state.agent.model = "test-model"
+        state.agent.provider = "openrouter"
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        await agent.prompt(prompt=[TextContentBlock(type="text", text="hi")], session_id=resp.session_id)
+
+        assert captured == {"user": "someone@yallaplay.com", "author": "someone@yallaplay.com"}
+
+    @pytest.mark.asyncio
     async def test_empty_messages_list_replaces_stale_history(self, agent, mock_manager):
         """``run_conversation`` returning ``messages=[]`` clears the ACP transcript instead of
         leaving the previous turn's history in place (#10844)."""

@@ -500,6 +500,9 @@ DEFAULT_CONFIG = {
     # 12-15K tokens). max_lines: max `limit` one read_file call may request before clamping.
     # max_line_length: per-line cap in read_file's line-numbered view (chars).
     "tool_output": {"max_bytes": 50000, "max_lines": 2000, "max_line_length": 2000},
+    # Committer identity for agent git commits in sessions whose authenticated owner is an email
+    # (ACP). The owner becomes GIT_AUTHOR_*; these become GIT_COMMITTER_*. Empty = gitconfig decides.
+    "git": {"committer": {"name": "", "email": ""}},
     # Tool loop guardrails nudge models that repeat failed/non-progressing tool calls. Soft warnings
     # are always on; hard stops are opt-in so interactive sessions keep flowing.
     "tool_loop_guardrails": {

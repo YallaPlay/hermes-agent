@@ -3910,9 +3910,13 @@ class HermesACPAgent(acp.Agent):
                     # outside the editor's workspace.
                     # cron_session="" explicitly marks this as a non-cron context,
                     # masking any leaked process-global HERMES_CRON_SESSION (#37968).
+                    # user_id carries the authenticated owner so child
+                    # processes can attribute git commits to that user
+                    # (tools/environments/local_git_identity.py).
                     session_tokens = set_session_vars(
                         session_key=session_id, session_id=session_id, cwd=state.cwd,
                         cron_session="", async_delivery=True,
+                        user_id=state.owner or "",
                     )
                 except Exception:
                     session_tokens = None
