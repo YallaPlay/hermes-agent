@@ -2400,9 +2400,23 @@ class HermesACPAgent(acp.Agent):
                 # isRunning from the live subagent registry: a running child
                 # is never in SessionManager._sessions, so state.is_running
                 # can't know about it.
-                {**self._turn_status_meta(state), **self._subagent_load_meta(state)},
+                {
+                    **self._turn_status_meta(state),
+                    **self._subagent_load_meta(state),
+                    **self._message_count_meta(state),
+                },
             ),
         )
+
+    def _message_count_meta(self, state: SessionState) -> dict:
+        """Baseline for the client's out-of-process refresh check.
+
+        Pairs with ``messageCount`` on ``session/list`` rows: the client
+        re-replays an open tab when the listed count differs from the count
+        its last replay rendered.
+        """
+        count = self.session_manager.persisted_message_count(state.session_id)
+        return {} if count is None else {"messageCount": count}
 
     async def resume_session(
         self,
@@ -2825,6 +2839,13 @@ class HermesACPAgent(acp.Agent):
             owner_id = str(s.get("user_id") or "").strip()
             if owner_id:
                 hermes_meta["owner"] = owner_id
+            # Progress markers for sessions that advance in another process
+            # (Slack bot, gateway): clients re-replay an open tab when
+            # messageCount moves and show the activity heartbeat meanwhile.
+            if s.get("message_count") is not None:
+                hermes_meta["messageCount"] = s["message_count"]
+            if s.get("activity"):
+                hermes_meta["activity"] = s["activity"]
             field_meta = {"hermes": hermes_meta} if hermes_meta else None
             sessions.append(
                 SessionInfo(

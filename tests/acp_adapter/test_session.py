@@ -1516,6 +1516,28 @@ def test_list_sessions_updated_at_falls_back_to_started_at_without_activity():
     assert out[0]["updated_at"] == expected
 
 
+def test_list_sessions_surfaces_persisted_progress_for_out_of_process_sessions():
+    # A session driven by another process (Slack bot) advances only in the DB.
+    # The listed messageCount must be the persisted count, and the heartbeat
+    # surfaces as activity, so an open client tab can tell it moved.
+    rows = [{
+        "id": "slack1", "cwd": ".", "model": "m", "message_count": 65,
+        "title": "T", "started_at": 10.0, "last_active": 20.0,
+        "last_activity_at": 30.0,
+        "last_activity_description": "delegate_task: subagent running terminal",
+    }, {
+        "id": "quiet", "cwd": ".", "model": "m", "message_count": 2,
+        "title": "Q", "started_at": 1.0, "last_active": 2.0,
+    }]
+    mgr, _ = _mgr_with_db(rows)
+    out = {s["session_id"]: s for s in mgr.list_sessions()}
+    assert out["slack1"]["message_count"] == 65
+    assert out["slack1"]["activity"]["description"] == "delegate_task: subagent running terminal"
+    assert out["slack1"]["activity"]["at"]
+    assert out["quiet"]["message_count"] == 2
+    assert "activity" not in out["quiet"]
+
+
 def test_set_session_archived_delegates_to_db():
     mgr, db = _mgr_with_db([], archived_ok=True)
     assert mgr.set_session_archived("s1", True) is True

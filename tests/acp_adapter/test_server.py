@@ -1786,6 +1786,26 @@ class TestListAndFork:
         assert untagged.field_meta is None
 
     @pytest.mark.asyncio
+    async def test_list_and_load_carry_matching_message_count(self, agent):
+        """The client re-replays when the listed count differs from the count
+        its last load rendered, so both must read the same persisted value."""
+        activity = {"description": "delegate_task: running", "at": "2026-10-09T19:58:47+00:00"}
+        with patch.object(
+            agent.session_manager, "list_sessions",
+            return_value=[{"session_id": "s1", "cwd": "/tmp", "title": "T",
+                           "updated_at": 2.0, "message_count": 65, "activity": activity}],
+        ):
+            resp = await agent.list_sessions(cwd="/tmp")
+        listed = resp.sessions[0].field_meta["hermes"]
+        assert listed["messageCount"] == 65
+        assert listed["activity"] == activity
+
+        new_resp = await agent.new_session(cwd="/tmp")
+        with patch.object(agent.session_manager, "persisted_message_count", return_value=65):
+            loaded = await agent.load_session(cwd="/tmp", session_id=new_resp.session_id)
+        assert loaded.field_meta["hermes"]["messageCount"] == listed["messageCount"]
+
+    @pytest.mark.asyncio
     async def test_ext_method_set_owner_delegates_persists_and_emits(self, agent):
         with patch.object(
             agent.session_manager, "set_session_owner", return_value=True

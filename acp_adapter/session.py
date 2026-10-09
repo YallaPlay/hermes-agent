@@ -166,6 +166,24 @@ def _format_updated_at(value: Any) -> str | None:
         return None
 
 
+def _progress_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Persisted progress markers for ``session/list`` rows.
+
+    A session can advance in another process (Slack bot, gateway, CLI) that
+    this ACP server never observes. Clients compare ``message_count`` against
+    the count they last rendered to decide when to re-replay, and show
+    ``activity`` (the live heartbeat) while no new message has landed yet.
+    """
+    fields: Dict[str, Any] = {}
+    if row.get("message_count") is not None:
+        fields["message_count"] = int(row["message_count"])
+    description = str(row.get("last_activity_description") or "").strip()
+    at = _format_updated_at(row.get("last_activity_at"))
+    if description and at:
+        fields["activity"] = {"description": description, "at": at}
+    return fields
+
+
 def _updated_at_sort_key(value: Any) -> float:
     if value is None:
         return float("-inf")
@@ -496,6 +514,31 @@ class SessionManager:
             )
             return None
 
+    def persisted_message_count(self, session_id: str) -> Optional[int]:
+        """Persisted message count of the session's live head, or None.
+
+        Same head resolution as ``live_transcript_history`` so the value
+        matches what a replay of this session just rendered.
+        """
+        db = self._get_db()
+        if db is None:
+            return None
+        with self._lock:
+            state = self._sessions.get(session_id)
+        head_id = session_id
+        if state is not None:
+            sid = getattr(state.agent, "session_id", None)
+            if isinstance(sid, str) and sid:
+                head_id = sid
+        try:
+            row = db.get_session(head_id)
+        except Exception:
+            logger.debug("Failed to read message count for %s", head_id, exc_info=True)
+            return None
+        if not row or row.get("message_count") is None:
+            return None
+        return int(row["message_count"])
+
     def remove_session(self, session_id: str) -> bool:
         """Remove a session from memory and database. Returns True if it existed."""
         with self._lock:
@@ -755,6 +798,7 @@ class SessionManager:
                         # its own right — don't inherit the Slack badge.
                         "slack": not parent_id
                         and _is_slack_preview(preview or persisted.get("preview")),
+                        **_progress_fields(persisted),
                     }
                 )
 
@@ -796,6 +840,7 @@ class SessionManager:
                 "parent_id": parent_id,
                 # Forks of Slack sessions are not Slack sessions — no badge.
                 "slack": not parent_id and _is_slack_preview(row.get("preview")),
+                **_progress_fields(row),
             })
 
         results.sort(key=lambda item: _updated_at_sort_key(item.get("updated_at")), reverse=True)
@@ -846,6 +891,7 @@ class SessionManager:
                     "parent_id": parent_sid,
                     "subagent": True,
                     "slack": False,
+                    **_progress_fields(row),
                 })
             if children:
                 results.extend(children)
