@@ -531,7 +531,12 @@ class SessionManager:
             if isinstance(sid, str) and sid:
                 head_id = sid
         try:
-            row = db.get_session(head_id)
+            # session/list projects a compression root onto its live tip's
+            # message_count; resolve the same tip here so a compaction in
+            # another process cannot leave the two counts permanently apart
+            # (which would make the client re-replay on every list poll).
+            chain = db.get_compression_chain(head_id) or [head_id]
+            row = db.get_session(chain[-1])
         except Exception:
             logger.debug("Failed to read message count for %s", head_id, exc_info=True)
             return None

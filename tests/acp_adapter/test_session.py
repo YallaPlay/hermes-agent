@@ -1538,6 +1538,17 @@ def test_list_sessions_surfaces_persisted_progress_for_out_of_process_sessions()
     assert "activity" not in out["quiet"]
 
 
+def test_persisted_message_count_follows_compression_tip():
+    # session/list projects a compressed root onto its tip's count; the load
+    # baseline must read the same tip or the client re-replays forever.
+    mgr, db = _mgr_with_db([])
+    db.get_compression_chain.return_value = ["root", "tip"]
+    db.get_session.side_effect = lambda sid: {"root": {"message_count": 90}, "tip": {"message_count": 12}}[sid]
+    assert mgr.persisted_message_count("root") == 12
+    db.get_session.side_effect = lambda sid: None
+    assert mgr.persisted_message_count("root") is None
+
+
 def test_set_session_archived_delegates_to_db():
     mgr, db = _mgr_with_db([], archived_ok=True)
     assert mgr.set_session_archived("s1", True) is True
