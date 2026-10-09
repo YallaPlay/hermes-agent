@@ -9,6 +9,7 @@ history.
 from __future__ import annotations
 
 from hermes_constants import get_hermes_home, strip_owner_note
+from agent.context_compressor import is_compaction_summary_message
 
 import copy
 import json
@@ -765,11 +766,16 @@ class SessionManager:
                     )
                     if row_owner != owner_filter:
                         continue
+                # A compaction summary is not the user's first message: after
+                # a compaction it heads the live history and would otherwise
+                # become the fallback title.
                 preview = next(
                     (
                         _preview_text(msg.get("content"))
                         for msg in s.history
-                        if msg.get("role") == "user" and _preview_text(msg.get("content"))
+                        if msg.get("role") == "user"
+                        and not is_compaction_summary_message(msg)
+                        and _preview_text(msg.get("content"))
                     ),
                     persisted.get("preview") or "",
                 )
@@ -801,8 +807,14 @@ class SessionManager:
                         "parent_id": parent_id,
                         # A fork of a Slack session is an ACP/VS Code session in
                         # its own right — don't inherit the Slack badge.
+                        # The persisted preview is the durable first user
+                        # message; the live history loses the Slack envelope
+                        # once compaction replaces the head with a summary.
                         "slack": not parent_id
-                        and _is_slack_preview(preview or persisted.get("preview")),
+                        and (
+                            _is_slack_preview(persisted.get("preview"))
+                            or _is_slack_preview(preview)
+                        ),
                         **_progress_fields(persisted),
                     }
                 )

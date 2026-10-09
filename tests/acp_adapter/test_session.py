@@ -1263,6 +1263,27 @@ class TestPersistence:
         by_id = {s["session_id"]: s for s in manager.list_sessions()}
         assert by_id[sid]["slack"] is True
 
+    def test_list_sessions_keeps_slack_flag_after_compacted_session_is_opened(self, manager):
+        """Opening a compacted Slack session loads it into memory with a
+        compaction summary as the first user message. The badge must still
+        come from the persisted first message, and the summary must not
+        become the preview."""
+        from agent.context_compressor import SUMMARY_PREFIX
+
+        state = manager.create_session(cwd="/slack-compacted")
+        state.history.append(
+            {"role": "user", "content": "[Slack runtime context]\nrequester: someone"}
+        )
+        manager.save_session(state.session_id)
+        state.history[:] = [
+            {"role": "user", "content": SUMMARY_PREFIX + "\nearlier turns"},
+            {"role": "user", "content": "[Slack turn tag: af65] next ask"},
+        ]
+
+        row = {s["session_id"]: s for s in manager.list_sessions()}[state.session_id]
+        assert row["slack"] is True
+        assert "COMPACTION" not in row["title"]
+
     def test_list_sessions_fork_of_slack_session_not_flagged_in_memory(self, manager):
         """Forking a Slack session yields a first-class ACP session — the fork
         copies the Slack envelope into its history but must NOT carry the
