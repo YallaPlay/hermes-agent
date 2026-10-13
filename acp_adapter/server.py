@@ -2300,14 +2300,18 @@ class HermesACPAgent(acp.Agent):
                     continue
                 result = message.get("content")
                 result_text = result if isinstance(result, str) else None
-                if not await _send(
-                    build_tool_complete(
-                        tool_call_id,
-                        tool_name,
-                        result=result_text,
-                        function_args=function_args,
-                    )
-                ):
+                complete = build_tool_complete(
+                    tool_call_id,
+                    tool_name,
+                    result=result_text,
+                    function_args=function_args,
+                )
+                # The tool row's persisted time is when the result was flushed,
+                # so it stamps the completion; the start event stays unstamped.
+                timestamp = self._history_timestamp_iso(message)
+                if timestamp:
+                    complete.field_meta = {"hermes": {"timestamp": timestamp}}
+                if not await _send(complete):
                     return
                 if tool_name == "todo":
                     plan_update = _build_plan_update_from_todo_result(result_text)
