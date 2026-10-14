@@ -735,6 +735,46 @@ class TestSessionOps:
         }
 
     @pytest.mark.asyncio
+    async def test_load_session_stamps_timestamp_on_replayed_tool_completion(self, agent):
+        """A replayed tool result carries its persisted row time on the
+        completion update, so clients can show when each tool call finished.
+        Unstamped tool rows stay meta-free."""
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        def call(call_id):
+            return {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": "search_files", "arguments": '{"pattern":"x"}'},
+            }
+
+        new_resp = await agent.new_session(cwd="/tmp")
+        state = agent.session_manager.get_session(new_resp.session_id)
+        state.history = [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": "", "tool_calls": [call("c1"), call("c2")]},
+            {"role": "tool", "tool_call_id": "c1", "content": "{}", "timestamp": 1783000042.0},
+            {"role": "tool", "tool_call_id": "c2", "content": "{}"},
+        ]
+
+        mock_conn.session_update.reset_mock()
+        await agent.load_session(cwd="/tmp", session_id=new_resp.session_id)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        completions = {
+            u.tool_call_id: u
+            for u in (c.kwargs.get("update") for c in mock_conn.session_update.await_args_list)
+            if isinstance(u, ToolCallProgress)
+        }
+        assert completions["c1"].field_meta == {
+            "hermes": {"timestamp": "2026-07-02T13:47:22+00:00"}
+        }
+        assert completions["c2"].field_meta is None
+
+    @pytest.mark.asyncio
     async def test_load_session_replays_native_plan_for_persisted_todo_tool(self, agent):
         """Persisted todo tool results should rebuild Zed's native plan panel."""
         mock_conn = MagicMock(spec=acp.Client)
