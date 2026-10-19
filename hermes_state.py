@@ -511,15 +511,18 @@ class SessionDB(
     def _inherit_parent_session_metadata(conn, session_id: str) -> None:
         """Compose upstream lineage metadata inheritance with fork owner attribution.
 
-        Routing keys remain compression-only upstream; ``user_id`` is attribution,
-        not routing, so every child (including delegate/subagent rows) inherits it.
+        Unkeyed parents carry the fork's soft owner attribution, which follows
+        delegate/branch children too. A gateway parent's ``user_id`` is sender
+        routing identity instead: when ``session_key`` is set, leave inheritance
+        of that identity to upstream's compression-continuation-only rule.
         """
         SessionSessionsMixin._inherit_parent_session_metadata(conn, session_id)
         conn.execute(
             """UPDATE sessions
                   SET user_id = COALESCE(sessions.user_id,
                                 (SELECT p.user_id FROM sessions p
-                                  WHERE p.id = sessions.parent_session_id))
+                                  WHERE p.id = sessions.parent_session_id
+                                    AND p.session_key IS NULL))
                 WHERE id = ? AND parent_session_id IS NOT NULL""",
             (session_id,),
         )
@@ -558,7 +561,7 @@ class SessionDB(
         order_by_last_active: bool = False, include_archived: bool = False, archived_only: bool = False,
         id_query: str = None, search_query: str = None, compact_rows: bool = False,
         include_pinned: bool = False, session_key: str = None, include_hidden: bool = False,
-        owner: str = None,
+        owner: str = None, include_subagents: bool = False,
     ) -> List[Dict[str, Any]]:
         """Upstream rich listing plus the fork's strict owner-only projection.
 
@@ -573,7 +576,7 @@ class SessionDB(
             order_by_last_active=order_by_last_active, include_archived=include_archived,
             archived_only=archived_only, id_query=id_query, search_query=search_query,
             compact_rows=compact_rows, include_pinned=include_pinned, session_key=session_key,
-            include_hidden=include_hidden,
+            include_hidden=include_hidden, include_subagents=include_subagents,
         )
         if not owner:
             return super().list_sessions_rich(limit=limit, offset=offset, **params)
