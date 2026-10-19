@@ -792,16 +792,29 @@ class TestRegression_ProviderToolsBridgeScope:
         assert err is not None
         assert "not a deferrable" in err
 
-    def test_resolve_allowed_names_does_not_admit_core_tool(self):
-        """allowed_names must never let a core tool through even if a
-        buggy caller lists it."""
-        from tools.tool_search import resolve_underlying_call
-        name, _, err = resolve_underlying_call(
-            {"name": "terminal", "arguments": {"command": "true"}},
-            allowed_names=frozenset({"terminal"}),
+    @pytest.mark.parametrize("deferred", [False, True])
+    def test_resolve_core_tool_requires_session_deferral(self, deferred):
+        """v0.22.2 supports explicit core deferral; assembly owns the allowlist."""
+        from tools.tool_search import (
+            ToolSearchConfig, assemble_tool_defs, resolve_underlying_call,
         )
-        assert name is None
-        assert err is not None
+
+        assembly = assemble_tool_defs(
+            [_td("terminal")],
+            context_length=200_000,
+            config=ToolSearchConfig.from_raw({"defer": ["terminal"] if deferred else []}),
+        )
+        name, args, err = resolve_underlying_call(
+            {"name": "terminal", "arguments": {"command": "true"}},
+            allowed_names=frozenset(entry.name for entry in assembly.catalog),
+        )
+        if deferred:
+            assert err is None
+            assert name == "terminal"
+            assert args == {"command": "true"}
+        else:
+            assert name is None
+            assert err is not None
 
     def _executor_agent(self):
         from types import SimpleNamespace

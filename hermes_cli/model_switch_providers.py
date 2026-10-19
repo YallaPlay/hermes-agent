@@ -1251,6 +1251,11 @@ def list_authenticated_providers(
 
     non_blocking_catalogs = bool(non_blocking_catalogs)
 
+    # This picker path no longer goes through models.list_available_providers.
+    # Preserve the config hide-list alongside the caller's per-surface exclusions.
+    from hermes_cli.models import _disabled_providers
+    excluded_providers = list(set(excluded_providers or []) | _disabled_providers())
+
     # Explicit refresh: drop every cached list so the calls below re-fetch live. A stale cache
     # can fall back to the curated static list when its live fetch fails, silently dropping
     # live-only models the user had seen.
@@ -1304,7 +1309,15 @@ def list_authenticated_providers(
     if custom_providers and isinstance(custom_providers, list):
         _lap_custom_provider_rows(b, custom_providers)
 
-    return _finalize_picker_rows(b.results, user_providers, current_model)
+    from hermes_cli.models import normalize_provider
+    results = [
+        row for row in b.results
+        if not any(
+            normalize_provider(str(row.get(key) or "")) in b.excluded
+            for key in ("slug", "provider_id")
+        )
+    ]
+    return _finalize_picker_rows(results, user_providers, current_model)
 
 
 def _finalize_picker_rows(results: list, user_providers, current_model: str) -> list:

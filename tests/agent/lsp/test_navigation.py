@@ -406,14 +406,25 @@ def test_tool_reports_unsupported_with_fallback(monkeypatch, tmp_path):
 
 def test_plugin_manifest_matches_registered_tool():
     """The manifest's provides_tools must match what register() actually adds."""
-    import yaml
     from pathlib import Path
 
-    manifest_path = Path(__file__).resolve().parents[3] / "plugins" / "lsp_navigate" / "plugin.yaml"
-    manifest = yaml.safe_load(manifest_path.read_text())
-    assert manifest["name"] == "lsp_navigate"
-    assert manifest["kind"] == "backend", "bundled backend = auto-loads without opt-in"
-    assert manifest["provides_tools"] == ["lsp_navigate"]
+    from hermes_cli.plugins_manifest import parse_manifest_file
+    from plugins.lsp_navigate import register
+
+    plugin_dir = Path(__file__).resolve().parents[3] / "plugins" / "lsp_navigate"
+    manifest = parse_manifest_file(plugin_dir / "plugin.yaml", plugin_dir, "bundled", "")
+    assert manifest is not None
+    assert manifest.name == "lsp_navigate"
+    assert manifest.kind == "backend", "bundled backend = auto-loads without opt-in"
+
+    registered = []
+
+    class _Ctx:
+        def register_tool(self, **kw):
+            registered.append(kw["schema"]["name"])
+
+    register(_Ctx())
+    assert manifest.provides_tools == registered == ["lsp_navigate"]
 
 
 def test_plugin_register_adds_the_tool():

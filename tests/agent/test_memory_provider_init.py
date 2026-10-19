@@ -147,9 +147,9 @@ def test_fresh_agent_finalizes_provider_tools_into_tool_search_catalog():
         patch("hermes_cli.config.load_config_readonly", return_value=cfg),
         patch("plugins.memory.load_memory_provider", return_value=provider),
         patch("agent.model_metadata.get_model_context_length", return_value=204_800),
-        patch("run_agent.get_tool_definitions", return_value=[]),
-        patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI"),
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
     ):
         from run_agent import AIAgent
 
