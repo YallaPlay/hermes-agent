@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import re
+import time
 from types import SimpleNamespace
 import pytest
 from unittest.mock import MagicMock, patch
@@ -100,7 +101,7 @@ class TestCreateSession:
         )
         monkeypatch.setattr(
             "hermes_cli.runtime_provider.resolve_runtime_provider",
-            lambda requested=None: {
+            lambda requested=None, target_model=None: {
                 "provider": requested,
                 "api_mode": "codex_app_server",
                 "base_url": "https://example.invalid",
@@ -277,7 +278,7 @@ class TestCreateSession:
         monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
         monkeypatch.setattr(
             "hermes_cli.runtime_provider.resolve_runtime_provider",
-            lambda requested=None: {
+            lambda requested=None, target_model=None: {
                 "provider": requested,
                 "api_mode": "codex_app_server",
                 "base_url": "https://example.invalid",
@@ -312,7 +313,7 @@ class TestCreateSession:
         monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
         monkeypatch.setattr(
             "hermes_cli.runtime_provider.resolve_runtime_provider",
-            lambda requested=None: {
+            lambda requested=None, target_model=None: {
                 "provider": requested,
                 "api_mode": "codex_app_server",
                 "base_url": "https://example.invalid",
@@ -345,7 +346,7 @@ class TestCreateSession:
         monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
         monkeypatch.setattr(
             "hermes_cli.runtime_provider.resolve_runtime_provider",
-            lambda requested=None: {
+            lambda requested=None, target_model=None: {
                 "provider": requested,
                 "api_mode": "codex_app_server",
                 "base_url": "https://example.invalid",
@@ -377,7 +378,7 @@ class TestCreateSession:
         monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
         monkeypatch.setattr(
             "hermes_cli.runtime_provider.resolve_runtime_provider",
-            lambda requested=None: {
+            lambda requested=None, target_model=None: {
                 "provider": requested,
                 "api_mode": "codex_app_server",
                 "base_url": "https://example.invalid",
@@ -952,7 +953,10 @@ class TestPersistence:
 
 
     def test_create_session_honors_platform_toolsets_acp(self, tmp_path, monkeypatch):
-        """platform_toolsets.acp in config replaces the hermes-acp composite."""
+        """platform_toolsets.acp replaces the composite through the shared resolver."""
+        monkeypatch.setattr("hermes_cli.tools_config._enabled_plugin_toolsets", lambda *args: set())
+        monkeypatch.setattr("hermes_cli.plugins.get_portable_mcp_server_names_nowait", lambda: set())
+        monkeypatch.setattr("hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build", lambda **kw: None)
         captured = {}
 
         def fake_agent(**kwargs):
@@ -981,14 +985,39 @@ class TestPersistence:
             manager = SessionManager(db=db)
             manager.create_session(cwd="/work")
 
-        assert captured["enabled_toolsets"] == ["web", "terminal", "file", "mcp-olympus"]
+        # Shared resolution is set-based; ACP sorts it before adding MCP prefixes.
+        assert captured["enabled_toolsets"] == ["file", "terminal", "web", "mcp-olympus"]
 
-    def test_acp_base_toolsets_fallback_on_empty_or_missing(self, monkeypatch):
-        """Missing, non-list, or empty platform_toolsets.acp falls back to hermes-acp."""
-        for cfg in ({}, {"platform_toolsets": {}}, {"platform_toolsets": {"acp": "web"}},
-                    {"platform_toolsets": {"acp": []}}, {"platform_toolsets": {"acp": ["", None]}}):
-            monkeypatch.setattr("hermes_cli.config.load_config", lambda cfg=cfg: cfg)
-            assert acp_session._acp_base_toolsets() == ["hermes-acp"]
+    @pytest.mark.parametrize("platform_config, expected", [
+        ({}, None),
+        ({"platform_toolsets": {}}, None),
+        ({"platform_toolsets": {"acp": "web"}}, None),
+        ({"platform_toolsets": {"acp": []}}, []),
+        ({"platform_toolsets": {"acp": ["file", "terminal"]}}, ["file", "terminal"]),
+        ({"platform_toolsets": {"acp": ["file", "no_mcp"]}}, ["file"]),
+        ({"platform_toolsets": {"acp": ["file", "alpha"]}}, ["file", "mcp-alpha"]),
+    ])
+    def test_fresh_agent_uses_shared_platform_resolver(self, monkeypatch, platform_config, expected):
+        """Missing/invalid config uses the default; an explicit empty surface stays empty."""
+        from hermes_cli.tools_config import _get_platform_tools
+
+        config = {"model": {"default": "m"}, **platform_config}
+        # Keep non-MCP cases independent of discovery/plugin state.
+        monkeypatch.setattr("hermes_cli.tools_config._enabled_plugin_toolsets", lambda *args: set())
+        if expected and "mcp-alpha" in expected:
+            config["mcp_servers"] = {"alpha": {"command": "a"}, "beta": {"command": "b"}}
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+        monkeypatch.setattr("run_agent.AIAgent", lambda **kw: SimpleNamespace(kwargs=kw))
+        monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **kw: {})
+        monkeypatch.setattr("hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build", lambda **kw: None)
+        monkeypatch.setattr("hermes_cli.plugins.get_portable_mcp_server_names_nowait", lambda: set())
+        with patch("hermes_cli.tools_config._get_platform_tools", wraps=_get_platform_tools) as resolver:
+            agent = SessionManager()._make_agent(session_id="fresh", cwd=".")
+        resolver.assert_called_once_with(config, "acp")
+        if expected is None:
+            expected = sorted(_get_platform_tools({"platform_toolsets": {"acp": ["hermes-acp"]}}, "acp"))
+            assert expected  # the default is not the explicitly empty surface
+        assert agent.kwargs["enabled_toolsets"] == expected
 
     def test_create_session_is_draft_until_meaningful_history_is_saved(self, manager):
         state = manager.create_session(cwd="/project")

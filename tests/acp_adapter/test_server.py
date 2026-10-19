@@ -2794,7 +2794,7 @@ class TestSlashCommands:
 
         assert "Context compressed: 4 -> 1 messages" in result
         assert "~40 -> ~12 tokens" in result
-        assert state.history == [{"role": "user", "content": "summary"}]
+        assert _without_row_ids(state.history) == [{"role": "user", "content": "summary"}]
         assert state.agent._session_db is original_session_db
         state.agent._compress_context.assert_called_once_with(
             [
@@ -2854,13 +2854,16 @@ class TestSlashCommands:
         original_session_db = object()
         state.agent._session_db = original_session_db
 
-        def _compress_context(messages, system_prompt, *, approx_tokens, task_id, force):
+        def _compress_context(messages, system_prompt, *, approx_tokens, task_id, force,
+                              focus_topic, defer_context_engine_notification):
             assert state.agent._session_db is None
             assert messages == state.history
             assert system_prompt == "system"
             assert approx_tokens == 40
             assert task_id == state.session_id
             assert force is True
+            assert focus_topic is None
+            assert defer_context_engine_notification is True
             return [{"role": "user", "content": "summary"}], "new-system"
 
         state.agent._compress_context = MagicMock(side_effect=_compress_context)
@@ -2890,7 +2893,9 @@ class TestSlashCommands:
             "system",
             approx_tokens=40,
             task_id=state.session_id,
+            focus_topic=None,
             force=True,
+            defer_context_engine_notification=True,
         )
         mock_save.assert_called_once_with(state.session_id)
 
@@ -3156,7 +3161,8 @@ class TestRegisterSessionMcpServers:
 def _without_row_ids(messages):
     """Compare conversation payloads without durable SQLite row metadata."""
     return [
-        {key: value for key, value in message.items() if key != "_row_id"}
+        {key: value for key, value in message.items()
+         if key not in {"_row_id", "message_uid", "timestamp", "_db_row_snapshot"}}
         for message in messages
     ]
 

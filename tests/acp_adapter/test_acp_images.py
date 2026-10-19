@@ -1,5 +1,9 @@
+import base64
+
 import pytest
 from acp.schema import (
+    BlobResourceContents,
+    EmbeddedResourceContentBlock,
     ImageContentBlock,
     ResourceContentBlock,
     TextContentBlock,

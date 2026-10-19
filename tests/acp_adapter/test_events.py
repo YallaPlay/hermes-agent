@@ -101,7 +101,8 @@ class TestToolProgressCallback:
 
         # Completion built with the started id, args, and the live result.
         mock_btc.assert_called_once_with(
-            tc_id, "read_file", result="file contents", function_args={"path": "/etc/hosts"}, snapshot=None
+            tc_id, "read_file", result="file contents", function_args={"path": "/etc/hosts"}, snapshot=None,
+            is_error=False
         )
         # The id is consumed so the step callback won't double-complete it.
         assert "read_file" not in tool_call_ids
@@ -178,15 +179,18 @@ class TestStepCallback:
         }
         mock_send.assert_called_once()
 
-    def test_step_callback_completes_todo_without_emitting_plan(self, mock_conn, event_loop_fixture):
-        """The deferred step callback finalizes the tool call but no longer emits
-        the plan update — that now happens live on ``tool.completed`` so the
-        turn's final todo is not stranded one step behind."""
-        from collections import deque
-
-        tool_call_ids = {"todo": deque(["tc-todo"])}
+    @pytest.mark.parametrize("name", ["todo", "todo_list"])
+    @pytest.mark.parametrize("live_completion", [False, True])
+    def test_todo_plan_emits_once_live_or_on_step_fallback(
+        self, mock_conn, event_loop_fixture, name, live_completion,
+    ):
+        """Live completion sends the last plan immediately; older runtimes use the step fallback."""
+        tool_call_ids, tool_call_meta, turn_state = {}, {}, {}
         loop = event_loop_fixture
-        cb = make_step_cb(mock_conn, "session-1", loop, tool_call_ids, {})
+        progress = make_tool_progress_cb(
+            mock_conn, "session-1", loop, tool_call_ids, tool_call_meta, turn_state=turn_state,
+        )
+        step = make_step_cb(mock_conn, "session-1", loop, tool_call_ids, tool_call_meta, turn_state)
         todo_result = (
             '{"todos":['
             '{"id":"inspect","content":"Inspect ACP","status":"completed"}'
@@ -194,12 +198,18 @@ class TestStepCallback:
         )
 
         with patch("acp_adapter.events._send_update") as mock_send:
-            cb(1, [{"name": "todo", "result": todo_result}])
+            progress("tool.started", name, None, {})
+            mock_send.reset_mock()
+            if live_completion:
+                progress("tool.completed", name, result=todo_result)
+                live_updates = [call.args[3].session_update for call in mock_send.call_args_list]
+                assert live_updates == ["plan", "tool_call_update"]
+                mock_send.reset_mock()
+            step(1, [{"name": name, "result": todo_result}])
 
-        updates = [call.args[3] for call in mock_send.call_args_list]
-        assert [getattr(update, "session_update", None) for update in updates] == [
-            "tool_call_update",
-        ]
+        updates = [call.args[3].session_update for call in mock_send.call_args_list]
+        assert updates == ([] if live_completion else ["tool_call_update", "plan"])
+        assert name not in tool_call_ids
 
     def test_todo_completion_emits_native_plan_update_live(self, mock_conn, event_loop_fixture):
         """A live ``tool.completed`` event for ``todo`` emits the native ACP plan
