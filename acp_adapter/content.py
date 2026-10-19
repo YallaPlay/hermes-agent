@@ -76,6 +76,9 @@ def _path_from_file_uri(uri: str) -> Path | None:
     if not raw:
         return None
 
+    # urlparse treats a bare Windows drive as a URI scheme.
+    if len(raw) >= 3 and raw[0].isalpha() and raw[1] == ":" and raw[2] in "/\\":
+        raw = "file:///" + raw.replace("\\", "/")
     parsed = urlparse(raw)
     if parsed.scheme and parsed.scheme != "file":
         return None
@@ -91,7 +94,11 @@ def _path_from_file_uri(uri: str) -> Path | None:
         drive, rest = path_text[0], path_text[2:]
     else:
         return Path(path_text)
-    return Path("/mnt") / drive.lower() / rest.lstrip("/\\").replace("\\", "/")
+    import os
+    rest = rest.lstrip("/\\").replace("\\", "/")
+    if os.name == "nt":
+        return Path(f"{drive}:/{rest}")
+    return Path("/mnt") / drive.lower() / rest
 
 
 def _decode_text_bytes(data: bytes, mime_type: str | None) -> str | None:
@@ -137,6 +144,21 @@ def _attr(obj: Any, name: str) -> str | None:
     return str(getattr(obj, name, "") or "").strip() or None
 
 
+def _save_attachment_to_cache(data: bytes, display_name: str) -> str | None:
+    """Materialize undeliverable attachment bytes into the document cache.
+
+    Returns the saved path, or None when saving fails — an attachment must
+    never fail the prompt; callers fall back to the omit placeholder.
+    """
+    try:
+        from gateway.platforms.base import cache_document_from_bytes
+
+        return cache_document_from_bytes(data, display_name or "attachment.bin")
+    except Exception:
+        logger.warning("Could not persist ACP attachment %r", display_name, exc_info=True)
+        return None
+
+
 def _resource_link_to_parts(block: ResourceContentBlock) -> list[dict[str, Any]]:
     """ACP resource_link -> OpenAI content parts: images become a text header + image_url,
     everything else a single text part with the inlined body (or a binary-omit note)."""
@@ -159,7 +181,7 @@ def _resource_link_to_parts(block: ResourceContentBlock) -> list[dict[str, Any]]
             size = path.stat().st_size
             if size > _MAX_ACP_RESOURCE_BYTES:
                 return _text_parts(
-                    **ident, body=f"[Image too large to inline: {size} bytes, cap={_MAX_ACP_RESOURCE_BYTES}]"
+                    **ident, body=f"[Image too large to inline: {size} bytes, cap={_MAX_ACP_RESOURCE_BYTES}. File is at {path}.]"
                 )
             with path.open("rb") as fh:
                 data = fh.read()
@@ -174,7 +196,8 @@ def _resource_link_to_parts(block: ResourceContentBlock) -> list[dict[str, Any]]
             data = fh.read(min(size, _MAX_ACP_RESOURCE_BYTES))
         text = _decode_text_bytes(data, mime_type)
         if text is None:
-            return _text_parts(**ident, body=f"[Binary file omitted: {size} bytes, mime={mime_type or 'unknown'}]")
+            return _text_parts(**ident, body=(f"[Binary file at {path} — {size} bytes, mime={mime_type or 'unknown'}. "
+                                               "Not inlined; use your tools to read or process it.]"))
         note = f"truncated to {_MAX_ACP_RESOURCE_BYTES} of {size} bytes" if size > _MAX_ACP_RESOURCE_BYTES else None
         return _text_parts(**ident, body=text, note=note)
     except OSError as exc:
@@ -202,17 +225,24 @@ def _embedded_resource_to_parts(block: EmbeddedResourceContentBlock) -> list[dic
 
         if _is_image_resource(mime_type):
             if len(data) > _MAX_ACP_RESOURCE_BYTES:
-                return _text_parts(
-                    uri=uri,
-                    body=f"[Embedded image too large to inline: {len(data)} bytes, cap={_MAX_ACP_RESOURCE_BYTES}]",
-                )
+                saved = _save_attachment_to_cache(data, _resource_display_name(uri) or "attachment.bin")
+                body = f"[Embedded image too large to inline: {len(data)} bytes, cap={_MAX_ACP_RESOURCE_BYTES}"
+                body += (f". Image saved to {saved} — use your tools to read or process it.]" if saved else "]")
+                return _text_parts(uri=uri, body=body)
             return _image_parts(uri, _resource_display_name(uri), data, mime_type or "image/png")
 
         body = _decode_text_bytes(data[:_MAX_ACP_RESOURCE_BYTES], mime_type)
         if body is None:
-            body = f"[Binary embedded file omitted: {len(data)} bytes, mime={mime_type or 'unknown'}]"
+            saved = _save_attachment_to_cache(data, _resource_display_name(uri) or "attachment.bin")
+            body = (
+                f"[Binary attachment saved to {saved} — {len(data)} bytes, mime={mime_type or 'unknown'}. "
+                "Use your tools to read or process it.]"
+                if saved else f"[Binary embedded file omitted: {len(data)} bytes, mime={mime_type or 'unknown'}]"
+            )
         elif len(data) > _MAX_ACP_RESOURCE_BYTES:
-            body += f"\n\n[Truncated to {_MAX_ACP_RESOURCE_BYTES} of {len(data)} bytes]"
+            saved = _save_attachment_to_cache(data, _resource_display_name(uri) or "attachment.bin")
+            note = f"[Truncated to {_MAX_ACP_RESOURCE_BYTES} of {len(data)} bytes"
+            body += "\n\n" + note + (f"; full file saved to {saved}]" if saved else "]")
         return _text_parts(uri=uri, body=body)
 
     text = getattr(resource, "text", None)

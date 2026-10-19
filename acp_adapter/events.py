@@ -15,7 +15,10 @@ from typing import Any, Callable, Deque, Dict
 import acp
 from acp.schema import AgentPlanUpdate, PlanEntry
 
-from .tools import _json_loads_maybe, build_tool_complete, build_tool_start, coerce_tool_args, make_tool_call_id
+from .tools import (
+    _json_loads_maybe, build_tool_abandoned, build_tool_complete, build_tool_start, coerce_tool_args,
+    make_tool_call_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +148,7 @@ def make_subagent_update_router(conn: acp.Client, loop: asyncio.AbstractEventLoo
     return SubagentUpdateRouter(conn, loop)
 
 
-def _upgrade_queue(tool_call_ids: Dict[str, Deque[str]], name: str) -> Deque[str] | None:
+def _upgrade_queue(tool_call_ids: dict[str, deque[str]], name: str) -> deque[str] | None:
     """Fetch the per-tool FIFO of pending call IDs, upgrading a legacy bare-string entry in place."""
     queue = tool_call_ids.get(name)
     if isinstance(queue, str):
@@ -153,35 +156,79 @@ def _upgrade_queue(tool_call_ids: Dict[str, Deque[str]], name: str) -> Deque[str
     return queue
 
 
+def close_tool_call(
+    conn: acp.Client, session_id: str, loop: asyncio.AbstractEventLoop, tool_call_ids: dict[str, deque[str]],
+    tool_call_meta: dict[str, dict[str, Any]], name: str, result: Any = None, is_error: bool = False,
+) -> str | None:
+    """Close the oldest open ACP tool call for ``name``; returns its id, or None when none is open."""
+    queue = _upgrade_queue(tool_call_ids, name)
+    if not queue:
+        return None
+    tc_id = queue.popleft()
+    meta = tool_call_meta.pop(tc_id, {})
+    _send_update(conn, session_id, loop, build_tool_complete(
+        tc_id, name, result=str(result) if result is not None else None,
+        function_args=meta.get("args"), snapshot=meta.get("snapshot"), is_error=is_error,
+    ))
+    if not queue:
+        tool_call_ids.pop(name, None)
+    return tc_id
+
+
+def flush_open_tool_calls(
+    conn: acp.Client, session_id: str, loop: asyncio.AbstractEventLoop, tool_call_ids: dict[str, deque[str]],
+    tool_call_meta: dict[str, dict[str, Any]],
+) -> int:
+    """Close every tool call still open at the end of a turn, and report how many there were.
+
+    A tool blocked by scope, guardrail or an editor permission prompt never
+    projects ``tool.completed``, so without this its bubble stays ``in_progress``
+    forever and clients read the turn as one that never ran a tool."""
+    open_calls = [(name, list(queue)) for name, queue in list(tool_call_ids.items()) if queue]
+    flushed = 0
+    for name, ids in open_calls:
+        for tc_id in ids:
+            tool_call_meta.pop(tc_id, None)
+            _send_update(conn, session_id, loop, build_tool_abandoned(tc_id, name))
+            flushed += 1
+        tool_call_ids.pop(name, None)
+    if flushed:
+        logger.debug("Flushed %d ACP tool call(s) left open at turn end", flushed)
+    return flushed
+
+
 def make_tool_progress_cb(
-    conn: acp.Client, session_id: str, loop: asyncio.AbstractEventLoop, tool_call_ids: Dict[str, Deque[str]],
-    tool_call_meta: Dict[str, Dict[str, Any]],
+    conn: acp.Client, session_id: str, loop: asyncio.AbstractEventLoop, tool_call_ids: dict[str, deque[str]],
+    tool_call_meta: dict[str, dict[str, Any]],
     edit_approval_policy_getter: Callable[[], tuple[str, str | None]] | None = None,
     subagent_router: Callable | None = None,
+    turn_state: dict[str, Any] | None = None,
 ) -> Callable:
-    """Create the live tool/subagent progress bridge."""
+    """Create a ``tool_progress_callback`` for AIAgent.
 
-    def _tool_progress(event_type: str, name: str = None, preview: str = None, args: Any = None, **kwargs) -> None:
+    Signature: ``tool_progress_callback(event_type, name, preview, args, **kwargs)``.
+    Emits ``ToolCallStart`` for ``tool.started`` and tracks IDs in a FIFO per tool
+    name so parallel same-name calls complete against the right ACP tool call.
+    ``tool.completed`` closes that call with its own result — the step callback
+    only fires on the *next* step, which leaves a turn's last tools open."""
+
+    def _tool_progress(event_type: str, name: str | None = None, preview: str | None = None, args: Any = None, **kwargs) -> None:
         if event_type.startswith("subagent."):
             if subagent_router is not None and kwargs.get("child_session_id"):
                 subagent_router(event_type, name, preview, args, **kwargs)
             return
-        if event_type == "tool.completed":
-            if name == "todo":
+        if event_type == "tool.completed" and name:
+            if name in {"todo", "todo_list"}:
                 plan_update = _build_plan_update_from_todo_result(kwargs.get("result"))
                 if plan_update is not None:
                     _send_update(conn, session_id, loop, plan_update)
-            queue = _upgrade_queue(tool_call_ids, name or "")
-            if name and queue:
-                tc_id = queue.popleft()
-                meta = tool_call_meta.pop(tc_id, {})
-                result = kwargs.get("result")
-                _send_update(conn, session_id, loop, build_tool_complete(
-                    tc_id, name, result=str(result) if result is not None else None,
-                    function_args=meta.get("args"), snapshot=meta.get("snapshot"),
-                ))
-                if not queue:
-                    tool_call_ids.pop(name, None)
+            if turn_state is not None:
+                turn_state["saw_completion"] = True
+            # The executor's verdict: a cancelled/errored tool may return plain text the heuristic misses.
+            close_tool_call(
+                conn, session_id, loop, tool_call_ids, tool_call_meta, name, kwargs.get("result"),
+                is_error=bool(kwargs.get("is_error")),
+            )
             return
         if event_type != "tool.started":
             return
@@ -266,8 +313,8 @@ def make_message_cb(
 
 
 def make_step_cb(
-    conn: acp.Client, session_id: str, loop: asyncio.AbstractEventLoop, tool_call_ids: Dict[str, Deque[str]],
-    tool_call_meta: Dict[str, Dict[str, Any]],
+    conn: acp.Client, session_id: str, loop: asyncio.AbstractEventLoop, tool_call_ids: dict[str, deque[str]],
+    tool_call_meta: dict[str, dict[str, Any]], turn_state: dict[str, Any] | None = None,
 ) -> Callable:
     """Create a ``step_callback(api_call_count, prev_tools)`` fallback completion bridge."""
 
@@ -284,20 +331,27 @@ def make_step_cb(
                 tool_name = tool_info
             if not tool_name:
                 continue
-            queue = _upgrade_queue(tool_call_ids, tool_name)
-            if not queue:
-                continue
-            tc_id = queue.popleft()
-            meta = tool_call_meta.pop(tc_id, {})
-            _send_update(conn, session_id, loop, build_tool_complete(
-                tc_id, tool_name, result=str(result) if result is not None else None,
-                function_args=function_args or meta.get("args"), snapshot=meta.get("snapshot"),
-            ))
-            if not queue:
-                tool_call_ids.pop(tool_name, None)
+            # ``tool.completed`` already closed this call with its own result;
+            # this callback is the fallback for runtimes that never project one.
+            if not (turn_state or {}).get("saw_completion"):
+                queue = _upgrade_queue(tool_call_ids, tool_name)
+                if not queue:
+                    continue
+                tc_id = queue.popleft()
+                meta = tool_call_meta.pop(tc_id, {})
+                # ``prev_tools`` carries the wire ``arguments`` JSON *string*; the content
+                # builders index it as a dict, so an uncoerced string raised inside this
+                # (swallowed) callback and the bubble never closed.
+                _send_update(conn, session_id, loop, build_tool_complete(
+                    tc_id, tool_name, result=str(result) if result is not None else None,
+                    function_args=coerce_tool_args(function_args) if function_args else meta.get("args"),
+                    snapshot=meta.get("snapshot"),
+                ))
+                if not queue:
+                    tool_call_ids.pop(tool_name, None)
+            if (not (turn_state or {}).get("saw_completion")
+                    and tool_name in {"todo", "todo_list"}
+                    and (plan_update := _build_plan_update_from_todo_result(result)) is not None):
+                _send_update(conn, session_id, loop, plan_update)
+
     return _step
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-import json  # noqa: F401,E402
-# ---- END PLUGIN-COMPAT ----
