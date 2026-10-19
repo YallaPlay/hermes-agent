@@ -87,7 +87,7 @@ def test_proactive_artifact_success_uses_scope_and_preserves_arguments(tmp_path)
     arguments = json.dumps({"cmd": "python", "payload": "x" * 2_000})
     messages = _messages(output=original_output, arguments=arguments)
 
-    with patch("tools.terminal_tool.get_active_env", return_value=env) as get_env:
+    with patch("tools.terminal_tool_lifecycle.get_active_env", return_value=env) as get_env:
         result, count = _compressor().prune_tool_results_only(
             messages,
             current_tokens=10_000,
@@ -128,7 +128,7 @@ def test_artifact_mode_never_uses_legacy_lossy_fallback(tmp_path):
     env = LocalArtifactEnv(tmp_path)
 
     with (
-        patch("tools.terminal_tool.get_active_env", return_value=env),
+        patch("tools.terminal_tool_lifecycle.get_active_env", return_value=env),
         patch("agent.context_compressor.persist_tool_artifact", return_value=None),
         patch.object(ContextCompressor, "_prune_old_tool_results") as legacy,
     ):
@@ -165,7 +165,7 @@ def test_artifact_mode_preserves_protected_head_results(tmp_path):
         {"role": "assistant", "content": "tail reply"},
     ]
 
-    with patch("tools.terminal_tool.get_active_env", return_value=env):
+    with patch("tools.terminal_tool_lifecycle.get_active_env", return_value=env):
         result, count = _compressor(protect_first_n=2).prune_tool_results_only(
             messages, current_tokens=10_000, task_id="task-scope"
         )
@@ -203,7 +203,7 @@ def test_duplicate_call_ids_keep_occurrence_specific_tool_identity(tmp_path):
         {"role": "assistant", "content": "done"},
     ]
 
-    with patch("tools.terminal_tool.get_active_env", return_value=env):
+    with patch("tools.terminal_tool_lifecycle.get_active_env", return_value=env):
         result, count = _compressor().prune_tool_results_only(
             messages, current_tokens=10_000, task_id="task-scope"
         )
@@ -220,7 +220,7 @@ def test_responses_style_call_id_is_used_for_tool_identity(tmp_path):
     tool_call["call_id"] = "wire-id"
     tool_call["id"] = "provider-item-id"
 
-    with patch("tools.terminal_tool.get_active_env", return_value=env):
+    with patch("tools.terminal_tool_lifecycle.get_active_env", return_value=env):
         result, count = _compressor().prune_tool_results_only(
             messages, current_tokens=10_000, task_id="task-scope"
         )
@@ -249,7 +249,7 @@ def test_partial_failure_never_removes_reused_artifact(tmp_path):
     )
 
     with (
-        patch("tools.terminal_tool.get_active_env", return_value=object()),
+        patch("tools.terminal_tool_lifecycle.get_active_env", return_value=object()),
         patch("agent.context_compressor.persist_tool_artifact", side_effect=[reused, None]),
         patch("agent.context_compressor.remove_created_tool_artifact") as cleanup,
     ):
@@ -267,7 +267,7 @@ def test_artifact_failures_return_exact_original_object(tmp_path, failure):
     messages = _messages(output="output" * 2_000)
     env = None if failure == "missing-env" else LocalArtifactEnv(tmp_path)
 
-    patches = [patch("tools.terminal_tool.get_active_env", return_value=env)]
+    patches = [patch("tools.terminal_tool_lifecycle.get_active_env", return_value=env)]
     if failure == "writer":
         patches.append(patch("agent.context_compressor.persist_tool_artifact", return_value=None))
     elif failure == "sanitizer":
@@ -287,7 +287,7 @@ def test_reclaim_gate_rejection_removes_new_artifacts(tmp_path):
     env = LocalArtifactEnv(tmp_path)
     messages = _messages(output="output" * 2_000)
 
-    with patch("tools.terminal_tool.get_active_env", return_value=env):
+    with patch("tools.terminal_tool_lifecycle.get_active_env", return_value=env):
         result, count = _compressor(
             proactive_prune_min_reclaim_tokens=1_000_000,
         ).prune_tool_results_only(messages, current_tokens=10_000, task_id="task-scope")
@@ -304,7 +304,7 @@ def test_incapable_store_skips_artifact_creation(tmp_path):
     compressor._session_db = object()
     compressor._session_id = "session"
 
-    with patch("tools.terminal_tool.get_active_env", return_value=env) as get_env:
+    with patch("tools.terminal_tool_lifecycle.get_active_env", return_value=env) as get_env:
         result, count = compressor.prune_tool_results_only(
             messages, current_tokens=10_000, task_id="task-scope"
         )
@@ -326,7 +326,7 @@ def test_failed_store_commit_removes_new_artifacts(tmp_path):
     compressor._session_db = FailingStore()
     compressor._session_id = "session"
 
-    with patch("tools.terminal_tool.get_active_env", return_value=env):
+    with patch("tools.terminal_tool_lifecycle.get_active_env", return_value=env):
         result, count = compressor.prune_tool_results_only(
             messages, current_tokens=10_000, task_id="task-scope"
         )
@@ -342,7 +342,7 @@ def test_cleanup_failure_still_fails_closed_with_original_object(tmp_path):
     messages = _messages(output="output" * 2_000)
 
     with (
-        patch("tools.terminal_tool.get_active_env", return_value=env),
+        patch("tools.terminal_tool_lifecycle.get_active_env", return_value=env),
         patch("agent.context_compressor.remove_created_tool_artifact", return_value=False),
     ):
         result, count = _compressor(
@@ -358,7 +358,7 @@ def test_repeated_prune_is_idempotent_without_rewrite(tmp_path):
     messages = _messages(output="output" * 2_000)
     compressor = _compressor()
 
-    with patch("tools.terminal_tool.get_active_env", return_value=env):
+    with patch("tools.terminal_tool_lifecycle.get_active_env", return_value=env):
         first, first_count = compressor.prune_tool_results_only(
             messages, current_tokens=10_000, task_id="task-scope"
         )
@@ -436,7 +436,7 @@ def test_proactive_artifact_skips_results_smaller_than_their_stub(tmp_path):
     small_output = "s" * 260
     messages = _messages(output=small_output)
 
-    with patch("tools.terminal_tool.get_active_env", return_value=env):
+    with patch("tools.terminal_tool_lifecycle.get_active_env", return_value=env):
         result, count = _compressor().prune_tool_results_only(
             messages,
             current_tokens=10_000,
@@ -487,7 +487,7 @@ def test_proactive_artifact_prunes_large_and_skips_small_in_one_pass(tmp_path):
         {"role": "assistant", "content": "done"},
     ]
 
-    with patch("tools.terminal_tool.get_active_env", return_value=env):
+    with patch("tools.terminal_tool_lifecycle.get_active_env", return_value=env):
         result, count = _compressor().prune_tool_results_only(
             messages,
             current_tokens=10_000,

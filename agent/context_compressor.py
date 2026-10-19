@@ -3450,7 +3450,7 @@ class ContextCompressor(
             return messages, 0, (), None
 
         try:
-            from tools.terminal_tool import get_active_env
+            from tools.terminal_tool_lifecycle import get_active_env
 
             env = get_active_env(task_id)
         except Exception:
