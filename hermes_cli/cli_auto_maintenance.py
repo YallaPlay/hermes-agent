@@ -62,6 +62,15 @@ def _run_state_db_auto_maintenance(session_db) -> None:
             vacuum=bool(cfg.get("vacuum_after_prune", True)),
             sessions_dir=_hermes_home_maint / "sessions",
         )
+        # Transcript images share session retention, not the short-lived inbound-media TTL.
+        try:
+            from gateway.platforms.base import cleanup_history_image_cache
+
+            removed = cleanup_history_image_cache(max_age_days=int(cfg.get("retention_days", 90)))
+            if removed:
+                logger.info("History image cache: removed %d expired file(s)", removed)
+        except Exception as image_exc:
+            logger.debug("History image cache cleanup skipped: %s", image_exc)
     except Exception as exc:
         logger.debug("state.db auto-maintenance skipped: %s", exc)
 

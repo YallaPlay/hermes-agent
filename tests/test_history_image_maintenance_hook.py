@@ -51,6 +51,12 @@ def test_auto_prune_off_never_sweeps_images(session_db):
     sweep.assert_not_called()
 
 
+def test_auto_prune_missing_defaults_to_off(session_db):
+    sweep = _run(session_db, {})
+    session_db.maybe_auto_prune_and_vacuum.assert_not_called()
+    sweep.assert_not_called()
+
+
 def test_image_sweep_failure_never_blocks_startup(session_db):
     with (
         patch(
