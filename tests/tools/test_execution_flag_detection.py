@@ -249,6 +249,7 @@ def test_read_tools_in_quoted_command_substitution_not_malformed(command):
     [
         # Danger inside the substitution must still be detected.
         ('echo "$(ls; rm -rf /)"', "delete in root path"),
+        ("echo \"$(grep -P 'rm -rf /' f; rm -rf /)\"", "delete in root path"),
         # Danger after a benign quoted substitution must still be detected.
         ("echo \"$(grep -c 'x' f)\"; rm -rf /", "delete in root path"),
         # A well-formed execution-bearing payload inside a substitution still

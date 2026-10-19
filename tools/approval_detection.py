@@ -1491,6 +1491,9 @@ def _command_detection_variants(command: str):
     # command (only quoted newlines masked), then normalize; the leading space keeps the marker
     # from being eaten as a `\<newline>` continuation when the preceding text ends in a backslash.
     faithful = _normalize_command_for_detection(_mark_command_starts(_mask_quoted_newlines(command), marker=" \n"))
+    # The faithful quote-state variant must retain the same inert grep operands
+    # as the normalized variant, rather than reintroducing their pattern text.
+    faithful, _ = _grep_safe_detection_variant(faithful)
     if fresh(faithful):
         yield faithful
     # Quoting/escaping can spell an executable in pieces (r\m, r''m). Keep that deobfuscation scoped
