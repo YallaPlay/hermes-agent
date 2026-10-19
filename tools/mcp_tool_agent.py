@@ -125,7 +125,15 @@ def _publish_tool_snapshot(
                 == tuple(surface.source_defs)
         )
         agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
-        if unchanged and not content_aware:
+        # A content-aware refresh still must not replace an identical snapshot.
+        # An agent without source metadata has a direct-tools snapshot: unchanged
+        # source bytes alone do not warrant migrating it to a deferred surface.
+        unchanged_direct = (
+            not hasattr(agent, "_tool_search_source_defs")
+            and not hasattr(agent, "_tool_search_config")
+            and current_defs == list(surface.source_defs)
+        )
+        if unchanged or unchanged_direct:
             return None
 
         publish_agent_tool_surface(agent, surface)

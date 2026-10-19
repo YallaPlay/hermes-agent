@@ -149,6 +149,51 @@ def test_refresh_rebuilds_provider_tool_search_catalog(monkeypatch):
         "mcp_new_server_tool",
         "provider_stats",
     ]
+
+
+def test_content_aware_refresh_keeps_identical_deferred_snapshot(monkeypatch):
+    from agent.tool_search_surface import finalize_agent_tool_surface
+    from tools.registry import registry
+    from tools.tool_search import ToolSearchConfig
+    import model_tools
+
+    agent = _agent(["image_generate"])
+    source = list(agent.tools)
+    finalize_agent_tool_surface(agent, config=ToolSearchConfig.from_raw({"enabled": "on"}))
+    before = agent.tools
+    catalog = agent._tool_search_catalog
+    scope_cache = object()
+    agent._tool_search_scope_cache = scope_cache
+    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kw: source)
+
+    assert _mcp_agent.refresh_agent_mcp_tools(agent, content_aware=True) == set()
+
+    assert agent.tools is before
+    assert agent._tool_search_catalog is catalog
+    assert agent._tool_search_scope_cache is scope_cache
+    assert agent._tool_snapshot_generation == registry._generation
+
+
+def test_content_aware_refresh_publishes_changed_deferred_schema(monkeypatch):
+    from agent.tool_search_surface import finalize_agent_tool_surface
+    from tools.tool_search import ToolSearchConfig
+    import model_tools
+
+    agent = _agent(["image_generate"])
+    finalize_agent_tool_surface(agent, config=ToolSearchConfig.from_raw({"enabled": "on"}))
+    before = agent.tools
+    changed = _tool("image_generate")
+    changed["function"]["description"] = "New image capabilities"
+    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kw: [changed])
+
+    assert _mcp_agent.refresh_agent_mcp_tools(agent, content_aware=True) == set()
+
+    assert agent.tools is not before
+    assert agent._tool_search_source_defs == (changed,)
+    assert agent._tool_search_catalog[0].description == "New image capabilities"
+    assert agent._tool_search_allowed_names == frozenset({"image_generate"})
+
+
 def test_refresh_does_not_reinject_disabled_memory_provider_tools(monkeypatch):
     """A refresh removes stale provider tools when memory becomes disabled."""
     agent = _agent(
