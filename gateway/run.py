@@ -4385,7 +4385,7 @@ class GatewayRunner(
         """Persist a tool-driven global reasoning level; fail closed to the session override."""
         try:
             from hermes_cli.config import atomic_config_write
-            import yaml
+            import hermes_yaml as yaml
 
             config_path = _hermes_home / "config.yaml"
             user_config = {}
