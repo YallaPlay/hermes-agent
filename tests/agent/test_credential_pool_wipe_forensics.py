@@ -119,9 +119,12 @@ def test_codex_terminal_refresh_recovers_from_cli_before_wiping(
         "access_token": "recovered-access-token",
         "refresh_token": "recovered-refresh-token",
     }
-    monkeypatch.setattr(
-        auth_codex_mod, "_recover_codex_tokens_from_cli", lambda reason: dict(recovered_tokens)
-    )
+    def recover(reason, *, observed_access_token):
+        assert reason == "credential_pool_terminal_refresh"
+        assert observed_access_token == _FAKE_ACCESS
+        return dict(recovered_tokens)
+
+    monkeypatch.setattr(auth_codex_mod, "_recover_codex_tokens_from_cli", recover)
 
     def _fail(*_a, **_kw):
         raise _terminal_error()

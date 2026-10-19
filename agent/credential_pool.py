@@ -1845,8 +1845,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             # re-seed the revoked credentials, and drop singleton-seeded
             # entries from the pool (mirrors the Nous quarantine path).
             if getattr(auth_mod, terminal_fn_name)(exc):
-                logger.warning(
-                    "%s OAuth refresh token is terminally invalid; attempting recovery before clearing state: %s code=%s",
+                logger.info(
+                    "%s OAuth refresh recovery before clearing state: %s code=%s",
                     display, _cred_log_ctx(entry), getattr(exc, "code", "unknown"),
                 )
                 if self.provider == "openai-codex":
@@ -1870,9 +1870,9 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                             **_MARK_OK,
                         )
                 logger.warning(
-                    "%s OAuth refresh token is terminally invalid (%s); clearing local token state: %s. "
+                    "%s OAuth refresh token is terminally invalid (%s); clearing local token state: %s code=%s. "
                     "Re-run 'hermes auth add %s' to sign in again.",
-                    display, exc, _cred_log_ctx(entry), self.provider,
+                    display, exc, _cred_log_ctx(entry), getattr(exc, "code", "unknown"), self.provider,
                 )
                 self._clear_terminal_tokens_state(entry, exc)
                 if entry.source.startswith("manual:"):
