@@ -1373,7 +1373,7 @@ class TestCuratorConsolidationDeleteGuard:
         iteration budget in a view→patch→refused loop. The marks must survive
         across per-call context snapshots."""
         from tools.skills_tool import skill_view
-        from tools.skill_manager_tool import _reset_background_review_read_marks
+        from tools.skill_manager_guards import _reset_background_review_read_marks
 
         _reset_background_review_read_marks()
         with _curator_pass(tmp_path, monkeypatch=monkeypatch):
@@ -1396,7 +1396,7 @@ class TestCuratorConsolidationDeleteGuard:
         concurrently running fork — each fork must load the content its own
         model actually saw."""
         from tools.skills_tool import skill_view
-        from tools.skill_manager_tool import _reset_background_review_read_marks
+        from tools.skill_manager_guards import _reset_background_review_read_marks
 
         _reset_background_review_read_marks()
         with _curator_pass(tmp_path, monkeypatch=monkeypatch):
@@ -1425,7 +1425,7 @@ class TestCuratorConsolidationDeleteGuard:
         """background_review.py clears a finished fork's ledger entry by key;
         a later fork that happens to reuse the key must start locked."""
         from tools.skills_tool import skill_view
-        from tools.skill_manager_tool import (
+        from tools.skill_manager_guards import (
             _reset_background_review_read_marks,
             clear_background_review_read_marks,
         )

@@ -1178,7 +1178,7 @@ def _run_review_fork(
 
         _reset_background_review_read_marks()
     with suppress(Exception):
-        from tools.skill_manager_tool import clear_background_review_read_marks
+        from tools.skill_manager_guards import clear_background_review_read_marks
 
         clear_background_review_read_marks(st.review_fork_key)
     try:
@@ -1205,7 +1205,7 @@ def _run_review_fork(
         _track_review_fork(agent, st.review_agent, register=False)
         finish_background_review_run(agent, review_run)
         with suppress(Exception):
-            from tools.skill_manager_tool import clear_background_review_read_marks
+            from tools.skill_manager_guards import clear_background_review_read_marks
 
             clear_background_review_read_marks(st.review_fork_key)
     st.review_messages = list(getattr(st.review_agent, "_session_messages", []))
@@ -1303,7 +1303,7 @@ def _run_review_in_thread(
         _track_review_fork(agent, st.review_agent, register=False)
         finish_background_review_run(agent, review_run)
         with suppress(Exception):
-            from tools.skill_manager_tool import clear_background_review_read_marks
+            from tools.skill_manager_guards import clear_background_review_read_marks
 
             clear_background_review_read_marks(st.review_fork_key)
         if st.review_agent is not None:

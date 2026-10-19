@@ -17,7 +17,7 @@ _write_origin: contextvars.ContextVar[str] = contextvars.ContextVar(
 # any per-fork state a tool needs to persist across calls must live in
 # process-global storage keyed by this id — ContextVar writes made inside a
 # worker die with the snapshot. The read-before-write marks in
-# skill_manager_tool are the canonical consumer.
+# skill_manager_guards are the canonical consumer.
 _review_fork_id: contextvars.ContextVar["str | None"] = contextvars.ContextVar(
     "skill_review_fork_id",
     default=None,

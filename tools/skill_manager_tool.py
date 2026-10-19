@@ -14,7 +14,6 @@ from contextlib import ExitStack, suppress
 import logging
 import re
 import shutil
-import threading as _threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -37,124 +36,6 @@ from tools.skill_manager_batch import (
 from tools.skills_guard import scan_skill, should_allow_install, format_scan_report
 
 logger = logging.getLogger(__name__)
-
-class _BackgroundReviewReadMarks:
-    """Read marks shared by copied tool contexts within one review run."""
-
-    def __init__(self) -> None:
-        self._lock = _threading.Lock()
-        self._paths: set[str] = set()
-
-    def add(self, path: str) -> None:
-        with self._lock:
-            self._paths.add(path)
-
-    def contains(self, path: str) -> bool:
-        with self._lock:
-            return path in self._paths
-
-
-# Read-before-write marks have two complementary storage paths:
-#
-# * Real background-review forks bind a stable fork id in turn_context. Their
-#   marks live in a process-global, lock-protected map keyed by that id, because
-#   every tool call runs in a separate worker-thread context snapshot.
-# * Direct/test callers without a fork id use upstream's ContextVar-held mutable
-#   ledger. Initializing it before copy_context() lets copied tool contexts share
-#   one ledger while separate review contexts remain isolated.
-#
-# This hybrid preserves the fork's production worker-thread fix and cleanup
-# contract while retaining upstream's context-isolation behavior.
-_background_review_read_lock = _threading.Lock()
-_background_review_read_paths_by_fork: Dict[str, "set[str]"] = {}
-_background_review_read_paths: (
-    "_ctxvars.ContextVar[Optional[_BackgroundReviewReadMarks]]"
-) = _ctxvars.ContextVar("background_review_read_paths", default=None)
-
-
-def _current_review_fork_key() -> Optional[str]:
-    try:
-        from tools.skill_provenance import get_current_review_fork_id
-        return get_current_review_fork_id()
-    except Exception:
-        return None
-
-
-def mark_background_review_skill_read(path: Path) -> None:
-    """Record that the active background-review fork has read a skill file.
-
-    The autonomous review fork is allowed to evolve skills, but it must not
-    patch or rewrite content it has only inferred from the transcript.  The
-    skill_view tool calls this after returning file content to the model; write
-    paths below require the corresponding target path to be present when the
-    current origin is ``background_review``.
-    """
-    try:
-        from tools.skill_provenance import is_background_review
-        if not is_background_review():
-            return
-    except Exception:
-        return
-
-    try:
-        resolved = str(path.resolve())
-    except Exception:
-        resolved = str(path)
-    key = _current_review_fork_key()
-    if key is not None:
-        with _background_review_read_lock:
-            _background_review_read_paths_by_fork.setdefault(key, set()).add(resolved)
-        return
-    marks = _background_review_read_paths.get()
-    if marks is None:
-        marks = _BackgroundReviewReadMarks()
-        _background_review_read_paths.set(marks)
-    marks.add(resolved)
-
-
-def _background_review_has_read(path: Path) -> bool:
-    try:
-        resolved = str(path.resolve())
-    except Exception:
-        resolved = str(path)
-    key = _current_review_fork_key()
-    if key is not None:
-        with _background_review_read_lock:
-            return resolved in _background_review_read_paths_by_fork.get(key, ())
-    marks = _background_review_read_paths.get()
-    return marks is not None and marks.contains(resolved)
-
-
-def clear_background_review_read_marks(fork_id: Optional[str] = None) -> None:
-    """Drop a review fork's read marks (its whole entry) when it finishes.
-
-    background_review.py calls this from the review thread's finally with the
-    fork's key so entries never outlive their fork; with no argument the
-    current context's fork entry is cleared.
-    """
-    key = fork_id or _current_review_fork_key()
-    if key is not None:
-        with _background_review_read_lock:
-            _background_review_read_paths_by_fork.pop(key, None)
-    else:
-        _background_review_read_paths.set(_BackgroundReviewReadMarks())
-
-
-def _reset_background_review_read_marks() -> None:
-    """Start a fresh context ledger and clear process-global fork marks."""
-    _background_review_read_paths.set(_BackgroundReviewReadMarks())
-    with _background_review_read_lock:
-        _background_review_read_paths_by_fork.clear()
-
-
-# The upstream decomposition moved readers and guards into
-# ``skill_manager_guards``.  Rebind that module's seams to this fork-aware
-# ledger so skill_view/read_file marks and skill_manage checks share the same
-# per-review-fork state even when tool calls run on copied worker contexts.
-from tools import skill_manager_guards as _skill_manager_guards
-_skill_manager_guards.mark_background_review_skill_read = mark_background_review_skill_read
-_skill_manager_guards._background_review_has_read = _background_review_has_read
-_skill_manager_guards._reset_background_review_read_marks = _reset_background_review_read_marks
 
 # Import security scanner — external hub installs always get scanned;
 # agent-created skills only get scanned when skills.guard_agent_created is on.

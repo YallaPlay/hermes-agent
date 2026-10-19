@@ -48,28 +48,55 @@ class _BackgroundReviewReadMarks:
             return path in self._paths
 
 
+# A seeded mutable ledger is shared by copied contexts. Fork-keyed marks also
+# cover workers whose context is independently reconstructed from turn metadata.
 _background_review_read_paths: _ctxvars.ContextVar[Optional[_BackgroundReviewReadMarks]] = (
     _ctxvars.ContextVar("background_review_read_paths", default=None))
+_background_review_read_lock = threading.Lock()
+_background_review_read_paths_by_fork: dict[str, set[str]] = {}
+
+
+def _current_review_fork_key() -> Optional[str]:
+    from tools.skill_provenance import get_current_review_fork_id
+    return get_current_review_fork_id()
 
 
 def mark_background_review_skill_read(path: Path) -> None:
-    """Record that the active background-review fork has read a skill file. The fork must not
-    patch content it only inferred from the transcript: skill_view/read_file call this, and
-    the write guards require the mark."""
+    """Record content actually loaded by this review, including its tool workers."""
     if not _is_background_review():
+        return
+    resolved = _resolved_str(path)
+    if (key := _current_review_fork_key()) is not None:
+        with _background_review_read_lock:
+            _background_review_read_paths_by_fork.setdefault(key, set()).add(resolved)
         return
     if (marks := _background_review_read_paths.get()) is None:
         _background_review_read_paths.set(marks := _BackgroundReviewReadMarks())
-    marks.add(_resolved_str(path))
+    marks.add(resolved)
 
 
 def _background_review_has_read(path: Path) -> bool:
+    resolved = _resolved_str(path)
+    if (key := _current_review_fork_key()) is not None:
+        with _background_review_read_lock:
+            return resolved in _background_review_read_paths_by_fork.get(key, ())
     marks = _background_review_read_paths.get()
-    return marks is not None and marks.contains(_resolved_str(path))
+    return marks is not None and marks.contains(resolved)
+
+
+def clear_background_review_read_marks(fork_id: Optional[str] = None) -> None:
+    """Release only the finished fork's ledger; never invalidate another review."""
+    key = fork_id or _current_review_fork_key()
+    if key is not None:
+        with _background_review_read_lock:
+            _background_review_read_paths_by_fork.pop(key, None)
+    else:
+        _background_review_read_paths.set(_BackgroundReviewReadMarks())
 
 
 def _reset_background_review_read_marks() -> None:
-    """Start a fresh, isolated read set for the current review context."""
+    """Seed the current context before workers spawn, resetting only its fork."""
+    clear_background_review_read_marks()
     _background_review_read_paths.set(_BackgroundReviewReadMarks())
 
 
