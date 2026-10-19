@@ -310,7 +310,7 @@ def test_codex_usage_labels_5h_session_window_by_duration(monkeypatch):
     }
     snapshot = _fetch_with_payload(monkeypatch, payload)
     assert snapshot is not None
-    assert [w.label for w in snapshot.windows] == ["5h", "Weekly"]
+    assert [w.label for w in snapshot.windows] == ["Session", "Weekly"]
 
 
 def test_codex_usage_includes_additional_rate_limits(monkeypatch):
