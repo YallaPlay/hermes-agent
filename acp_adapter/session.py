@@ -401,21 +401,28 @@ class SessionManager:
             base_url=base_url,
             api_mode=api_mode,
         )
-        state = SessionState(
-            session_id=session_id,
-            agent=agent,
-            cwd=cwd,
-            model=getattr(agent, "model", "") or "",
+        state = self._install_state(
+            session_id, agent, cwd, getattr(agent, "model", "") or "", [],
+            owner=(owner or "").strip() or None,
             parent_id=parent_id,
             persist_empty=bool((parent_id or "").strip()),
-            cancel_event=threading.Event(),
         )
-        state.owner = (owner or "").strip() or None
+        logger.info("Created ACP session %s (cwd=%s)", session_id, cwd)
+        return state
+
+    def _install_state(self, session_id: str, agent: Any, cwd: str, model: str,
+                       history: list[dict[str, Any]], *, persist: bool = True,
+                       **state_fields: Any) -> SessionState:
+        """Install a session, including fork metadata, through the common lifecycle path."""
+        state = SessionState(
+            session_id=session_id, agent=agent, cwd=cwd, model=model,
+            history=history, cancel_event=threading.Event(), **state_fields,
+        )
         with self._lock:
             self._sessions[session_id] = state
         _register_task_cwd(session_id, cwd)
-        self._persist(state)
-        logger.info("Created ACP session %s (cwd=%s)", session_id, cwd)
+        if persist:
+            self._persist(state)
         return state
 
     def get_session(self, session_id: str) -> Optional[SessionState]:
@@ -1200,8 +1207,6 @@ class SessionManager:
 
     def _restore(self, session_id: str) -> Optional[SessionState]:
         """Load a session from the database into memory, recreating the AIAgent."""
-        import threading
-
         db = self._get_db()
         if db is None:
             return None
@@ -1286,11 +1291,10 @@ class SessionManager:
             logger.warning("Failed to recreate agent for ACP session %s", session_id, exc_info=True)
             return None
 
-        state = SessionState(
-            session_id=session_id,
-            agent=agent,
-            cwd=cwd,
-            model=model or getattr(agent, "model", "") or "",
+        _apply_effort_to_agent(agent, restored_effort)
+        state = self._install_state(
+            session_id, agent, cwd, model or getattr(agent, "model", "") or "", history,
+            persist=False,
             mode=restored_mode,
             effort=restored_effort,
             # Rehydrate the owner so forks of a restored session inherit it
@@ -1304,13 +1308,7 @@ class SessionManager:
                 else (restored_parent_id or None)
             ),
             subagent=is_subagent,
-            history=history,
-            cancel_event=threading.Event(),
         )
-        _apply_effort_to_agent(agent, restored_effort)
-        with self._lock:
-            self._sessions[session_id] = state
-        _register_task_cwd(session_id, cwd)
         logger.info("Restored ACP session %s from DB (%d messages)", session_id, len(history))
         return state
 
@@ -1521,7 +1519,8 @@ class SessionManager:
             "enabled_toolsets": list(enabled_toolsets),
             # agent.disabled_toolsets is subtracted at tool granularity by the agent, as on the CLI/gateway/cron.
             "disabled_toolsets": (list(disabled_toolsets) if disabled_toolsets is not None
-                                  else parse_config_string_list((config.get("agent") or {}).get("disabled_toolsets")) or None),
+                                  else [name.strip() for name in parse_config_string_list(
+                                      (config.get("agent") or {}).get("disabled_toolsets")) if name.strip()] or None),
             "model": model or default_model,
             "cwd": cwd,
             # Same chokepoint as the CLI/gateway/TUI/cron: without it ``agent.reasoning_effort: none`` never

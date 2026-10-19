@@ -1833,8 +1833,10 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             # Flip attached-but-not-owner panels back to idle (see the
             # matching running=True update above). Inside the finally so a
             # tail exception can't strand a client in steer mode.
-            await self._send_turn_status_update(state, running=False)
-        await self._drain_queued_prompts(state, session_id, conn)
+            try:
+                await self._send_turn_status_update(state, running=False)
+            finally:
+                await self._drain_queued_prompts(state, session_id, conn)
 
         # A steer arriving after the final tool batch cannot be injected into a
         # tool result. Run it as a follow-up after already-queued prompts instead
@@ -1900,12 +1902,16 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                         session_id,
                         exc_info=True,
                     )
+            prompt_kwargs = {}
+            if queued_synthetic:
+                prompt_kwargs["_synthetic_notification"] = True
+            if queued_sink is not None:
+                prompt_kwargs["_turn_completion_sink"] = queued_sink
             try:
                 await self.prompt(
                     prompt=[TextContentBlock(type="text", text=next_prompt)],
                     session_id=session_id,
-                    _synthetic_notification=queued_synthetic,
-                    _turn_completion_sink=queued_sink,
+                    **prompt_kwargs,
                 )
             except BaseException as exc:
                 interrupted = isinstance(exc, asyncio.CancelledError)
