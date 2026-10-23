@@ -37,6 +37,7 @@ from acp_adapter.events import (
     make_message_cb, make_step_cb, make_thinking_cb, make_tool_progress_cb, make_subagent_update_router,
 )
 from acp_adapter.model_catalog import build_model_state, encode_model_choice
+from acp_adapter.notifications import completion_output_seen_after_spawn
 from acp_adapter.permissions import make_approval_callback
 from acp_adapter.provenance import session_provenance_meta
 from acp_adapter.session import (SessionManager, SessionState, QueuedPrompt,
@@ -373,6 +374,12 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         # into sessions; started lazily from a running-loop context (see
         # _ensure_notification_watcher).
         self._notification_watcher_task: Optional[asyncio.Task] = None
+        # In-flight delivery turns keyed by target session id. The watcher
+        # schedules each delivery as its own task so one session's long turn
+        # can never head-of-line block completions for every other session;
+        # the dict is the per-session "busy" signal for the drain cycle and
+        # the strong reference that keeps the tasks alive.
+        self._notification_delivery_tasks: dict[str, asyncio.Task] = {}
         # Session ids already sent through the background title backfill —
         # one derive attempt per session per process, so a failing aux model
         # doesn't get hammered on every sessions-list refresh.
@@ -2931,92 +2938,6 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         except Exception:
             logger.exception("ACP notify: delivery turn failed for %s", session_id)
 
-    @staticmethod
-    def _completion_output_seen_after_spawn(state: SessionState, evt: dict) -> bool:
-        """Whether a successful process completion repeats evidence already seen.
-
-        A process notification may finish just after the agent independently
-        fetched the same result. Starting another full-context turn for that
-        duplicate payload is wasteful. Suppression requires positive provenance:
-
-        1. the event is a successful plain process completion;
-        2. the process id appears in an earlier tool result (the spawn boundary);
-        3. a later tool result contains either the complete output or an exact
-           structured status line proving ``state=complete`` and ``exit_code=0``.
-
-        Old matching text before the spawn boundary, user/assistant prose, empty
-        output, arbitrary partial overlap, and failures never qualify. If history
-        was compacted or the evidence is ambiguous, return False and preserve
-        normal delivery.
-        """
-        if evt.get("type") != "completion" or evt.get("exit_code") != 0:
-            return False
-        process_id = str(evt.get("session_id") or "").strip()
-        output = str(evt.get("output") or "")
-        if not process_id or not output.strip():
-            return False
-
-        messages = getattr(state.agent, "_session_messages", None)
-        if not isinstance(messages, list):
-            return False
-
-        def _content_text(content: Any) -> str:
-            if isinstance(content, str):
-                return content
-            try:
-                return json.dumps(content, ensure_ascii=False, default=str)
-            except (TypeError, ValueError):
-                # Defensive only: model-facing tool content should be JSON-safe,
-                # but a malformed/cyclic test double must never break delivery.
-                return repr(content)
-
-        def _appears_in(candidate: str, haystack: str) -> bool:
-            encoded = json.dumps(candidate, ensure_ascii=False)[1:-1]
-            return candidate in haystack or encoded in haystack
-
-        spawn_idx = None
-        for idx, message in enumerate(messages):
-            if not isinstance(message, dict) or message.get("role") != "tool":
-                continue
-            text = _content_text(message.get("content", ""))
-            if process_id in text:
-                spawn_idx = idx
-                break
-        if spawn_idx is None:
-            return False
-
-        later_tool_text = []
-        for message in messages[spawn_idx + 1 :]:
-            if not isinstance(message, dict) or message.get("role") != "tool":
-                continue
-            later_tool_text.append(_content_text(message.get("content", "")))
-        haystack = "\n".join(later_tool_text)
-        if not haystack:
-            return False
-
-        complete_output = output.strip()
-        if len(complete_output) >= 32 and _appears_in(complete_output, haystack):
-            return True
-
-        for raw_line in output.splitlines():
-            line = raw_line.strip()
-            if len(line) < 16 or not line.startswith("{"):
-                continue
-            try:
-                status = json.loads(line)
-            except (TypeError, ValueError):
-                continue
-            if not isinstance(status, dict):
-                continue
-            state_value = str(status.get("state") or status.get("status") or "").lower()
-            if state_value not in {"complete", "completed", "done", "success", "succeeded"}:
-                continue
-            if status.get("exit_code") != 0:
-                continue
-            if _appears_in(line, haystack):
-                return True
-        return False
-
     async def _drain_notification_cycle(self) -> None:
         """One drain pass over the process registry's completion queue.
 
@@ -3026,10 +2947,18 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         via ``_deliver_notification``.
 
         Delivery protocol: resolve target from ownership → require the target
-        IDLE → deliver. Busy targets are requeued so process wait/log can
-        still consume ordinary completions before they become synthetic turns.
-        Delegation events then claim → complete → deliver for at-most-once
+        IDLE (no running turn AND no in-flight delivery task) → schedule the
+        delivery. Busy targets are requeued so process wait/log can still
+        consume ordinary completions before they become synthetic turns.
+        Delegation events then claim → complete → schedule for at-most-once
         delivery. See the inline comments for why each step is ordered this way.
+
+        Deliveries are SCHEDULED, never awaited here: a delivery turn can run
+        for minutes, and awaiting it inline stalled the whole watcher, so a
+        completion for an idle session B sat unclaimed until session A's turn
+        ended (probe-confirmed head-of-line blocking). One task per target
+        session keeps same-session deliveries ordered; cross-session
+        deliveries run concurrently.
         """
         if not self._conn:
             # No client attached — leave events queued for when one is.
@@ -3063,14 +2992,20 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 process_registry.completion_queue.put(evt)
                 continue
             state = self.session_manager.get_in_memory(target)
-            if state is not None and state.is_running:
+            if (state is not None and state.is_running) or self._notification_delivery_in_flight(target):
                 # Keep the raw event retractable while its target turn runs.
                 # In particular, process wait/log may consume a completion
                 # before the next drain; drain_notifications can then suppress
                 # it instead of leaving a stale synthetic queued prompt.
+                # A scheduled-but-not-yet-started delivery task counts as busy
+                # too: its prompt() has not flipped is_running yet, and a
+                # second task for the same session would race it for the
+                # turn. Requeue (unclaimed) and let the next cycle retry once
+                # the first delivery has finished — same-session order and
+                # the single-claim guarantee both follow from this check.
                 process_registry.completion_queue.put(evt)
                 continue
-            if state is not None and self._completion_output_seen_after_spawn(state, evt):
+            if state is not None and completion_output_seen_after_spawn(state, evt):
                 logger.info(
                     "ACP notify: suppressed duplicate completion for %s after "
                     "matching process output already seen by the agent",
@@ -3087,8 +3022,8 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 claim = claim_event_delivery(evt, consumer)
                 if claim is None:
                     continue
-                # complete BEFORE deliver — deliberate at-most-once. The
-                # delivery turn below can run for MINUTES, and
+                # complete BEFORE scheduling delivery — deliberate at-most-once.
+                # The delivery turn can run for MINUTES, and
                 # claim_event_delivery lets any other consumer STEAL a claim
                 # older than 300s: complete-after-deliver provably
                 # double-delivers when a gateway/TUI restarts mid-turn
@@ -3098,34 +3033,89 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 # in-memory and idle, and _deliver_notification never raises,
                 # so a post-delivery completion could not detect failure
                 # anyway. Benign TOCTOU remains: if a user turn starts
-                # between the idle check above and the delivery below, the
-                # text lands in RAM queued_prompts after the row was
-                # completed — but that window is milliseconds (vs a whole
+                # between the idle check above and the delivery task's own
+                # check, the text lands in RAM queued_prompts after the row
+                # was completed — but that window is milliseconds (vs a whole
                 # turn before this fix) and the busy-requeue above keeps it
                 # from ever spanning a full turn.
                 complete_event_delivery(evt, claim)
-                await self._deliver_notification(target, text)
+                self._schedule_notification_delivery(target, text)
             else:
                 # Plain completion/watch_match/watch_disabled events are
                 # in-process only — no cross-process race, no durable row,
                 # no claim needed. The shared busy check above keeps completion
                 # events retractable until the target session is idle.
-                await self._deliver_notification(target, text)
+                self._schedule_notification_delivery(target, text)
+
+    def _notification_delivery_in_flight(self, session_id: str) -> bool:
+        """True while a scheduled delivery task for ``session_id`` is not done."""
+        task = self._notification_delivery_tasks.get(session_id)
+        return task is not None and not task.done()
+
+    def _schedule_notification_delivery(self, session_id: str, text: str) -> None:
+        """Run ``_deliver_notification`` as its own task on the running loop.
+
+        Called from the drain cycle, which has already verified the target is
+        idle and has no in-flight delivery (so at most one task per session
+        exists at any time). The task is tracked in
+        ``_notification_delivery_tasks`` until it finishes; the done callback
+        drops the entry and logs any escaped exception so a failed delivery
+        can neither go unnoticed ("Task exception was never retrieved") nor
+        affect the watcher or other sessions' deliveries.
+        """
+        task = asyncio.get_running_loop().create_task(
+            self._deliver_notification(session_id, text),
+            name=f"acp-notify-deliver:{session_id}",
+        )
+        self._notification_delivery_tasks[session_id] = task
+
+        def _on_done(done: asyncio.Task) -> None:
+            if self._notification_delivery_tasks.get(session_id) is done:
+                del self._notification_delivery_tasks[session_id]
+            if done.cancelled():
+                return
+            exc = done.exception()
+            if exc is not None:
+                logger.error(
+                    "ACP notify: delivery task for %s raised",
+                    session_id,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+
+        task.add_done_callback(_on_done)
+
+    async def _cancel_notification_deliveries(self) -> None:
+        """Cancel every in-flight delivery task and wait for them to settle.
+
+        Shutdown path for the watcher: the delivery tasks are owned by the
+        watcher, so cancelling it must not leave orphan delivery turns
+        running on the loop (and tests must not leak tasks across cases).
+        """
+        tasks = [t for t in self._notification_delivery_tasks.values() if not t.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._notification_delivery_tasks.clear()
 
     async def _notification_watcher(self) -> None:
         """Poll loop: drain completion events into sessions every interval.
 
         One failing cycle must never kill the loop — everything except
-        cancellation is logged and the loop keeps going.
+        cancellation is logged and the loop keeps going. Cancelling the
+        watcher also cancels the delivery tasks it scheduled.
         """
-        while True:
-            try:
-                await self._drain_notification_cycle()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("ACP notification watcher cycle failed")
-            await asyncio.sleep(self._NOTIFY_DRAIN_INTERVAL_SEC)
+        try:
+            while True:
+                try:
+                    await self._drain_notification_cycle()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("ACP notification watcher cycle failed")
+                await asyncio.sleep(self._NOTIFY_DRAIN_INTERVAL_SEC)
+        finally:
+            await self._cancel_notification_deliveries()
 
     def _ensure_notification_watcher(self) -> None:
         """Idempotently start (or resurrect) the notification watcher task.

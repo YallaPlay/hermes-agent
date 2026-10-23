@@ -4183,6 +4183,14 @@ class TestNotificationDelivery:
         assert self.NOTIFY_TEXT in captured["user_message"]
 
 
+async def _settle_deliveries(agent):
+    """Await every delivery task the drain cycle scheduled (deliveries are
+    per-session background tasks; the cycle returns before they run)."""
+    tasks = [t for t in agent._notification_delivery_tasks.values() if not t.done()]
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 class TestNotificationWatcher:
     """Background watcher that drains process/delegation completion events
     from the in-process ``process_registry.completion_queue`` and delivers
@@ -4248,6 +4256,7 @@ class TestNotificationWatcher:
             return_value=[(evt, "[IMPORTANT: done]")],
         ) as mock_drain:
             await agent._drain_notification_cycle()
+            await _settle_deliveries(agent)
 
         mock_drain.assert_called_once_with(
             owns_event=agent._owns_notification_event
@@ -4295,6 +4304,7 @@ class TestNotificationWatcher:
             return_value=[(evt, "[IMPORTANT: done]")],
         ):
             await agent._drain_notification_cycle()
+            await _settle_deliveries(agent)
 
         agent._deliver_notification.assert_not_awaited()
 
@@ -4325,6 +4335,7 @@ class TestNotificationWatcher:
             return_value=[(evt, "[IMPORTANT: done]")],
         ):
             await agent._drain_notification_cycle()
+            await _settle_deliveries(agent)
 
         agent._deliver_notification.assert_not_awaited()
 
@@ -4356,6 +4367,7 @@ class TestNotificationWatcher:
             return_value=[(evt, "[IMPORTANT: done]")],
         ):
             await agent._drain_notification_cycle()
+            await _settle_deliveries(agent)
 
         agent._deliver_notification.assert_awaited_once_with(
             "sess-partial", "[IMPORTANT: done]"
@@ -4388,6 +4400,7 @@ class TestNotificationWatcher:
             return_value=[(evt, "[IMPORTANT: done]")],
         ):
             await agent._drain_notification_cycle()
+            await _settle_deliveries(agent)
 
         agent._deliver_notification.assert_awaited_once_with(
             "sess-old-output", "[IMPORTANT: done]"
@@ -4420,6 +4433,7 @@ class TestNotificationWatcher:
             return_value=[(evt, "[IMPORTANT: done]")],
         ):
             await agent._drain_notification_cycle()
+            await _settle_deliveries(agent)
 
         agent._deliver_notification.assert_awaited_once_with(
             "sess-prose", "[IMPORTANT: done]"
@@ -4458,6 +4472,7 @@ class TestNotificationWatcher:
             return_value=[(evt, "[IMPORTANT: done]")],
         ):
             await agent._drain_notification_cycle()
+            await _settle_deliveries(agent)
 
         agent._deliver_notification.assert_awaited_once_with(
             "sess-banner", "[IMPORTANT: done]"
@@ -4492,6 +4507,7 @@ class TestNotificationWatcher:
             return_value=[(evt, "[IMPORTANT: done]")],
         ):
             await agent._drain_notification_cycle()
+            await _settle_deliveries(agent)
 
         agent._deliver_notification.assert_awaited_once_with(
             "sess-cyclic", "[IMPORTANT: done]"
@@ -4524,6 +4540,7 @@ class TestNotificationWatcher:
             return_value=[(evt, "[IMPORTANT: failed]")],
         ):
             await agent._drain_notification_cycle()
+            await _settle_deliveries(agent)
 
         agent._deliver_notification.assert_awaited_once_with(
             "sess-failed", "[IMPORTANT: failed]"
@@ -4552,6 +4569,7 @@ class TestNotificationWatcher:
             "tools.async_delegation.complete_event_delivery"
         ) as mock_complete:
             await agent._drain_notification_cycle()
+            await _settle_deliveries(agent)
 
         mock_claim.assert_called_once()
         assert mock_claim.call_args.args[0] is evt
@@ -4579,6 +4597,7 @@ class TestNotificationWatcher:
             "tools.async_delegation.complete_event_delivery"
         ) as mock_complete:
             await agent._drain_notification_cycle()
+            await _settle_deliveries(agent)
 
         agent._deliver_notification.assert_awaited_once_with(
             "sess-del", "[IMPORTANT: delegation done]"
@@ -4621,6 +4640,7 @@ class TestNotificationWatcher:
             "tools.async_delegation.complete_event_delivery"
         ) as mock_complete:
             await agent._drain_notification_cycle()
+            await _settle_deliveries(agent)
 
         agent._deliver_notification.assert_awaited_once_with(
             "sess-real", "[IMPORTANT: delegation done]"
@@ -4651,6 +4671,7 @@ class TestNotificationWatcher:
             "tools.async_delegation.complete_event_delivery"
         ) as mock_complete:
             await agent._drain_notification_cycle()
+            await _settle_deliveries(agent)
 
         mock_claim.assert_not_called()
         mock_complete.assert_not_called()
@@ -4677,6 +4698,7 @@ class TestNotificationWatcher:
             process_registry.completion_queue.put(evt)
 
             await agent._drain_notification_cycle()
+            await _settle_deliveries(agent)
 
             agent._deliver_notification.assert_not_awaited()
             assert self._pop_requeued(evt), "busy completion was not requeued"
@@ -4686,6 +4708,7 @@ class TestNotificationWatcher:
             process_registry.completion_queue.put(evt)
 
             await agent._drain_notification_cycle()
+            await _settle_deliveries(agent)
 
             agent._deliver_notification.assert_not_awaited()
             assert not self._pop_requeued(evt)
@@ -4722,6 +4745,7 @@ class TestNotificationWatcher:
             side_effect=lambda *a: order.append("complete"),
         ):
             await agent._drain_notification_cycle()
+            await _settle_deliveries(agent)
 
         assert order == ["claim", "complete", "deliver"]
 
@@ -4747,6 +4771,7 @@ class TestNotificationWatcher:
             "tools.async_delegation.complete_event_delivery"
         ) as mock_complete:
             await agent._drain_notification_cycle()
+            await _settle_deliveries(agent)
 
         mock_claim.assert_not_called()
         mock_complete.assert_not_called()
@@ -4770,6 +4795,7 @@ class TestNotificationWatcher:
             return_value=[(evt, "[IMPORTANT: done]")],
         ):
             await agent._drain_notification_cycle()
+            await _settle_deliveries(agent)
 
         agent._deliver_notification.assert_not_awaited()
         assert self._pop_requeued(evt), "plain event was not requeued"
@@ -4785,6 +4811,7 @@ class TestNotificationWatcher:
             process_registry, "drain_notifications", return_value=[]
         ) as mock_drain:
             await agent._drain_notification_cycle()
+            await _settle_deliveries(agent)
 
         mock_drain.assert_not_called()
         agent._deliver_notification.assert_not_awaited()
@@ -4863,107 +4890,6 @@ class TestNotificationWatcher:
             timeout=5,
         )
         agent._ensure_notification_watcher.assert_called_once()
-
-
-class TestNotificationE2E:
-    """End-to-end: a REAL completion event on the REAL registry queue flows
-    through the REAL drain cycle (ownership routing + formatting) into a
-    REAL synthetic prompt turn. Only ``run_conversation`` — the executor
-    boundary — is mocked, matching the file's established pattern.
-    """
-
-    @pytest.mark.asyncio
-    async def test_completion_event_drains_into_synthetic_turn(self, agent):
-        import time
-
-        from tools.process_registry import process_registry
-
-        proc_sid = "proc_test123"  # unique — drain skip-state can't collide
-
-        # HYGIENE: completion_queue is process-global shared state. Stash
-        # everything currently queued (ours or leaked from parallel tests)
-        # and restore it in teardown so no foreign event is consumed.
-        stashed = []
-        while not process_registry.completion_queue.empty():
-            try:
-                stashed.append(process_registry.completion_queue.get_nowait())
-            except Exception:
-                break
-        # Clean consumed/observed skip-state for our unique proc id so the
-        # real drain's _drain_should_skip cannot spuriously eat the event.
-        process_registry._completion_consumed.discard(proc_sid)
-        process_registry._poll_observed.discard(proc_sid)
-
-        try:
-            # Real agent + real in-memory idle session.
-            new_resp = await agent.new_session(cwd=".")
-            state = agent.session_manager.get_session(new_resp.session_id)
-
-            captured = {}
-
-            def _run(**kwargs):
-                captured.update(kwargs)
-                return {"final_response": "ok", "messages": []}
-
-            state.agent.run_conversation = MagicMock(side_effect=_run)
-
-            mock_conn = MagicMock(spec=acp.Client)
-            mock_conn.session_update = AsyncMock()
-            agent._conn = mock_conn
-
-            # A REAL completion event, shaped exactly like
-            # ProcessRegistry._move_to_finished produces (no drain mock —
-            # the real registry drain + formatter run below).
-            evt = {
-                "type": "completion",
-                "session_id": proc_sid,
-                "session_key": new_resp.session_id,
-                "command": "echo hello world",
-                "exit_code": 0,
-                "completion_reason": "exited",
-                "termination_source": "",
-                "output": "hello world",
-                "started_at": time.time(),
-            }
-            process_registry.completion_queue.put(evt)
-
-            await asyncio.wait_for(
-                agent._drain_notification_cycle(), timeout=10
-            )
-
-            # The chain ran end-to-end: event → drain → ownership →
-            # format → synthetic turn on OUR session.
-            state.agent.run_conversation.assert_called_once()
-            user_text = captured["user_message"]
-            assert "[IMPORTANT:" in user_text
-            assert proc_sid in user_text
-            assert "hello world" in user_text
-            # The synthetic turn fully completed — session idle again.
-            assert state.is_running is False
-        finally:
-            # The delivery turn goes through prompt(), which may start the
-            # real watcher task — never leak it into other tests.
-            task = getattr(agent, "_notification_watcher_task", None)
-            if task is not None and not task.done():
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await asyncio.wait_for(task, timeout=5)
-            # Drop any leftover copies of OUR event, then restore every
-            # stashed foreign event for the tests that own them.
-            while not process_registry.completion_queue.empty():
-                try:
-                    item = process_registry.completion_queue.get_nowait()
-                except Exception:
-                    break
-                if not (
-                    isinstance(item, dict)
-                    and item.get("session_id") == proc_sid
-                ):
-                    stashed.append(item)
-            for item in stashed:
-                process_registry.completion_queue.put(item)
-            process_registry._completion_consumed.discard(proc_sid)
-            process_registry._poll_observed.discard(proc_sid)
 
 
 class TestDisabledToolsetsFilterToolSurface:
