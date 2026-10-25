@@ -66,6 +66,7 @@ def _unregister_subagent(subagent_id: str, *, agent: Any = None) -> None:
         if not sid:
             return
         _recent_subagents[sid] = {k: record.get(k) for k in ("goal", "delegation_id", "owner_agent_session_id")}
+        _recent_subagents[sid]["finished_at"] = time.time()
         while len(_recent_subagents) > _RECENT_SUBAGENTS_CAP:
             _recent_subagents.pop(next(iter(_recent_subagents)), None)
 
@@ -273,6 +274,17 @@ def _handle_control_action(action: str, subagent_id: Optional[str], message: Opt
         return tool_error(f"action='{action}' requires subagent_id (from the spawn dispatch response or action='list').")
     with _active_subagents_lock:
         record = _active_subagents.get(sid)
+        recent = _recent_subagents.get(sid)
+    if record is None and recent is not None and _owns_subagent_record(recent, parent_agent):
+        # Idempotent on a finished child: the model asked for a result it already has. An error here only
+        # triggers a steer/list/steer retry chain; a plain status answers the real question.
+        return json.dumps({
+            "action": action, "subagent_id": sid, "status": "finished",
+            "finished_at": recent.get("finished_at"), "goal": recent.get("goal"),
+            "note": "This child already finished. Its result was delivered to this conversation as a completion "
+                    "message; read it from history instead of steering or stopping. Re-delegate a follow-up task if "
+                    "more work is needed.",
+        }, ensure_ascii=False)
     if record is None or not _owns_subagent_record(record, parent_agent):
         return tool_error(
             f"No live subagent '{sid}' in this conversation's spawn tree. It "

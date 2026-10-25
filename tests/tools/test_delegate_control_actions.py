@@ -170,6 +170,42 @@ def test_steer_closed_acceptance_is_refused():
         _unregister_subagent("sid-ctl-steer-4")
 
 
+@pytest.mark.parametrize("action", ["steer", "stop"])
+def test_control_on_finished_owned_child_reports_finished_not_error(action):
+    import tools.delegate_tool_registry as dt
+
+    parent = _StubParent()
+    parent.session_id = "sess-ctl-fin-1"
+    child = _StubChild(parent)
+    _register("sid-ctl-fin-1", child, owner_agent_session_id="sess-ctl-fin-1")
+    _unregister_subagent("sid-ctl-fin-1")  # child finished; only the recent stub remains
+    try:
+        out = json.loads(_handle_control_action(action, "sid-ctl-fin-1", "late words", parent))
+        assert "error" not in out
+        assert out["status"] == "finished"
+        assert out["subagent_id"] == "sid-ctl-fin-1"
+        assert out["goal"] == "test goal"
+        assert isinstance(out["finished_at"], float)
+        assert child.steered == []
+    finally:
+        dt._recent_subagents.pop("sid-ctl-fin-1", None)
+
+
+def test_control_on_finished_foreign_child_is_still_refused():
+    import tools.delegate_tool_registry as dt
+
+    parent = _StubParent()
+    parent.session_id = "sess-ctl-fin-mine"
+    foreign = _StubChild(_StubParent())
+    _register("sid-ctl-fin-2", foreign, owner_agent_session_id="sess-ctl-fin-theirs")
+    _unregister_subagent("sid-ctl-fin-2")
+    try:
+        out = _handle_control_action("steer", "sid-ctl-fin-2", "hijack", parent)
+        assert "No live subagent" in out
+    finally:
+        dt._recent_subagents.pop("sid-ctl-fin-2", None)
+
+
 # ---------------------------------------------------------------------------
 # action='stop'
 # ---------------------------------------------------------------------------
