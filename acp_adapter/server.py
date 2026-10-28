@@ -1603,6 +1603,9 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             return await self._finish_turn(
                 state, session_id, conn, result, pre_turn_hermes_id, cbs.streamed,
                 user_content=user_content, completion_sink=completion_sink,
+                # Must match the ``persist_user_message`` given to run_conversation:
+                # the agent rewrites the live text user row to it.
+                persisted_user_content=user_text or "[Image attachment]",
             )
         except BaseException as exc:
             # Reset (idempotent if an inner handler already did) and flip any
@@ -1720,7 +1723,8 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
     async def _finish_turn(self, state: SessionState, session_id: str, conn: Any, result: dict,
                            pre_turn_hermes_id: Any, streamed_message: bool, *,
-                           user_content: Any = None, completion_sink: Any = None) -> PromptResponse:
+                           user_content: Any = None, completion_sink: Any = None,
+                           persisted_user_content: Any = None) -> PromptResponse:
         leftover_steer = result.get("pending_steer")
 
         # Absolute index of this turn's user message in the post-turn history,
@@ -1738,6 +1742,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             result.get("messages"),
             user_content,
             getattr(state.agent, "_persist_user_message_idx", None),
+            persisted_user_content,
         )
 
         # The whole post-turn tail below runs BEFORE ``state.is_running`` is
@@ -3250,7 +3255,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
     @staticmethod
     def _final_user_history_index(
-        messages: Any, user_content: Any, agent_idx: Any
+        messages: Any, user_content: Any, agent_idx: Any, persisted_content: Any = None
     ) -> int | None:
         """Absolute index of this turn's user message in the FINALIZED history.
 
@@ -3269,6 +3274,10 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         the message cannot be located (e.g. compression merged it into a
         summary), in which case the meta stamp is omitted and the client
         falls back to a full-history fork.
+
+        ``persisted_content`` is the ``persist_user_message`` override. The
+        agent rewrites a text user row to it (stripped text, no owner note),
+        so the row may equal it instead of ``user_content``.
         """
         if isinstance(agent_idx, bool) or not isinstance(agent_idx, int) or agent_idx < 0:
             return None
@@ -3280,7 +3289,10 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             if (
                 isinstance(msg, dict)
                 and msg.get("role") == "user"
-                and msg.get("content") == user_content
+                and (
+                    msg.get("content") == user_content
+                    or (persisted_content is not None and msg.get("content") == persisted_content)
+                )
             ):
                 return idx
         return None

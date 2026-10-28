@@ -2225,6 +2225,37 @@ class TestPrompt:
         assert resp.field_meta == {"hermes": {"userHistoryIndex": 2}}
 
     @pytest.mark.asyncio
+    async def test_prompt_user_history_index_matches_persisted_stripped_text(self, agent):
+        """A prompt with trailing whitespace is stored stripped (the
+        ``persist_user_message`` override). The stamp must still resolve, or
+        the client forks the full history instead of the earlier turn."""
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        def _run(*_args, **_kwargs):
+            state.agent._persist_user_message_idx = 2
+            return {
+                "final_response": "sure",
+                "messages": [
+                    {"role": "user", "content": "earlier"},
+                    {"role": "assistant", "content": "earlier reply"},
+                    {"role": "user", "content": "now"},
+                    {"role": "assistant", "content": "sure"},
+                ],
+            }
+
+        state.agent.run_conversation = MagicMock(side_effect=_run)
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        resp = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="now \n")],
+            session_id=new_resp.session_id,
+        )
+        assert resp.field_meta == {"hermes": {"userHistoryIndex": 2}}
+
+    @pytest.mark.asyncio
     async def test_prompt_omits_user_history_index_when_unavailable(self, agent):
         """No _persist_user_message_idx (e.g. a bare turn) → no _meta stamp."""
         new_resp = await agent.new_session(cwd=".")
