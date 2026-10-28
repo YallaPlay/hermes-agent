@@ -1649,6 +1649,34 @@ def test_drain_notifications_completion_callback_exception_fails_closed(registry
     assert registry.completion_queue.empty()
 
 
+def _heartbeat_event(sid, seq):
+    return {"type": "heartbeat", "session_id": sid, "seq": seq, "interval": 60,
+            "elapsed": seq * 60, "command": "long-job", "output": f"beat {seq}\n"}
+
+
+def test_drain_notifications_drops_heartbeats_of_an_exited_process(registry):
+    """A heartbeat backlog requeued behind a long busy turn must not replay as
+    "still running" turns after the process already exited."""
+    registry._finished["proc_done"] = _make_session(sid="proc_done", exited=True, exit_code=0)
+    for seq in (1, 2, 3):
+        registry.completion_queue.put(_heartbeat_event("proc_done", seq))
+
+    assert registry.drain_notifications() == []
+    assert registry.completion_queue.empty()
+
+
+def test_drain_notifications_keeps_only_newest_heartbeat_per_process(registry):
+    registry._running["proc_live"] = _make_session(sid="proc_live")
+    registry._running["proc_other"] = _make_session(sid="proc_other")
+    for seq in (1, 2, 3):
+        registry.completion_queue.put(_heartbeat_event("proc_live", seq))
+    registry.completion_queue.put(_heartbeat_event("proc_other", 1))
+
+    results = registry.drain_notifications()
+
+    assert [(e["session_id"], e["seq"]) for e, _ in results] == [("proc_live", 3), ("proc_other", 1)]
+
+
 def test_drain_notifications_filters_async_delegation_by_session_key():
     """Async-delegation events should only be consumed by the matching session's drain.
 

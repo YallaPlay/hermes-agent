@@ -1962,6 +1962,16 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                         "type=%s session_id=%s task_id=%s",
                         evt.get("type", "completion"), _evt_sid, _evt_task_id)
                     continue
+            if evt.get("type") == "heartbeat":
+                # A heartbeat says "still running"; once the process exited (or a newer
+                # heartbeat is pending) it is false or superseded. Delivered anyway, a backlog
+                # requeued behind a long busy turn replays as one stale model turn per beat.
+                with self._lock:
+                    still_running = _evt_sid in self._running
+                if not still_running:
+                    continue
+                results = [(e, t) for e, t in results
+                           if not (e.get("type") == "heartbeat" and e.get("session_id") == _evt_sid)]
             if text := format_process_notification(evt):
                 results.append((evt, text))
         for evt in requeue:
