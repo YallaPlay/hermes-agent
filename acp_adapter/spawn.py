@@ -35,24 +35,12 @@ SPAWN_SESSION_TOOL_SCHEMA: dict[str, Any] = {
     "function": {
         "name": SPAWN_SESSION_TOOL_NAME,
         "description": (
-            "Spawn a NEW derived, clean-context Hermes session inside this "
-            "running ACP server and start its first turn immediately in the "
-            "background. The new session is INDEPENDENT: it is shown next to "
-            "this one in the sidebar, but it records no parent and does not "
-            "copy this conversation history. "
-            "Returns the new session id right away. The spawned session owns "
-            "its work and reports to the user, not back here; pass "
-            "deliver_result_to_parent=true only if you deliberately need its "
-            "first-turn result returned to you. For work that must report back, "
-            "use delegate_task, whose subagents are real children. "
-            "Do not poll for completion. The session appears in the VS Code "
-            "sessions sidebar with live streaming and steer support. Use for "
-            "handoff/continuation sessions that should stay visible in this "
-            "window. NOT durable across a window reload: the spawned turn "
-            "dies with this ACP process — for walk-away work use the "
-            "detached CLI spawn instead. If the spawned session will WRITE "
-            "to a repo, give it its own worktree via the prompt; two "
-            "sessions writing one checkout collide."
+            "Start an independent, clean-context ACP session for a visible handoff or continuation. "
+            "Returns its ID immediately; work starts in the background, with sidebar streaming and steer support. "
+            "It has no parent or shared history and reports to the user by default. "
+            "Prefer delegate_task for work that must report back. Do not poll for completion. "
+            "Window reload or ACP process exit kills the turn; use detached CLI spawn for durable work. "
+            "Give repo-writing sessions their own worktree in the prompt."
         ),
         "parameters": {
             "type": "object",
@@ -75,12 +63,8 @@ SPAWN_SESSION_TOOL_SCHEMA: dict[str, Any] = {
                 "title": {
                     "type": "string",
                     "description": (
-                        "Session title (max 100 chars). You know what the "
-                        "spawned work is — name it so the sessions sidebar "
-                        "shows meaningful text immediately instead of "
-                        "waiting for post-first-turn auto-titling. "
-                        "Deduplicated with a #N suffix on collision; "
-                        "stamping is best-effort and never fails the spawn."
+                        "Descriptive sidebar title, max 100 chars. Collisions get a #N suffix; "
+                        "title assignment is best-effort and cannot fail the spawn."
                     ),
                 },
                 "provider": {
@@ -100,13 +84,8 @@ SPAWN_SESSION_TOOL_SCHEMA: dict[str, Any] = {
                 "deliver_result_to_parent": {
                     "type": "boolean",
                     "description": (
-                        "Return the spawned first-turn result to the spawning "
-                        "session. Defaults to FALSE, because a spawned session is "
-                        "independent (parent_session_id is NULL) and owns its own "
-                        "work. Set true only when you deliberately want the first "
-                        "turn reported back, for example a spawned probe whose "
-                        "answer the spawner needs; for parented work whose result "
-                        "must return, use delegate_task instead."
+                        "Return the first-turn result here. Default false; set true only when you need that result. "
+                        "The session remains independent, not a delegated child."
                     ),
                 },
             },

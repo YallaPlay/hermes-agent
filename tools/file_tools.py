@@ -1172,7 +1172,7 @@ READ_FILE_SCHEMA = {
 
 WRITE_FILE_SCHEMA = {
     "name": "write_file",
-    "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. For an EXISTING file, call read_file first: write_file refuses (file untouched) when this task has no current full read/write of the file or the file changed on disk since; on refusal, read_file, merge, then retry. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out). The result's verified:true means the on-disk content hash was confirmed — do NOT re-read the file to check the write landed.",
+    "description": "Create or fully replace a file; creates parent directories. Prefer patch for targeted edits. Read existing files fully first. Missing or stale read/write state causes refusal without changes; re-read, merge, then retry. Runs applicable syntax checks and reports only newly introduced errors. verified:true confirms the saved content hash; do not re-read to verify the write.",
     "parameters": {
         "type": "object",
         "properties": {

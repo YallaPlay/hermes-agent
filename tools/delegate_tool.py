@@ -668,33 +668,19 @@ def _build_top_level_description(*, independent_completions=None) -> str:
     return _DESCRIPTION_HEAD.format(delivery=delivery) + restrictions_rule + _DESCRIPTION_TAIL
 
 _DESCRIPTION_HEAD = (
-    "Spawn subagents in isolated contexts; each gets its own conversation, terminal session, and toolset, and only its "
-    "final summary returns to you. Pass every task in `tasks` — one entry spawns one subagent, several run in parallel "
-    "(limit in the tasks description).\n\n"
-    "Required results return in this tool call by default; use them before finalizing. Set "
-    "completion_policy='deferred' only when the current answer does not depend on the results. "
-    "Deferred work returns live transcript paths and results re-enter as a new message when subagents finish "
-    "({delivery}). Sessions without a later-result consumer (including one-shot CLI and cron) join children "
-    "and return results in this tool call even for deferred work. Deferred results are delivered only BETWEEN "
-    "your turns: finish whatever does not depend on them, then END YOUR TURN. Never wait or poll on "
-    "transcripts, artifact files, or CI for a deferred child. "
-    "While children run, `action` (list/steer/stop) controls them live.\n\n"
-    "USE FOR: reasoning-heavy subtasks, work that would flood your context, or independent parallel workstreams.\n"
-    "DO NOT USE FOR (use these instead):\n"
-    "- Mechanical multi-step work with no reasoning needed -> execute_code\n"
-    "- A single tool call -> call the tool directly\n"
-    "- Tasks needing user interaction -> subagents cannot ask questions\n"
-    "- Durable work that must survive this session -> cronjob or terminal(background=True, notify=True); /stop, /new, "
-    "or process exit halts running subagents (whole tree); each returns an 'interrupted' completion with partial output.\n\n"
-    "RULES:\n"
-    "- Children know nothing of this conversation: pass everything needed via 'context', including any required "
-    "output language, tone, or style (e.g. \"respond in Chinese\").\n"
-    "- Child summaries are SELF-REPORTS, not verified facts: a child claiming \"uploaded successfully\" or "
-    "\"file written\" may be wrong. For external side effects (uploads, remote writes, publishing), require a "
-    "verifiable handle (URL, ID, absolute path) and verify it yourself before telling the user the operation "
-    "succeeded.\n"
-    "- Children cannot close tracked work: a child asked to close it returns findings instead; "
-    "the parent applies the transition.\n"
+    "Delegate reasoning-heavy, context-heavy, or parallel work to isolated subagents. Each has its own "
+    "conversation, terminal and tools; only its final summary returns. Use execute_code for mechanical "
+    "batches and direct calls for single tools. Children cannot ask the user questions.\n\n"
+    "Use required results before finalizing. Choose deferred only when this answer does not need the results. "
+    "Deferred calls return transcript paths; completions arrive BETWEEN turns ({delivery}). Finish independent "
+    "work, then END YOUR TURN. Never wait or poll transcripts, artifacts or CI for deferred children. "
+    "Without a later-result consumer (including one-shot CLI and cron), even deferred calls wait and return results.\n\n"
+    "Not durable: /stop, /new or process exit halts the whole child tree, with interrupted completions and "
+    "partial output. Use cronjob or terminal(background=True, notify=True) for durable work.\n\n"
+    "- Pass all needed context, including output language, tone and style; children have no conversation history.\n"
+    "- Summaries are self-reports. For external side effects, require a URL, ID or absolute path and verify "
+    "the result yourself before claiming success.\n"
+    "- Children return findings, not tracked-work closures; the parent applies the transition.\n"
 )
 _DESCRIPTION_TAIL = (
     "- Children inherit the parent model unless pinned via delegation.provider / delegation.model in config.yaml."
@@ -707,10 +693,8 @@ def _build_tasks_param_description() -> str:
     except Exception:
         max_children = _DEFAULT_MAX_CONCURRENT_CHILDREN
     return (
-        f"The task(s), up to {max_children} in parallel for this user (set "
-        "via delegation.max_concurrent_children). Each entry spawns one "
-        "subagent with isolated context and terminal session; a single task "
-        "is a one-entry array. Required when spawning."
+        f"Required for spawn: one entry per child, up to {max_children} in parallel "
+        "(delegation.max_concurrent_children). Use a one-entry array for a single task."
     )
 
 def _build_dynamic_schema_overrides() -> dict:

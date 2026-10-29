@@ -879,15 +879,14 @@ _TOOL_DOC_LINES = [
     ("web_search", "  web_search(query: str, limit: int = 5) -> dict\n"
      "    Returns {\"data\": {\"web\": [{\"url\", \"title\", \"description\"}, ...]}}"),
     ("web_extract", "  web_extract(urls: list[str], char_limit: int = None) -> dict\n"
-     "    Returns {\"results\": [{\"url\", \"title\", \"content\", \"error\"}, ...]} where content is markdown.\n"
-     "    No LLM summarization. Pages over char_limit (default 15000) are head+tail truncated; full text stored on disk (path in the content footer)."),
+     "    Returns {\"results\": [{\"url\", \"title\", \"content\", \"error\"}, ...]}; content is unsummarized markdown.\n"
+     "    Over char_limit (default 15000): head/tail plus full-text file path in footer."),
     ("read_file", "  read_file(path: str, offset: int = 1, limit: int = 2000) -> dict\n"
      "    Lines are 1-indexed. Returns {\"content\": \"...\", \"total_lines\": N}"),
-    ("write_file", "  write_file(path: str, content: str) -> dict\n    Always overwrites the entire file; an existing file must be read_file'd first or the write is refused."),
+    ("write_file", "  write_file(path: str, content: str) -> dict\n    Full replacement; read existing files first or the write is refused."),
     ("search_files", "  search_files(pattern: str, target=\"content\", path=\".\", file_glob=None, limit=50, order=\"discovery\") -> dict\n"
-     "    target: \"content\" (search inside files) or \"files\" (find files by name). Returns {\"matches\": [...]}"),
-    ("patch", "  patch(path: str, old_string: str, new_string: str, replace_all: bool = False) -> dict\n"
-     "    Replaces old_string with new_string in the file."),
+     "    target: \"content\" or \"files\" (names). Returns {\"matches\": [...]}"),
+    ("patch", "  patch(path: str, old_string: str, new_string: str, replace_all: bool = False) -> dict"),
     ("terminal", "  terminal(command: str, timeout=None, workdir=None) -> dict\n"
      "    Foreground only (no background/pty). Returns {\"output\": \"...\", \"exit_code\": N}"),
 ]
@@ -907,40 +906,29 @@ def build_execute_code_schema(enabled_sandbox_tools: set | None = None,
     import_str = ", ".join(import_examples) + ", ..." if import_examples else "..."
     if mode == "strict":
         cwd_note = (
-            "Scripts run in their own temp dir, not the session's CWD — pass "
-            "absolute paths for any file that lives outside the session's "
-            "working directory, or use terminal()/read_file() to reach it."
+            "Runs in a separate temp directory, not the session cwd. "
+            "Use absolute paths or terminal()/read_file() for session files."
         )
     else:
         cwd_note = (
-            "Scripts run in the session's working directory. Interpreter: "
-            "the project's activated venv/conda python when one is active "
-            "(VIRTUAL_ENV/CONDA_PREFIX — matches terminal()); otherwise "
-            "Hermes's own python (the common case — stdlib plus Hermes's "
-            "deps; check `import x` before relying on project packages)."
+            "Runs in the session cwd with the active venv/conda Python (VIRTUAL_ENV/CONDA_PREFIX), "
+            "otherwise Hermes's Python. Check imports before relying on project packages."
         )
     # Remote hosts that fail open to per-call are not worth schema words; the result's
     # `kernel` field tells the truth per call.
     # Session kernels are always on (kernel_mode retired in #96787): persistence is part of the tool's one
     # description, not a bolt-on paragraph behind a dead conditional.
     description = (
-        "Run Python that calls Hermes tools programmatically. Use when you "
-        "need 3+ tool calls with logic between them: filtering/reducing "
-        "large outputs before they enter context, branching, or loops "
-        "(N pages/files, retry on failure). Use normal tool calls for "
-        "single calls, results you must reason over in full, or anything needing user interaction.\n\n"
-        "Calls run in a persistent session kernel: variables, imports, and "
-        "loaded data survive across execute_code calls, so build on earlier "
-        "work instead of re-loading it. A timed-out or interrupted call loses that state.\n\n"
+        "Run Python for 3+ tool calls with loops, branches or output filtering. "
+        "Use direct calls for single tools, results requiring full reasoning, or user interaction. "
+        "The session kernel preserves variables, imports and data between calls; reuse them. "
+        "Timeout or interruption loses that state.\n\n"
         f"Available via `from hermes_tools import ...`:\n\n"
         f"{tool_lines}\n\n"
-        "Limits: 5-minute timeout, max 50 tool calls per call. Stdout over "
-        "50KB shows head/tail inline; the FULL text is auto-saved to a file whose path rides in the result.\n\n"
+        "Limits: 5 minutes, 50 tool calls. Stdout over 50KB shows head/tail plus a full-output file path.\n\n"
         f"{cwd_note}\n\n"
-        "Helpers require imports: `from hermes_tools import json_parse, shell_quote, retry`. "
-        "json_parse(text) — tolerant "
-        "json.loads for terminal() output; shell_quote(s) — shlex.quote for "
-        "dynamic shell args; retry(fn, max_attempts=3, delay=2) — exponential backoff."
+        "Import helpers from hermes_tools: json_parse(text) tolerates terminal JSON; "
+        "shell_quote(s) quotes shell arguments; retry(fn, max_attempts=3, delay=2) uses exponential backoff."
     )
     return {
         "name": "execute_code",
