@@ -68,18 +68,6 @@ runs, with CI's pinned tools; `--install-hook pre-push` runs it on every push (r
 pulling to refresh the hook). `# noqa` does not waive a ratchet finding:
 `# health: allow <RULE> -- <why>` does.
 
-### Worktree Policy (YallaPlay fork-local)
-
-Do not build features on the shared `main` checkout — it is the LIVE agent
-checkout and multiple sessions commit to it concurrently. For ANY feature work
-(even single-commit, since another session's WIP is often sitting dirty here),
-spin up a worktree: `bash /home/ubuntu/git/yallaplay-claudio-hermes/scripts/new_worktree.sh runtime <slug>`
-(branches off a freshly-fetched `origin/main`, dir `~/.hermes/hermes-agent-wt-<slug>`,
-shares this checkout's venv via the run_tests.sh probe above). Commit there,
-push the branch, merge back to `origin/main` by fast-forward or PR, then
-`--remove`. Never touch `tui_gateway`/other files carrying a sibling session's
-uncommitted WIP on the main checkout.
-
 ## Project Structure
 
 Counts shift constantly; the filesystem is canonical. Load-bearing entry points:
