@@ -450,6 +450,34 @@ def _attachment_only_opener(message: str) -> bool:
     return not residual.strip()
 
 
+_SLACK_TITLE_CONTEXT_RE = re.compile(
+    r"\A\[(Slack runtime context|channel instructions(?: UPDATED)?|thread context|channel context)"
+    r"[^\w\n][^\n]*\n.*?^\[/\1\][ \t]*(?:\n|$)",
+    re.MULTILINE | re.DOTALL,
+)
+_SLACK_TITLE_JOB_RE = re.compile(
+    r"\A\[Scheduled-job context[^\n]*\]\n.*?(?=^\[(?:thread context|channel context|slack user )|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+
+
+def _slack_title_request(message: str) -> str:
+    """Strip Slack transport prefixes before the title budget, not from agent history."""
+    text = message.strip()
+    if not text.startswith(("[Slack runtime context]", "[Slack turn tag:")):
+        return text
+    text = re.sub(r"\A\[Slack turn tag:[^\n]*\](?:\n|$)", "", text).lstrip()
+    while text:
+        context = _SLACK_TITLE_CONTEXT_RE.match(text) or _SLACK_TITLE_JOB_RE.match(text)
+        if not context:
+            break
+        text = text[context.end():].lstrip()
+    # Match the first header AFTER context, never a quoted header in the request.
+    header = re.match(r"\A\[slack user [A-Z0-9]+\][ \t]*", text)
+    # A marker alone does not prove transport provenance; preserve ordinary prose.
+    return text[header.end():] if header else (message if text else "")
+
+
 def _summarize_user_message(user_message: str) -> str:
     """Text worth titling: describe a ``/skill`` invocation (it embeds the whole skill body), then strip wrappers."""
     if not user_message:
@@ -460,7 +488,7 @@ def _summarize_user_message(user_message: str) -> str:
         described = describe_skill_invocation(user_message)
     except Exception:
         logger.debug("Skill-scaffolding summary failed; titling raw", exc_info=True)
-    return strip_control_wrappers(user_message if described is None else described)
+    return _slack_title_request(strip_control_wrappers(user_message if described is None else described))
 
 
 def build_title_input(user_message: str, title_preview: str | None = None) -> str:
