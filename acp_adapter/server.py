@@ -1271,6 +1271,9 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         os.environ, so concurrent workers can't race a global flag onto the non-interactive
         auto-approve path (GHSA-96vc-wcxf-jjff)."""
         agent = state.agent
+        # Owner first, so "My Sessions" lists the session and its delegate
+        # children while the first turn runs, not only after it ends.
+        self.session_manager.claim_owner_for_turn(session_id)
         with contextlib.ExitStack() as stack:
             # HERMES_SESSION_KEY scopes per-session caches (interactive sudo password) to this
             # session, not the reused thread. ``cwd`` pins what the system prompt reports as the

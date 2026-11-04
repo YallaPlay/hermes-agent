@@ -1355,6 +1355,35 @@ class SessionManager:
             logger.debug("Failed to set owner on %s", session_id, exc_info=True)
             return False
 
+    def claim_owner_for_turn(self, session_id: str) -> None:
+        """Put the session owner on its DB row before a turn starts.
+
+        The agent creates the row early in its first turn, but without the
+        owner. ``_persist`` adds the owner only when the turn ends, so during a
+        long first turn the strict "My Sessions" filter hides the session and
+        every delegate child nested under it. A pre-created row is safe: the
+        agent's later upsert never overwrites ``user_id`` and fills the other
+        columns through COALESCE. An owner already on the row always wins.
+        """
+        with self._lock:
+            state = self._sessions.get(session_id)
+        if state is None or getattr(state, "subagent", False):
+            return
+        owner = str(getattr(state, "owner", "") or "").strip()
+        db = self._get_db() if owner else None
+        if db is None:
+            return
+        try:
+            existing = db.get_session(session_id)
+            if existing is None:
+                db.create_session(
+                    session_id=session_id, source="acp", user_id=owner, cwd=state.cwd,
+                )
+            elif not str(existing.get("user_id") or "").strip():
+                db.set_session_owner(session_id, owner)
+        except Exception:
+            logger.debug("Failed to claim ACP session owner for %s", session_id, exc_info=True)
+
     def promote_session(self, session_id: str) -> bool:
         """Detach an idle ACP fork from its display parent.
 

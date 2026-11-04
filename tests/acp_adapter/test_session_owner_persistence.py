@@ -7,7 +7,13 @@ create-time ``user_id`` write never runs and the session persists untagged,
 invisible behind the strict "My Sessions" filter.
 """
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
+import acp
+import pytest
+from acp.schema import TextContentBlock
+
+from acp_adapter.server import HermesACPAgent
 from acp_adapter.session import SessionManager
 from hermes_state import SessionDB
 
@@ -44,4 +50,40 @@ def test_persist_never_overwrites_an_owner_already_on_the_row(tmp_path):
 
     # Backfill fills a gap; it is not an ownership transfer.
     assert db.get_session(state.session_id)["user_id"] == "someone.else@yallaplay.com"
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_first_turn_row_is_owned_while_the_turn_runs(tmp_path):
+    # The end-of-turn backfill is too late for a long first turn: until it
+    # lands, "My Sessions" hides the session and its delegate children.
+    db = SessionDB(tmp_path / "state.db")
+    manager = SessionManager(db=db, agent_factory=lambda: MagicMock(name="MockAIAgent"))
+    server = HermesACPAgent(session_manager=manager)
+    server._conn = MagicMock(spec=acp.Client)
+    server._conn.session_update = AsyncMock()
+    owner = "me@yallaplay.com"
+    resp = await server.new_session(cwd=str(tmp_path), hermes={"owner": owner})
+    state = manager.get_session(resp.session_id)
+    seen = {}
+
+    def _run(*args, **kwargs):
+        # The agent's _ensure_db_session: creates the row with no owner.
+        db.create_session(session_id=resp.session_id, source="acp", model="test-model")
+        db.append_message(session_id=resp.session_id, role="user", content="go")
+        db.create_session(
+            session_id="child", source="subagent", parent_session_id=resp.session_id,
+        )
+        seen["owner"] = db.get_session(resp.session_id)["user_id"]
+        seen["child_owner"] = db.get_session("child")["user_id"]
+        seen["listed"] = [row["session_id"] for row in manager.list_sessions(owner=owner)]
+        return {"final_response": "ok", "messages": []}
+
+    state.agent.run_conversation = _run
+    state.agent.model = "test-model"
+    await server.prompt(prompt=[TextContentBlock(type="text", text="go")], session_id=resp.session_id)
+
+    assert seen["owner"] == owner
+    assert seen["child_owner"] == owner
+    assert resp.session_id in seen["listed"]
     db.close()
