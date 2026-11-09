@@ -728,7 +728,8 @@ class TestSessionOps:
         assert completions["c2"].field_meta is None
 
     @pytest.mark.asyncio
-    async def test_load_session_replays_native_plan_for_persisted_todo_tool(self, agent):
+    @pytest.mark.parametrize("tool_name", ["todo", "todo_list"])
+    async def test_load_session_replays_native_plan_for_persisted_todo_tool(self, agent, tool_name):
         """Persisted todo tool results should rebuild Zed's native plan panel."""
         mock_conn = MagicMock(spec=acp.Client)
         mock_conn.session_update = AsyncMock()
@@ -745,7 +746,7 @@ class TestSessionOps:
                         "id": "call_todo_1",
                         "type": "function",
                         "function": {
-                            "name": "todo",
+                            "name": tool_name,
                             "arguments": '{"todos":[{"id":"ship","content":"Ship it","status":"in_progress"}]}',
                         },
                     }

@@ -47,6 +47,7 @@ from agent.context_compressor import (COMPRESSED_SUMMARY_METADATA_KEY, ContextCo
 from agent.history_media import image_bytes_from_ref, image_refs_from_message, inline_image_bytes_from_content
 from agent.interrupt_compat import request_hard_interrupt
 from tools.approval_context import reset_hermes_interactive_context, set_hermes_interactive_context
+from tools.todo_tool import is_todo_tool_name
 
 logger = logging.getLogger(__name__)
 
@@ -899,7 +900,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                     complete.field_meta = {"hermes": {"timestamp": timestamp}}
                 if not await _send(complete):
                     return
-                if tool_name == "todo":
+                if is_todo_tool_name(tool_name):
                     plan_update = _build_plan_update_from_todo_result(result_text)
                     if plan_update is not None and not await _send(plan_update):
                         return
