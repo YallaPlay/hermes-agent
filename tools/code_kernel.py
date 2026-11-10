@@ -59,6 +59,8 @@ _CELL_SPILL_READ_CAP = 4 * _RUNNER_SPILL_CHARS + 4096
 # persistent GLOBALS namespace, build the payload. `__name__` is `__main__` as on the per-call path.
 RUNNER_CELL_SOURCE = '''\
 GLOBALS = {"__name__": "__main__", "__builtins__": __builtins__}
+# Only terminal-initiated cwd changes override Python's own os.chdir between cells.
+_LAST_TERMINAL_CWD = None
 
 
 def _clip(text):
@@ -104,6 +106,7 @@ def _scan_edited_modules(report):
 
 def run_cell(request, execution_count):
     """Exec one cell; returns (response payload, FULL stdout text)."""
+    global _LAST_TERMINAL_CWD
     out, err = io.StringIO(), io.StringIO()
     status, trace = "ok", ""
     # An imported module keeps the code it was loaded with: name the ones edited on disk since
@@ -111,8 +114,10 @@ def run_cell(request, execution_count):
     stale_modules = _scan_edited_modules(True)
     try:
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            if request.get("cwd"):
-                os.chdir(request["cwd"])
+            terminal_cwd = request.get("cwd")
+            if terminal_cwd and terminal_cwd != _LAST_TERMINAL_CWD:
+                os.chdir(terminal_cwd)
+                _LAST_TERMINAL_CWD = terminal_cwd
             exec(compile(request["code"], "<cell>", "exec"), GLOBALS)
     except SystemExit as exc:
         status, trace = "exit", "SystemExit: " + repr(exc.code)
