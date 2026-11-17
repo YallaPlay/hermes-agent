@@ -258,8 +258,10 @@ def test_joined_result_handle_can_continue_the_same_child(background):
     model, parent = _ScriptedModel(), _parent()
     with patch("run_agent.AIAgent", side_effect=model), \
             patch("tools.delegate_tool_dispatch._resolve_async_wake_sid", return_value=None):
-        out = json.loads(registry.dispatch("delegate_task", {"goal": "write parser", "background": background},
-                                           parent_agent=parent))
+        # YallaPlay fork: model-facing background work requires an explicit deferred completion policy.
+        out = json.loads(registry.dispatch("delegate_task", {
+            "goal": "write parser", "completion_policy": "deferred" if background else "required",
+        }, parent_agent=parent))
         if background:
             assert "SYNCHRONOUSLY" in out["note"]
         sid = out["results"][0]["subagent_id"]

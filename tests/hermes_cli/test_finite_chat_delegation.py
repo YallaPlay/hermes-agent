@@ -218,8 +218,9 @@ def test_tty_seeded_chat_keeps_background_delegation(monkeypatch, query, image):
         return {"status": "dispatched", "delegation_id": "interactive-delegation"}
 
     monkeypatch.setattr("tools.delegate_tool_dispatch._dispatch_unit", dispatch)
+    # YallaPlay fork: background delegation is opt-in; required results join by default.
     seeded = SimpleNamespace(run=lambda: AIAgent._dispatch_delegate_task(
-        parent, {"tasks": [{"goal": "independent task"}]},
+        parent, {"tasks": [{"goal": "independent task"}], "completion_policy": "deferred"},
     ))
     try:
         result = cli._run_single_query_mode(seeded, query, image, False, False)

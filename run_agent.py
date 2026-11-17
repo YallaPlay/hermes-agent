@@ -1339,7 +1339,10 @@ class AIAgent(
 
     def _append_guardrail_observation(self, tool_name: str, function_args: dict, function_result: str, *,
                                       failed: bool, tool_call_id: str = "") -> str:
-        self._note_tool_failure_repetition(tool_name, function_result, failed=failed)
+        # Lightweight guardrail callers need not implement the fork's optional repetition tracker.
+        note_failure_repetition = getattr(self, "_note_tool_failure_repetition", None)
+        if callable(note_failure_repetition):
+            note_failure_repetition(tool_name, function_result, failed=failed)
         decision = self._tool_guardrails.after_call(tool_name, function_args, function_result, failed=failed)
         # Identical-call stall guards observe the RAW result (before the per-call loop suffix) and are applied
         # at result construction so tool results stay append-only / cache-safe.
