@@ -87,9 +87,10 @@ def _publish_tool_snapshot(
 
         current_defs = _agent_tool_defs(agent)
         current_available = {_def_name(t) for t in current_defs}
-        current_available.update(
-            entry.name for entry in (getattr(agent, "_tool_search_catalog", None) or ())
-        )
+        if set(BRIDGE_TOOL_NAMES) <= current_available:
+            current_available.update(
+                entry.name for entry in (getattr(agent, "_tool_search_catalog", None) or ())
+            )
         memory_manager = getattr(agent, "_memory_manager", None)
         if memory_manager is not None:
             try:
@@ -107,10 +108,6 @@ def _publish_tool_snapshot(
             getattr(agent, "_context_engine_tool_names", None) or ()
         )
         current_available.difference_update(BRIDGE_TOOL_NAMES)
-        incoming_available = {
-            _def_name(t) for t in surface.source_defs if _def_name(t)
-        } - set(BRIDGE_TOOL_NAMES)
-
         visible_defs = list(surface.assembly.tool_defs)
         visible_names = set(surface.visible_names)
         if prefix_registered is not None:
@@ -151,6 +148,10 @@ def _publish_tool_snapshot(
         if isinstance(engine_names, set):
             engine_names.clear()
             engine_names.update(staged_engine_names)
+        # Only report reachable additions, not source names held out of tools[].
+        incoming_available = visible_names - set(BRIDGE_TOOL_NAMES)
+        if set(BRIDGE_TOOL_NAMES) <= visible_names:
+            incoming_available.update(entry.name for entry in surface.assembly.catalog)
         return incoming_available - current_available
 
 

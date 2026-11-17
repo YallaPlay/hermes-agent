@@ -32,8 +32,14 @@ def _names(defs):
 
 
 @pytest.fixture
-def mail_state():
+def mail_state(monkeypatch):
     """A recovering MCP-style tool (mail) next to an always-healthy one (anchor)."""
+    from tools import mcp_tool
+
+    # Fork 157a6049a0 dispatches from finalized catalogs: model real MCP provenance
+    # so the between-turns refresh updates that snapshot after a reconnect.
+    monkeypatch.setitem(mcp_tool._mcp_tool_server_names, MAIL, "probe-mail")
+    monkeypatch.setitem(mcp_tool._mcp_tool_server_names, ANCHOR, "probe-anchor")
     state = {"up": False, "probes": 0}
 
     def mail_connected():
@@ -333,6 +339,11 @@ def test_bridge_tools_stay_out_of_a_live_session_when_its_only_deferrable_tools_
     assert json.dumps(agent.tools, sort_keys=True) == sent
 
     assert BRIDGE <= _names(_agent(selection).tools)  # /new
+
+    # A catalog staged behind a held-out bridge is not a reachable addition yet.
+    reprobe_tool_availability()
+    assert refresh_agent_mcp_tools(agent, quiet_mode=True) == {MAIL}  # /reload-mcp
+    assert BRIDGE <= _names(agent.tools)
 
 
 class _ApprovedLateAttempt:
