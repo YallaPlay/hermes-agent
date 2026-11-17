@@ -526,6 +526,8 @@ class ContextCategory(Result):
     id: str
     label: str
     tokens: int
+    # Fork: per-category drill-down rows (``{"label", "tokens"}``) for the desktop context panel.
+    detail: list[dict[str, JsonValue]] = []
 
 
 class ContextFileSource(Result):
@@ -569,6 +571,9 @@ class SessionContextBreakdownResult(Result):
     model: str
     context_files: list[ContextFileSource] = []
     prompt_cache: PromptCacheWindow | None = None
+    # Fork: session prompt-cache hit stats and compaction events/failure state.
+    cache: dict[str, JsonValue] | None = None
+    compaction: dict[str, JsonValue] | None = None
 
 
 method("session.context_breakdown", params=SessionContextBreakdownParams, result=SessionContextBreakdownResult,

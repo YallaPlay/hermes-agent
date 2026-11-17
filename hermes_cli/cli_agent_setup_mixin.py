@@ -719,7 +719,7 @@ class CLIAgentSetupMixin:
                 one_turn_reasoning=(pending_one_turn or {}).get("one_turn_reasoning") if one_turn else None,
                 one_turn_alias=(pending_one_turn or {}).get("one_turn_alias", "") if one_turn else "",
                 reasoning_callback=self._current_reasoning_callback(),
-                reasoning_update_callback=getattr(self, "_on_reasoning_update"),
+                reasoning_update_callback=getattr(self, "_on_reasoning_update", None),
                 fallback_model=self._fallback_model, thinking_callback=self._on_thinking,
                 checkpoints_enabled=self.checkpoints_enabled,
                 checkpoint_max_snapshots=self.checkpoint_max_snapshots,

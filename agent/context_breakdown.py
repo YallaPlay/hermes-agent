@@ -472,6 +472,7 @@ def compute_session_context_breakdown(
         "context_used": context_used,
         "context_source": source,
         "context_estimated": source != "provider_usage",
+        "estimated_total": estimated_total,
         "model": getattr(agent, "model", "") or "",
         "prompt_cache": cache_window_payload(agent),
     }

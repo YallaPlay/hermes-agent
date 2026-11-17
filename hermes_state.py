@@ -579,6 +579,7 @@ class SessionDB(
         id_query: str = None, search_query: str = None, compact_rows: bool = False,
         include_pinned: bool = False, session_key: str = None, include_hidden: bool = False,
         owner: str = None, include_subagents: bool = False,
+        local_created_sources: Optional[List[str]] = None, workspace_key: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Upstream rich listing plus the fork's strict owner-only projection.
 
@@ -594,6 +595,7 @@ class SessionDB(
             archived_only=archived_only, id_query=id_query, search_query=search_query,
             compact_rows=compact_rows, include_pinned=include_pinned, session_key=session_key,
             include_hidden=include_hidden, include_subagents=include_subagents,
+            local_created_sources=local_created_sources, workspace_key=workspace_key,
         )
         if not owner:
             return super().list_sessions_rich(limit=limit, offset=offset, **params)

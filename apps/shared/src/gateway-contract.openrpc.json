@@ -15974,6 +15974,15 @@
           "tokens": {
             "title": "Tokens",
             "type": "integer"
+          },
+          "detail": {
+            "default": [],
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Detail",
+            "type": "array"
           }
         },
         "required": [
@@ -37965,6 +37974,32 @@
               }
             ],
             "default": null
+          },
+          "cache": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Cache"
+          },
+          "compaction": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Compaction"
           }
         },
         "required": [

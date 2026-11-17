@@ -1373,7 +1373,7 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
                     quiet_mode=True, verbose_logging=False, session_id=task_id, platform="cli",
                     side_agent=True,
                     session_db=self._session_db, reasoning_config=self.reasoning_config,
-                    reasoning_update_callback=getattr(self, "_on_reasoning_update"),
+                    reasoning_update_callback=getattr(self, "_on_reasoning_update", None),
                     service_tier=self.service_tier,
                     request_overrides=turn_route.get("request_overrides"),
                     **{kw: getattr(self, attr) for kw, attr in _BG_PROVIDER_KWARGS.items()})

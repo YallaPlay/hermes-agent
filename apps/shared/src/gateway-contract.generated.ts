@@ -3649,12 +3649,15 @@ export interface SessionContextBreakdownResult {
   model: string
   context_files?: ContextFileSource[]
   prompt_cache?: PromptCacheWindow | null
+  cache?: Record<string, unknown> | null
+  compaction?: Record<string, unknown> | null
 }
 export interface ContextCategory {
   color: string
   id: string
   label: string
   tokens: number
+  detail?: Record<string, unknown>[]
 }
 /** One row of ``agent.context_file_sources.list_context_file_sources``. */
 export interface ContextFileSource {
