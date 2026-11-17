@@ -30,7 +30,7 @@ from acp.schema import (
 )
 
 from acp_adapter.auth import TERMINAL_SETUP_AUTH_METHOD_ID, build_auth_methods, detect_provider
-from acp_adapter.commands import SlashCommandsMixin, _estimate_tokens
+from acp_adapter.commands import SlashCommandsMixin, SlashReply, _estimate_tokens
 from acp_adapter.content import _MAX_ACP_RESOURCE_BYTES, PromptBlock, _content_blocks_to_openai_user_content, _extract_text
 from acp_adapter.events import (
     AssistantMessageIdAllocator, _build_plan_update_from_todo_result, _send_update, flush_open_tool_calls,
@@ -1644,7 +1644,22 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             and not synthetic_notification
         ):
             response_text = await asyncio.to_thread(self._handle_slash_command, user_text, state)
-            if response_text is not None:
+            follow_up = None
+            if isinstance(response_text, SlashReply):
+                reply, response_text = response_text, response_text.text
+                follow_up = reply.prompt
+                if reply.session_info_changed and self._conn:
+                    await self._send_session_info_update(session_id)
+            if follow_up:
+                # The command built a prompt (skill, /goal kickoff, /retry, /plan ...): show
+                # its notice, then run the prompt below as a normal turn (or queue it).
+                if response_text and self._conn:
+                    await self._send(session_id, acp.update_agent_message_text(response_text),
+                                     fail_msg="Could not send slash-command notice for %s")
+                user_text = user_content = follow_up
+                # A built prompt queues behind a live turn; it must never redirect it.
+                text_only_prompt = False
+            elif response_text is not None:
                 if completion_sink is not None:
                     completion_sink(
                         "",
@@ -1940,6 +1955,8 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         # a /stop-style cancel landed mid tool call: the interrupted turn
         # returned ``final_response=None`` and ``None.startswith(...)`` blew
         # up here. Guarantee the idle reset with try/finally.
+        goal_continuation: str | None = None
+        had_queued_prompts = False
         try:
             if "messages" in result and isinstance(result["messages"], list):
                 # An explicit empty list is authoritative (e.g. reset/transform
@@ -2037,6 +2054,19 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                     state.message_ids.close()
                 await conn.session_update(session_id, update)
 
+            # Standing /goal: judge this turn and pick the next step. Runs while the session is
+            # still marked running, so a prompt typed during the judge call queues behind it.
+            if not interrupted:
+                goal_verdict, goal_continuation = await asyncio.to_thread(
+                    self._goal_after_turn, state, result, final_response)
+                if goal_verdict and conn:
+                    verdict_update = acp.update_agent_message_text(goal_verdict)
+                    if state.message_ids is not None:
+                        state.message_ids.close()
+                        verdict_update.message_id = state.message_ids.current()
+                        state.message_ids.close()
+                    await self._send(session_id, verdict_update, fail_msg="Could not send goal verdict for %s")
+
         finally:
             # Mark this turn idle before draining queued work so recursive
             # prompt() calls can acquire the session — and so an exception in
@@ -2046,6 +2076,9 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             with state.runtime_lock:
                 state.is_running = False
                 state.current_prompt_text = ""
+                # Prompts typed during this turn run first; each is a user turn that re-judges
+                # the goal itself, so this turn's continuation is then stale.
+                had_queued_prompts = bool(state.queued_prompts)
             # Flip attached-but-not-owner panels back to idle (see the
             # matching running=True update above). Inside the finally so a
             # tail exception can't strand a client in steer mode.
@@ -2063,6 +2096,8 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 prompt=[TextContentBlock(type="text", text=leftover_steer)],
                 session_id=session_id,
             )
+        elif goal_continuation and not had_queued_prompts:
+            await self._run_goal_continuation(state, session_id, conn, goal_continuation)
 
         usage = None
         if any(result.get(key) is not None for key in ("prompt_tokens", "completion_tokens", "total_tokens")):
