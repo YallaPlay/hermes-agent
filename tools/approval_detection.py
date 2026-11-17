@@ -1130,11 +1130,19 @@ def _shell_segment_tokens(segment: str, start: int) -> list[str] | None:
     quoting for benign commands such as ``echo \"$(rg -c x f)\"``.  Bound the
     inner simple command at its own first unquoted shell separator/closing
     parenthesis before tokenizing.  Nested substitutions and quoted
-    separators remain opaque via ``_scan_shell``.
+    separators remain opaque via ``_scan_shell``.  The ``&``/``|`` of a
+    ``2>&1``, ``<&3``, ``>|`` or ``&>`` redirection is part of the command,
+    as in ``_shell_command_segment``.
     """
     end = len(segment)
-    for kind, i, _j, quote in _scan_shell(segment, start, subst="uq", brace=True):
-        if kind == "char" and quote is None and segment[i] in ";&|()\n":
+    redirect_end = -1  # end of an unquoted `<`/`>`; a quoted or escaped one is a literal
+    for kind, i, j, quote in _scan_shell(segment, start, subst="uq", brace=True):
+        bare = kind == "char" and quote is None
+        if bare and ((segment[i] == "&" and (redirect_end == i or segment.startswith(">", j)))
+                     or (segment[i] == "|" and redirect_end == i and segment[i - 1] == ">")):
+            continue
+        redirect_end = j if bare and segment[i] in "<>" else -1
+        if bare and segment[i] in ";&|()\n":
             end = i
             break
     try:
