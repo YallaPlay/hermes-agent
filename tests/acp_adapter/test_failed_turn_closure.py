@@ -91,7 +91,8 @@ class _RecordingConn:
     def __init__(self) -> None:
         self.updates: list = []
 
-    async def session_update(self, session_id, update):
+    async def session_update(self, session_id, update, **_meta):
+        # The fork stamps replayed user turns with notification ``_meta`` (keepHistory index).
         self.updates.append(update)
 
     async def request_permission(self, *args, **kwargs):

@@ -369,10 +369,11 @@ class TestCodexBuildKwargs:
     def test_prompt_cache_retention_skipped_for_known_incompatible_backends(self, transport):
         """Fork guard (#retention-backends): even on an endpoint whose model
         family qualifies for 24h retention, backends that reject the field must
-        not receive it."""
+        not receive it. (GitHub Copilot moved to a plugin in v0.23; its host never
+        qualifies for retention, so the core no longer carries an is_github flag.)"""
         messages = [{"role": "user", "content": "Hi"}]
         mantle = "https://bedrock-mantle.us-west-2.api.aws/v1"
-        for flag in ("is_xai_responses", "is_github_responses", "is_codex_backend"):
+        for flag in ("is_xai_responses", "is_codex_backend"):
             assert "prompt_cache_retention" not in transport.build_kwargs(
                 model="gpt-5.5", messages=messages, tools=[],
                 base_url=mantle, **{flag: True},

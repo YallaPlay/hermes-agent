@@ -85,7 +85,11 @@ def _model(child_reply):
         last = request["body"]["messages"][-1]
         if last.get("role") == "tool":
             return Text(ANSWER if FINDING in str(last.get("content")) else PAUSE)
-        return ToolCall("delegate_task", {"tasks": [{"goal": GOAL, "context": "Repo at /srv/billing."}]})
+        # YallaPlay fork: top-level delegations join by default (completion_policy='required'); only an explicit
+        # 'deferred' takes the background path. Ask for it so the background-variant sessions keep upstream's
+        # contract, and the joined variant proves it overrides the request.
+        return ToolCall("delegate_task", {"tasks": [{"goal": GOAL, "context": "Repo at /srv/billing."}],
+                                          "completion_policy": "deferred"})
 
     def aux(request):
         return child_reply if GOAL in _first_user_text(request) else Text("Fake summary.")

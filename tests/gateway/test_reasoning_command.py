@@ -288,7 +288,7 @@ class TestReasoningUpdateCallback:
         runner, hermes_home = self._runner_with_home(tmp_path, monkeypatch)
         source = _make_event("hello").source
         session_key = runner._session_key_for_source(source)
-        runner._session_reasoning_overrides[session_key] = {"enabled": True, "effort": "low"}
+        runner._set_session_reasoning_override(session_key, {"enabled": True, "effort": "low"})
 
         callback = runner._make_reasoning_update_callback(session_key)
         persisted = callback("high", {"enabled": True, "effort": "high"}, True)
@@ -296,7 +296,8 @@ class TestReasoningUpdateCallback:
         assert persisted is True
         saved = yaml.safe_load((hermes_home / "config.yaml").read_text(encoding="utf-8"))
         assert saved["agent"]["reasoning_effort"] == "high"
-        assert session_key not in runner._session_reasoning_overrides
+        state = runner._peek_session_state(session_key)
+        assert state is None or state.conversation.reasoning_override is None
         assert runner._resolve_session_reasoning_config(source=source) == {
             "enabled": True,
             "effort": "high",

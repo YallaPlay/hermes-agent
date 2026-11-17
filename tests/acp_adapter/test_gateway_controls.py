@@ -65,6 +65,12 @@ async def test_gateway_acp_advertises_every_session_capability_it_implements(tmp
     in_process = HermesACPAgent(session_manager=SessionManager(agent_factory=object))
     advertised = (await gateway.initialize(protocol_version=1)).agent_capabilities.session_capabilities
     expected = (await in_process.initialize(protocol_version=1)).agent_capabilities.session_capabilities
-    assert advertised.model_dump(exclude_none=True) == expected.model_dump(exclude_none=True)
+
+    def _without_fork_meta(caps):
+        # Fork: the in-process adapter also advertises ``_meta.hermes.keepHistory`` (edit & resend),
+        # which the gateway projection does not implement; parity covers the upstream capabilities.
+        return {name: {k: v for k, v in value.items() if k != "field_meta"} for name, value in caps.items()}
+
+    assert advertised.model_dump(exclude_none=True) == _without_fork_meta(expected.model_dump(exclude_none=True))
     for capability in advertised.model_dump(exclude_none=True):
         assert callable(getattr(gateway, f"{capability}_session" if capability != "list" else "list_sessions"))
