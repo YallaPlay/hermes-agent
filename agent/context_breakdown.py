@@ -189,6 +189,39 @@ def context_usage_fields(compressor: Any) -> dict[str, Any]:
             "context_source": source, "context_estimated": source != "provider_usage"}
 
 
+def _categories(system_prompt: str, skills: str, tools: Sequence[dict], messages: list[dict],
+                rules: str = "", memory: str = "") -> dict[str, Any]:
+    """The category list in display order and its estimated total."""
+    from agent.model_metadata import estimate_messages_tokens_rough
+    builtin_tools, mcp_tools, subagent_tools = _split_tools(tools)
+    tokens_by_id = {
+        "system_prompt": _chars_to_tokens(system_prompt),
+        "tool_definitions": _json_tokens(builtin_tools),
+        "rules": _chars_to_tokens(rules),
+        "skills": _chars_to_tokens(skills),
+        "mcp": _json_tokens(mcp_tools),
+        "subagent_definitions": _json_tokens(subagent_tools),
+        "memory": _chars_to_tokens(memory),
+        "conversation": estimate_messages_tokens_rough(messages),
+    }
+    return {
+        "categories": [
+            {"color": color, "id": category_id, "label": _category_label(category_id), "tokens": tokens_by_id[category_id]}
+            for category_id, (color, _glyph_) in _CATEGORIES.items()
+            if tokens_by_id[category_id] > 0 or category_id in _ALWAYS_REPORTED
+        ],
+        "estimated_total": sum(tokens_by_id.values()),
+    }
+
+
+def stored_context_breakdown(system_prompt: str, tools: Sequence[dict], messages: list[dict]) -> dict[str, Any]:
+    """Categories and estimated total from a frozen system prompt and tool schemas, without an agent. Only an
+    agent re-renders the prompt's tiers apart, so ``rules`` and ``memory`` count inside ``system_prompt``."""
+    skills_match = _SKILLS_BLOCK_RE.search(system_prompt)
+    skills_index = skills_match.group(0) if skills_match else ""
+    return _categories(_strip_blocks(system_prompt, skills_index), skills_index, tools, messages)
+
+
 def _collect_sections(agent: Any, messages: Optional[List[dict]]) -> Dict[str, Any]:
     """Gather the raw section texts/objects shared by the breakdown and report."""
     from agent.system_prompt import build_system_prompt_parts
@@ -326,6 +359,7 @@ def compute_session_context_breakdown(
 ) -> Dict[str, Any]:
     """Return a Cursor-style context usage breakdown for one live agent."""
     from agent.model_metadata import estimate_messages_tokens_rough
+    from agent.prompt_cache_clock import cache_window_payload
 
     sections = _collect_sections(agent, messages)
 
@@ -438,8 +472,8 @@ def compute_session_context_breakdown(
         "context_used": context_used,
         "context_source": source,
         "context_estimated": source != "provider_usage",
-        "estimated_total": estimated_total,
         "model": getattr(agent, "model", "") or "",
+        "prompt_cache": cache_window_payload(agent),
     }
 
 
@@ -837,6 +871,9 @@ def render_context_breakdown_lines(
         if source:
             source_label = t(f"gateway.context.source.{source}") if source in _CONTEXT_SOURCES else source
             lines.append(t("gateway.context.source_line", source=source_label))
+    from agent.prompt_cache_clock import render_prompt_cache_line
+    if cache_line := render_prompt_cache_line(payload.get("prompt_cache")):
+        lines.append(cache_line)
 
     if details is None:
         lines.extend(["", t("gateway.context.hint_all")])

@@ -19,11 +19,16 @@ the marker lists.
 
 from types import SimpleNamespace
 from typing import Union
+from unittest.mock import patch
 
 from agent.agent_runtime_helpers import (
     intent_ack_continuation_mode,
     looks_like_codex_intermediate_ack,
 )
+from providers.base import ProviderProfile
+
+# An ACP agent whose binary is ``copilot``: the "on <X> via acpx" cue names only external_process profiles.
+_ACP_AGENT = ProviderProfile(name="acme-acp", auth_type="external_process", process_command="copilot")
 
 
 def _agent(
@@ -391,10 +396,11 @@ def test_pronounless_action_announcements_continue_when_opted_in():
         "Exit code 1. Step 2. Checking the actual log.",
         "Attempt 1. Attempt 2. Relaunching with corrected arguments.",
     )
-    for announcement in announcements:
-        assert looks_like_codex_intermediate_ack(
-            a, user, announcement, msgs, require_workspace=False
-        ), announcement
+    with patch("providers.list_providers", return_value=[_ACP_AGENT]):
+        for announcement in announcements:
+            assert looks_like_codex_intermediate_ack(
+                a, user, announcement, msgs, require_workspace=False
+            ), announcement
 
 
 def test_pronounless_action_guardrails_reject_questions_and_finals():
@@ -480,10 +486,11 @@ def test_pronounless_action_guardrails_reject_questions_and_finals():
         "Option: 1. Launching it now.",
         "Options: 1. Creating the session now.",
     )
-    for final in final_answers:
-        assert not looks_like_codex_intermediate_ack(
-            a, user, final, msgs, require_workspace=False
-        ), final
+    with patch("providers.list_providers", return_value=[_ACP_AGENT]):
+        for final in final_answers:
+            assert not looks_like_codex_intermediate_ack(
+                a, user, final, msgs, require_workspace=False
+            ), final
 
 
 # ── detector: guardrails that hold regardless of workspace ───────────────────
@@ -660,3 +667,59 @@ def test_passive_progress_still_gated_in_codex_only():
     assert not looks_like_codex_intermediate_ack(
         a, _MIDTASK_USER, text, _MIDTASK_MSGS, require_workspace=True
     )
+
+
+# An earlier turn's tool rows stay in ``messages`` for the whole session (gateway, CLI).
+_EARLIER_TOOL_TURN = [
+    {"role": "user", "content": "earlier request"},
+    {"role": "assistant", "content": "", "tool_calls": [{"id": "1"}]},
+    {"role": "tool", "tool_call_id": "1", "content": "old result"},
+    {"role": "assistant", "content": "earlier answer"},
+]
+
+
+def test_earlier_turn_tool_rows_do_not_disable_the_guard():
+    """#69778: an ack that opens a new turn still continues in a session that used tools before."""
+    msgs = [*_EARLIER_TOOL_TURN, {"role": "user", "content": CODE_USER}]
+    for agent, require_workspace in (
+        (_agent("auto", "codex_responses"), True),
+        (_agent(True), False),
+    ):
+        assert looks_like_codex_intermediate_ack(
+            agent, CODE_USER, CODE_ACK, msgs, require_workspace=require_workspace
+        )
+
+
+def test_tool_rows_in_the_current_turn_respect_continuation_mode():
+    """Default Codex stops after tool work; opt-in all mode continues unfinished actions."""
+    msgs = [
+        *_EARLIER_TOOL_TURN,
+        {"role": "user", "content": CODE_USER},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "2"}]},
+        {"role": "tool", "tool_call_id": "2", "content": "listed files"},
+    ]
+    for agent, require_workspace, expected in (
+        (_agent("auto", "codex_responses"), True, False),
+        (_agent(True), False, True),
+    ):
+        assert looks_like_codex_intermediate_ack(
+            agent, CODE_USER, CODE_ACK, msgs, require_workspace=require_workspace
+        ) is expected
+
+
+def test_a_nudge_row_after_tool_work_respects_continuation_mode():
+    """A synthetic user row cannot reset the Codex tool gate; all mode stays opted in."""
+    msgs = [
+        {"role": "user", "content": CODE_USER},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "2"}]},
+        {"role": "tool", "tool_call_id": "2", "content": "listed files"},
+        {"role": "assistant", "content": "(empty)"},
+        {"role": "user", "content": "[System: process the tool results above and continue.]"},
+    ]
+    for agent, require_workspace, expected in (
+        (_agent("auto", "codex_responses"), True, False),
+        (_agent(True), False, True),
+    ):
+        assert looks_like_codex_intermediate_ack(
+            agent, CODE_USER, CODE_ACK, msgs, require_workspace=require_workspace
+        ) is expected

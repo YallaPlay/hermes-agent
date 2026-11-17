@@ -6,8 +6,8 @@ import asyncio
 from datetime import datetime, timezone, UTC
 import contextlib
 import contextvars
-import logging
 import json
+import logging
 import time
 import base64
 import os
@@ -38,13 +38,16 @@ from acp_adapter.events import (
 )
 from acp_adapter.model_catalog import build_model_state, encode_model_choice
 from acp_adapter.notifications import completion_output_seen_after_spawn
+from acp_adapter import modes as _modes
 from acp_adapter.permissions import make_approval_callback
 from acp_adapter.provenance import session_provenance_meta
 from acp_adapter.session import (SessionManager, SessionState, QueuedPrompt,
     _agent_provider_identity, _apply_effort_to_agent, _expand_acp_enabled_toolsets)
-from acp_adapter.tools import build_tool_complete, build_tool_start
+from acp_adapter.tools import build_tool_complete, build_tool_start, coerce_tool_args
 from agent.context_compressor import (COMPRESSED_SUMMARY_METADATA_KEY, ContextCompressor)
 from agent.history_media import image_bytes_from_ref, image_refs_from_message, inline_image_bytes_from_content
+from agent.turn_failure_copy import (
+    CONTENT_REFUSED_DISPLAY_KIND, CONTENT_REFUSED_METADATA_KEY, CONTENT_REFUSED_NOTICE)
 from agent.interrupt_compat import request_hard_interrupt
 from tools.approval_context import reset_hermes_interactive_context, set_hermes_interactive_context
 from tools.todo_tool import is_todo_tool_name
@@ -56,6 +59,175 @@ _executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="acp-agent")
 
 # ListSessionsRequest has no client-side limit; clients paginate via `cursor`/`next_cursor`.
 _LIST_SESSIONS_PAGE_SIZE = 40
+
+
+def _flatten_history_text(value: Any) -> str:
+    """Persisted content/reasoning (str, or list of ``{"text"}`` / ``{"type": "text", "content"}``
+    parts) -> one stripped string; whitespace-only collapses to ``""`` ("nothing to emit")."""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+                elif item.get("type") == "text" and isinstance(item.get("content"), str):
+                    parts.append(item["content"])
+            elif isinstance(item, str):
+                parts.append(item)
+        return "\n".join(part.strip() for part in parts if part and part.strip()).strip()
+    return ""
+
+
+def _history_reasoning_text(message: dict[str, Any]) -> str:
+    """First non-empty of ``reasoning_content`` and ``reasoning`` — both live keys, for
+    different transports (not old-vs-new)."""
+    for key in ("reasoning_content", "reasoning"):
+        text = _flatten_history_text(message.get(key))
+        if text:
+            return text
+    return ""
+
+
+def _history_summary_meta(message: dict[str, Any], text: str) -> dict[str, Any] | None:
+    """``_meta`` for a replayed compaction summary, else None.
+
+    Summaries persist as ordinary messages, standalone (either role) or merged into the first
+    preserved tail message. Two keys so clients can't hide real content: ``compactionSummary``
+    (whole chunk; safe to collapse) vs ``containsCompactionSummary`` (real content + summary).
+    Uses the in-process flag, falling back to content classification for DB-reloaded sessions."""
+    kind = ContextCompressor.classify_summary_content(text)
+    if kind is None and message.get(COMPRESSED_SUMMARY_METADATA_KEY):
+        # Flagged but unclassified (prefix drift): the flag only marks summaries -> standalone.
+        kind = "standalone"
+    if kind == "standalone":
+        return {"hermes": {"compactionSummary": True}}
+    if kind == "merged":
+        return {"hermes": {"containsCompactionSummary": True}}
+    return None
+
+
+# role -> (chunk class, session_update tag) for history replay.
+_HISTORY_CHUNK_TYPES = {
+    "user": (UserMessageChunk, "user_message_chunk"), "assistant": (AgentMessageChunk, "agent_message_chunk")
+}
+
+
+def _history_tool_call_name_args(tool_call: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Extract function name/arguments from an OpenAI-style tool_call."""
+    function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+    name = str(function.get("name") or tool_call.get("name") or "unknown_tool")
+    raw_args = function.get("arguments") or tool_call.get("arguments") or tool_call.get("args") or {}
+    return name, coerce_tool_args(raw_args)
+
+
+def _history_message_chunk(role: str, message: dict[str, Any]) -> UserMessageChunk | AgentMessageChunk | None:
+    text = _flatten_history_text(message.get("content"))
+    if not text:
+        return None
+    cls, session_update = _HISTORY_CHUNK_TYPES[role]
+    return cls(
+        session_update=session_update, content=TextContentBlock(type="text", text=text),
+        field_meta=HermesACPAgent._history_chunk_meta(message, text),
+    )
+
+
+def _content_refused_notice(message: dict[str, Any]) -> str | None:
+    """The stored refusal notice when *message* is a retained ``content_refused`` display row, else
+    ``None``. The row keeps the user's own refused ask VISIBLE but is gone from the MODEL context
+    (``active = 0``), so the active-only model history never carries it — only the display projection
+    does. Falls back to the shared notice when the row predates a stored one."""
+    if message.get("display_kind") != CONTENT_REFUSED_DISPLAY_KIND:
+        return None
+    meta = message.get("display_metadata")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except (ValueError, TypeError):
+            meta = None
+    entry = meta.get(CONTENT_REFUSED_METADATA_KEY) if isinstance(meta, dict) else None
+    notice = entry.get("notice") if isinstance(entry, dict) else None
+    return notice if isinstance(notice, str) and notice.strip() else CONTENT_REFUSED_NOTICE
+
+
+def _user_history_updates(message: dict[str, Any]):
+    """Replay a persisted user row. A retained ``content_refused`` row keeps the user's ask visible
+    (tagged ``hermes.contentRefused`` so a client can grey it) and is followed by the refusal notice
+    as an agent message, so a reopened editor still shows "you asked X -> refused" even though the
+    turn was dropped from the model context. A plain user row replays unchanged."""
+    notice = _content_refused_notice(message)
+    if notice is not None:
+        if (text := _flatten_history_text(message.get("content"))):
+            yield UserMessageChunk(
+                session_update="user_message_chunk",
+                content=TextContentBlock(type="text", text=text),
+                field_meta={"hermes": {"contentRefused": True}},
+            )
+        yield acp.update_agent_message_text(notice)
+        return
+    if (chunk := _history_message_chunk("user", message)) is not None:
+        yield chunk
+    yield from _history_image_updates("user", message)
+
+
+def _history_image_updates(role: str, message: dict[str, Any]):
+    """Share the fork's durable image replay with the gateway-backed ACP viewer."""
+    meta = HermesACPAgent._history_chunk_meta(message, _flatten_history_text(message.get("content")))
+    for data, mime_type in HermesACPAgent._history_message_images(message):
+        update = HermesACPAgent._history_image_update(role=role, data=data, mime_type=mime_type, field_meta=meta)
+        if update is not None:
+            yield update
+
+
+def _history_replay_updates(history: list[dict[str, Any]]):
+    """Yield ACP session updates that reconstruct a persisted transcript, in order: user/assistant
+    text (with compaction ``_meta``), assistant thoughts, and tool-call start/complete pairs
+    (``todo`` results also re-emit the plan)."""
+    active_tool_calls: dict[str, tuple[str, dict[str, Any]]] = {}
+    for message in history:
+        role = str(message.get("role") or "")
+        if role == "user":
+            yield from _user_history_updates(message)
+        elif role == "assistant":
+            thought = _history_reasoning_text(message)
+            if thought:
+                yield acp.update_agent_thought_text(thought)
+            if (chunk := _history_message_chunk(role, message)) is not None:
+                yield chunk
+            yield from _history_image_updates(role, message)
+            tool_calls = message.get("tool_calls")
+            for tool_call in tool_calls if isinstance(tool_calls, list) else ():
+                if not isinstance(tool_call, dict):
+                    continue
+                tool_call_id = str(
+                    tool_call.get("id") or tool_call.get("call_id") or tool_call.get("tool_call_id") or ""
+                ).strip()
+                if not tool_call_id:
+                    continue
+                tool_name, args = _history_tool_call_name_args(tool_call)
+                active_tool_calls[tool_call_id] = (tool_name, args)
+                yield build_tool_start(tool_call_id, tool_name, args)
+        elif role == "tool":
+            tool_call_id = str(message.get("tool_call_id") or "").strip()
+            tool_name = str(message.get("tool_name") or "").strip()
+            function_args: dict[str, Any] | None = None
+            if tool_call_id in active_tool_calls:
+                tool_name, function_args = active_tool_calls.pop(tool_call_id)
+            if not tool_call_id or not tool_name:
+                continue
+            result = message.get("content")
+            result_text = result if isinstance(result, str) else None
+            complete = build_tool_complete(tool_call_id, tool_name, result=result_text, function_args=function_args)
+            timestamp = HermesACPAgent._history_timestamp_iso(message)
+            if timestamp:
+                complete.field_meta = {"hermes": {"timestamp": timestamp}}
+            yield complete
+            if is_todo_tool_name(tool_name):
+                plan_update = _build_plan_update_from_todo_result(result_text)
+                if plan_update is not None:
+                    yield plan_update
 
 
 def _mcp_server_config(server: McpServerStdio | McpServerHttp | McpServerSse) -> dict:
@@ -330,23 +502,19 @@ def _prompt_has_content(user_text: str, user_content: str | list[dict[str, Any]]
 class HermesACPAgent(SlashCommandsMixin, acp.Agent):
     """ACP Agent implementation wrapping Hermes AIAgent."""
 
-    _EDIT_APPROVAL_POLICY_CONFIG_ID = "edit_approval_policy"
-    _EDIT_APPROVAL_POLICY_DEFAULT = "ask"
-    _MODE_DEFAULT = "default"
-    # mode id -> (edit approval policy, display name, description)
-    _MODES: dict[str, tuple[str, str, str]] = {
-        "default": ("ask", "Default", "Ask before edits."),
-        "accept_edits": (
-            "workspace_session",
-            "Accept Edits",
-            "Auto-allow workspace and temp-dir edits; still asks for sensitive paths.",
-        ),
-        "dont_ask": (
-            "session", "Don't Ask", "Auto-allow file edits for this session except sensitive paths."
-        ),
-    }
-    _MODE_TO_EDIT_APPROVAL_POLICY = {mode: spec[0] for mode, spec in _MODES.items()}
-    _EDIT_APPROVAL_POLICY_TO_MODE = {spec[0]: mode for mode, spec in _MODES.items()}
+    # mode id -> (edit approval policy, display name, description): ``acp_adapter/modes.py``
+    _EDIT_APPROVAL_POLICY_CONFIG_ID = _modes.EDIT_APPROVAL_POLICY_CONFIG_ID
+    _EDIT_APPROVAL_POLICY_DEFAULT = _modes.DEFAULT_EDIT_APPROVAL_POLICY
+    _MODE_DEFAULT = _modes.DEFAULT_MODE
+    _MODES = _modes.MODES
+    _MODE_TO_EDIT_APPROVAL_POLICY = _modes.MODE_TO_EDIT_APPROVAL_POLICY
+    _EDIT_APPROVAL_POLICY_TO_MODE = _modes.EDIT_APPROVAL_POLICY_TO_MODE
+
+    def __new__(cls, session_manager=None):
+        if session_manager is None:
+            from acp_adapter.gateway_server import GatewayACPAgent
+            return GatewayACPAgent()
+        return super().__new__(cls)
 
     # Seconds between notification-watcher drain passes over the process
     # registry's completion queue (background process / delegation events).
@@ -477,7 +645,10 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             raise ModelRejected(result.error_message or f"Cannot switch to {raw_model}")
         target_provider, new_model = result.target_provider, result.new_model
         endpoint: dict[str, Any] = {}
-        if keep_endpoint and not (current_provider and target_provider != current_provider):
+        # Keep the endpoint only when the provider is KNOWN and equal: an empty current
+        # provider (a resume that fell back) keeping the old base_url while the target
+        # provider's credentials are used is exactly the key/endpoint mismatch of #139908.
+        if keep_endpoint and current_provider and target_provider == current_provider:
             endpoint = {
                 "base_url": getattr(state.agent, "base_url", None), "api_mode": getattr(state.agent, "api_mode", None)
             }
@@ -586,13 +757,15 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             return
         try:
             from model_tools import get_tool_definitions
-            from agent.memory_manager import inject_memory_provider_tools
+            from agent.memory_manager_tools import inject_memory_provider_tools
 
             agent = state.agent
             agent.enabled_toolsets = _expand_acp_enabled_toolsets(
                 getattr(agent, "enabled_toolsets", None),
                 mcp_server_names=[s.name for s in mcp_servers],
             )
+            from agent.delegation_backends import saved_backend
+            agent._delegation_backend = saved_backend()  # the session routes on what its delegate_task is built from
             agent.tools = get_tool_definitions(
                 enabled_toolsets=agent.enabled_toolsets,
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None), quiet_mode=True,
@@ -775,6 +948,13 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 state.history = transcript
                 source = state.history
 
+        # A refusal is retained only in the display projection. Never adopt
+        # display-only rows into model history or use their positions for forks.
+        display = self.session_manager.display_history(state.session_id)
+        if display and any(_content_refused_notice(message) is not None for message in display):
+            fork_index_limit = min(fork_index_limit, self._stable_history_prefix_len(state.history, display))
+            source = display
+
         if not source:
             return
 
@@ -807,6 +987,11 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             role = str(message.get("role") or "")
 
             if role == "user":
+                if _content_refused_notice(message) is not None:
+                    for update in _user_history_updates(message):
+                        if not await _send(update):
+                            return
+                    continue
                 text = self._history_message_text(message)
                 chunk_meta = self._history_chunk_meta(message, text)
                 meta = (
@@ -989,11 +1174,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             state.cancel_event.set()
             try:
                 if state.agent:
-                    request_hard_interrupt(state.agent)
-                    # Background delegations are detached from the turn's fan-out; they end with the cancel.
-                    from tools.async_delegation import interrupt_for_session
-                    interrupt_for_session(parent_session_id=str(getattr(state.agent, "session_id", "") or ""),
-                                          reason="acp_cancel")
+                    request_hard_interrupt(state.agent)  # this turn only: background delegations keep running
             except Exception:
                 logger.debug("Failed to interrupt ACP session %s", session_id, exc_info=True)
         logger.info("Cancelled session %s", session_id)
@@ -1766,6 +1947,24 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 state.history = result["messages"]
                 # Persist updated history so sessions survive process restarts.
                 self.session_manager.save_session(session_id)
+                # Safety refusal: take the whole refused turn (user row + any tool rounds + the
+                # refusal) out of the MODEL context so a fresh session load isn't re-sent the
+                # blocked content and locked, while KEEPING the user's message visible in the chat
+                # as a greyed refused notice. state.history is already the clean pre-refusal history.
+                # Retain ONLY when the OWNING agent flushed incrementally AND save_session skipped
+                # replace_messages — i.e. session.py's exact condition `_session_db is db and
+                # _session_db_created`. A non-owning agent's replace_messages(clean history) already
+                # dropped the refused turn; a second rewind would drop a prior accepted turn.
+                _adb = getattr(state.agent, "_session_db", None)
+                if (result.get("failure_reason") == "content_policy_blocked"
+                        and _adb is not None and _adb is self.session_manager._get_db()
+                        and getattr(state.agent, "_session_db_created", False)):
+                    from agent.turn_failure_copy import CONTENT_REFUSED_NOTICE
+                    from hermes_state_rewind import retain_refused_turn_for_display
+                    retain_refused_turn_for_display(
+                        _adb, getattr(state.agent, "session_id", session_id),
+                        notice=CONTENT_REFUSED_NOTICE,
+                        boundary_row_id=result.get("refused_turn_boundary_row_id"))
 
             # Detect a compression-driven internal session rotation. If the agent's
             # DB head moved during the turn, emit a session_info_update carrying

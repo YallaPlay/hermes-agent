@@ -4,6 +4,13 @@ Hermes Agent uses a SQLite database (`~/.hermes/state.db`) to persist session
 metadata, full message history, and model configuration across CLI and gateway
 sessions. This replaces the earlier per-session JSONL file approach.
 
+The profile's gateway is the **only writer of canonical sessions**: `hermes chat`,
+the TUI, Desktop (local), the API server, ACP, cron, Bot Chat and Kanban workers are
+clients that admit input to its session authority over `/api/ws` (see
+[Gateway local sessions](./gateway-local-sessions.md)). Out-of-process managed
+workers write through that owner (`RuntimeSessionStore` RPC), never by opening
+`state.db` for transcript writes themselves.
+
 Source files: `hermes_state.py` (facade) plus the `hermes_state_*.py` siblings (schema, fts, search, compression, portability, gateway, ...)
 
 ## Hermes home and profile isolation
@@ -56,7 +63,7 @@ pytest run.
 ### Desktop profile isolation and compaction generations
 
 Each named profile stores its transcript in its own `$HERMES_HOME/state.db`,
-including when one `hermes serve` process serves several profiles. In-session
+including when one process (the multiplex gateway, or a `hermes serve`) serves several profiles. In-session
 agent rebuilds (Bot Chat capability refresh and `tools.configure`) must retain
 that session's database handle and bind its profile home during construction.
 Releasing the outgoing agent must not close the handle inherited by its replacement.
@@ -121,19 +128,39 @@ ownership for a redelivered event.
 ├── session_model_usage   — Per-model/per-task usage attribution rows
 ├── messages_fts          — FTS5 virtual table (content + tool_name + tool_calls)
 ├── messages_fts_trigram  — FTS5 virtual table with trigram tokenizer (CJK / substring search)
-├── messages_fts_cjk      — FTS5 virtual table with cjk_unicode61 tokenizer
 ├── state_meta            — Key/value metadata table
 ├── gateway_routing       — Gateway routing metadata
 ├── compression_locks     — Cross-process compression locking
 ├── async_delegations     — Async delegation bookkeeping
 ├── delivery_obligations  — Gateway outbox (owed replies); created lazily by gateway/delivery_ledger.py
+├── runtime_epoch         — Session authority's owner epoch + instance id (one row)
+├── session_admissions    — Durable per-session input FIFO (queued → started → terminal; unknown on owner loss)
+├── worker_executions     — Managed worker/child/cron/kanban executions bound to a session and epoch
+├── worker_receipts       — Ordered, digest-checked results a managed worker reported
 └── schema_version        — Single-row table tracking migration state
 ```
+
+`session_admissions`, `worker_executions` and `worker_receipts` reference `sessions`
+with `ON DELETE RESTRICT`: deleting or pruning a session retires its terminal ledger
+rows in the same transaction and refuses while work is live or `unknown`. An input that
+was `started` when its owner died becomes `unknown` at the next owner start and is never
+replayed; its later inputs wait until it is resolved (`prompt.resolve_unknown`).
+
+The `runtime_epoch` row is the store's owner fence: the gateway captures it once at boot
+and every write is checked against it, so bumping it is a takeover. Only the profile's lock
+holder may take it over — `begin_runtime_epoch()` refuses a bump while another process
+holds the profile's `gateway.lock` flock, because a stray bump leaves the running gateway
+permanently behind the fence: every write on that store then fails with `stale_epoch` until
+it restarts, and `/reset` does not recover it (#142330).
 
 `hermes sessions recover` copies the row-bearing tables above into the
 recovered database (FTS indexes and `schema_version` are regenerated), including
 the lazily-created `delivery_obligations` ledger when the source has one — its
-row count is verified like `sessions`/`messages`.
+row count is verified like `sessions`/`messages`. The four runtime-ledger tables
+(`runtime_epoch`, `session_admissions`, `worker_executions`, `worker_receipts`) are
+inventoried and reported as excluded, not copied: a partial ledger could replay
+started effects or adopt another owner's workers. A full `hermes backup` restore keeps
+the complete ledger for startup reconciliation instead.
 
 Key design decisions:
 - **WAL mode** for concurrent readers + one writer (gateway multi-platform)
@@ -187,6 +214,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     title TEXT,
     api_call_count INTEGER DEFAULT 0,
     -- ... additional gateway/workspace/handoff/compression columns ...
+    prompt_cache_clock TEXT,  -- JSON of the latest prompt-cache event (agent/prompt_cache_clock.py)
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -196,6 +224,20 @@ CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique
     ON sessions(title) WHERE title IS NOT NULL;
 ```
+
+`prompt_cache_clock` is nullable JSON: the route (provider, normalized base URL, model), requested
+and granted cache tiers, one coverage deadline per tier, the guaranteed and estimated ends,
+confidence, send time, and the session's context generation when the last request read or wrote
+the provider's prompt cache. It rides the same queued token-count batch as the usage counters (no
+extra write on the turn loop). The context generation is the number of rows a compaction or prune
+archived (`active = 0, compacted = 1`): it only grows, so a saved clock recorded before an in-place
+compaction no longer validates after a restart; for a managed worker the owner stamps that count
+onto the clock inside the usage receipt that carries it. A resumed agent restores the clock before its first
+response is recorded, and the agentless `session.context_breakdown` reads it too, checked against
+the row's persisted model and `model_config` provider/base URL so a `/model` switch reports
+`unknown`. Every clock read is advisory: a failed store read reports `unknown` and never fails the
+turn. Sessions stored
+before the column fall back to the newest assistant row's timestamp (`assumed`, never guaranteed).
 
 `user_id` is the principal on the other end of the session: messaging adapters
 store the platform sender id, and `desktop` / dashboard sessions opened through
@@ -268,6 +310,25 @@ background FTS rebuild can proceed without double-indexing) and cover all three
 indexed columns — see `SCHEMA_SQL` in `hermes_state_common.py` for the exact SQL.
 
 
+## Dashboard browsing and owner maintenance
+
+Session browsing opens `state.db` read-only. GET listing, search, details,
+messages, statistics and export never create an absent database, quarantine a
+zero-byte file, reconcile a stale schema, or trigger auto-archive. Uninitialized
+or incompatible stores return HTTP 503 with owner-start/recovery guidance;
+profile aggregation reports schema failures in its per-profile `errors` list.
+
+The profile's gateway initializes and reconciles its store at startup. The
+standalone `serve` backend retains its existing startup reconciliation worker.
+Configured `sessions.auto_archive` remains active through gateway startup and
+housekeeping, or the standalone backend's maintenance ticker, independently of
+browsing. Explicit mutation endpoints retain their existing write behavior.
+
+SQLite WAL readers still participate in shared-memory coordination: `mode=ro`
+may create empty WAL/SHM sidecars or update SHM read marks. The read-only contract
+forbids canonical schema/data writes, repair and checkpointing; it does not make
+live SQLite coordination files immutable.
+
 ## Schema Version and Migrations
 
 Current schema version: **31**
@@ -303,8 +364,9 @@ Declarative column adds use `ALTER TABLE ADD COLUMN` wrapped in try/except to ha
 
 ## Write Contention Handling
 
-Multiple hermes processes (gateway + CLI sessions + worktree agents) share one
-`state.db`. The `SessionDB` class handles write contention with:
+Several processes still open one `state.db`: the gateway (the canonical session
+writer), read-only browsers (dashboard, `hermes sessions list`), maintenance commands,
+and writers of non-session tables. The `SessionDB` class handles write contention with:
 
 - **Short SQLite timeout** (1 second) instead of the default 30s
 - **Time-budgeted application-level retry** with random jitter (20-150ms for the

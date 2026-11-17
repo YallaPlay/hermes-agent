@@ -20,15 +20,14 @@ from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
     DELEGATE_TASK_SCHEMA,
     _get_max_concurrent_children,
-    _load_config,
     delegate_task,
     _build_child_agent,
     _build_child_progress_callback,
     _build_child_system_prompt,
     _strip_blocked_tools,
     _resolve_child_credential_pool,
-    _resolve_delegation_credentials,
 )
+from tools.delegate_tool_config import _load_config, _resolve_delegation_credentials
 from hermes_state import SessionDB
 
 
@@ -74,30 +73,38 @@ class TestDelegateCompletionPolicy(unittest.TestCase):
 
 class TestChildSystemPrompt(unittest.TestCase):
     def test_task_stays_in_user_turn(self):
-        prompt = _build_child_system_prompt("Fix the tests")
+        prompt = _build_child_system_prompt()
         self.assertNotIn("Fix the tests", prompt)
         self.assertNotIn("YOUR TASK", prompt)
 
     def test_goal_with_context(self):
-        prompt = _build_child_system_prompt("Fix the tests", "Error: assertion failed in test_foo.py line 42")
-        # Upstream sends the goal as the first user turn, not twice in both roles.
+        from tools.delegate_tool_progress import child_task_message
+
+        prompt = _build_child_system_prompt()
+        message = child_task_message("Fix the tests", "Error: assertion failed in test_foo.py line 42")
+        # Per-task context and goal belong in the first user turn, not the shared system prefix.
         self.assertNotIn("Fix the tests", prompt)
-        self.assertIn("CONTEXT", prompt)
-        self.assertIn("assertion failed", prompt)
+        self.assertNotIn("assertion failed", prompt)
+        self.assertIn("CONTEXT", message)
+        self.assertIn("assertion failed", message)
+        self.assertIn("Fix the tests", message)
 
     def test_empty_context_ignored(self):
-        prompt = _build_child_system_prompt("Do something", "  ")
+        from tools.delegate_tool_progress import child_task_message
+
+        prompt = _build_child_system_prompt()
         self.assertNotIn("CONTEXT", prompt)
+        self.assertEqual(child_task_message("Do something", "  "), "Do something")
 
     def test_iteration_budget_with_explicit_max(self):
-        prompt = _build_child_system_prompt("Fix the tests", max_iterations=80)
+        prompt = _build_child_system_prompt(max_iterations=80)
         self.assertIn("Iteration Budget", prompt)
         self.assertIn("budget of 80 tool-calling iterations", prompt)
         self.assertIn("ONE iteration together", prompt)
         self.assertIn("execute_code", prompt)
 
     def test_iteration_budget_without_max_stays_generic(self):
-        prompt = _build_child_system_prompt("Fix the tests")
+        prompt = _build_child_system_prompt()
         self.assertIn("Iteration Budget", prompt)
         self.assertIn("limited budget of tool-calling iterations", prompt)
         self.assertNotIn("budget of None", prompt)
@@ -110,7 +117,7 @@ class TestChildSystemPrompt(unittest.TestCase):
         "validation is underway" style updates after real tool work,
         reporting status=completed with no deliverable.
         """
-        prompt = _build_child_system_prompt("Fix the tests")
+        prompt = _build_child_system_prompt()
         self.assertIn("COMPLETION CONTRACT", prompt)
         self.assertIn("no user to hand", prompt)
         self.assertIn("not a final", prompt)
@@ -1085,8 +1092,8 @@ class TestDelegationProviderIntegration(unittest.TestCase):
     """Integration tests: delegation config → _run_single_child → AIAgent construction."""
 
 
-    @patch("tools.delegate_tool._load_config")
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool_config._load_config")
+    @patch("tools.delegate_tool_routes._resolve_delegation_credentials")
     def test_cross_provider_delegation(self, mock_creds, mock_cfg):
         """Parent on Nous, subagent on OpenRouter — full credential switch."""
         mock_cfg.return_value = {
@@ -1124,8 +1131,8 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             self.assertNotEqual(kwargs["api_key"], parent.api_key)
 
 
-    @patch("tools.delegate_tool._load_config")
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool_config._load_config")
+    @patch("tools.delegate_tool_routes._resolve_delegation_credentials")
     def test_credential_error_returns_json_error(self, mock_creds, mock_cfg):
         """When credential resolution fails, delegate_task returns a JSON error."""
         mock_cfg.return_value = {"model": "bad-model", "provider": "nonexistent"}
@@ -1256,15 +1263,14 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
         parent.provider, parent.base_url, parent.requested_provider = "custom", url, "custom:open-ai"
         parent._credential_pool = None
 
-        with patch("tools.delegate_tool_config._loaded_pool", side_effect=lambda key: key) as loaded:
-            key = _resolve_child_credential_pool("custom", parent, url, effective_requested_provider="custom:open-ai")
-        loaded.assert_called_once()
-        self.assertIn("open-ai", key)
-        self.assertNotIn("claude", key)
+        with patch("tools.delegate_tool_config._loaded_pool", return_value=None) as loaded:
+            _resolve_child_credential_pool("custom", parent, url, effective_requested_provider="custom:open-ai")
+        (key,) = loaded.assert_called_once() or loaded.call_args.args
+        self.assertTrue("open-ai" in key and "claude" not in key)
 
 
     @patch(
-        "tools.delegate_tool._load_config",
+        "tools.delegate_tool_config._load_config",
         return_value={"inherit_mcp_toolsets": False},
     )
     def test_build_child_agent_strict_intersection_when_opted_out(self, mock_cfg):
@@ -1401,7 +1407,7 @@ class TestDelegateHeartbeat(unittest.TestCase):
         child.run_conversation.side_effect = slow_run
 
         # Patch the heartbeat interval to fire quickly
-        with patch("tools.delegate_tool._HEARTBEAT_INTERVAL", 0.01):
+        with patch("tools.delegate_tool_child_run._HEARTBEAT_INTERVAL", 0.01):
             _run_single_child(
                 task_index=0,
                 goal="Test heartbeat",
@@ -1435,7 +1441,7 @@ class TestDelegateHeartbeat(unittest.TestCase):
             "final_response": "done", "completed": True, "api_calls": 1,
         }
 
-        with patch("tools.delegate_tool._HEARTBEAT_INTERVAL", 0.01):
+        with patch("tools.delegate_tool_child_run._HEARTBEAT_INTERVAL", 0.01):
             _run_single_child(
                 task_index=0,
                 goal="Test cleanup",
@@ -1498,9 +1504,9 @@ class TestDelegateHeartbeat(unittest.TestCase):
         # if idle rules were used for in-tool work, heartbeat would stop after
         # ~2 cycles. The in-tool branch should keep touching well past that.
         with (
-            patch("tools.delegate_tool._HEARTBEAT_INTERVAL", 0.01),
-            patch("tools.delegate_tool._HEARTBEAT_STALE_CYCLES_IDLE", 2),
-            patch("tools.delegate_tool._HEARTBEAT_STALE_CYCLES_IN_TOOL", 40),
+            patch("tools.delegate_tool_child_run._HEARTBEAT_INTERVAL", 0.01),
+            patch("tools.delegate_tool_child_run._HEARTBEAT_STALE_CYCLES_IDLE", 2),
+            patch("tools.delegate_tool_child_run._HEARTBEAT_STALE_CYCLES_IN_TOOL", 40),
         ):
             _run_single_child(
                 task_index=0,
@@ -1563,9 +1569,9 @@ class TestDelegateHeartbeat(unittest.TestCase):
         child.run_conversation.side_effect = slow_run
 
         with (
-            patch("tools.delegate_tool._HEARTBEAT_INTERVAL", 0.01),
-            patch("tools.delegate_tool._HEARTBEAT_STALE_CYCLES_IDLE", 2),
-            patch("tools.delegate_tool._HEARTBEAT_STALE_CYCLES_IN_TOOL", 40),
+            patch("tools.delegate_tool_child_run._HEARTBEAT_INTERVAL", 0.01),
+            patch("tools.delegate_tool_child_run._HEARTBEAT_STALE_CYCLES_IDLE", 2),
+            patch("tools.delegate_tool_child_run._HEARTBEAT_STALE_CYCLES_IN_TOOL", 40),
         ):
             _run_single_child(
                 task_index=0,
@@ -1584,7 +1590,7 @@ class TestDelegateHeartbeat(unittest.TestCase):
 class TestDelegationReasoningEffort(unittest.TestCase):
     """Tests for delegation.reasoning_effort config override."""
 
-    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool_config._load_config")
     @patch("run_agent.AIAgent")
     def test_inherits_parent_reasoning_when_no_override(self, MockAgent, mock_cfg):
         """With no delegation.reasoning_effort, child inherits parent's config."""
@@ -1601,7 +1607,7 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         call_kwargs = MockAgent.call_args[1]
         self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "xhigh"})
 
-    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool_config._load_config")
     @patch("run_agent.AIAgent")
     def test_override_reasoning_effort_from_config(self, MockAgent, mock_cfg):
         """delegation.reasoning_effort overrides the parent's level."""
@@ -1806,7 +1812,7 @@ class TestConcurrencyDefaults(unittest.TestCase):
                 self.assertEqual(_get_max_concurrent_children(), 50)
 
 
-    @patch("tools.delegate_tool._load_config",
+    @patch("tools.delegate_tool_config._load_config",
            return_value={"max_concurrent_children": 0})
     def test_zero_clamped_to_one(self, mock_cfg):
         """Floor of 1 is enforced; zero or negative values raise to 1."""
@@ -1816,11 +1822,11 @@ class TestAsyncCapUnified(unittest.TestCase):
     """max_async_children is deprecated: the async cap IS max_concurrent_children."""
 
 
-    @patch("tools.delegate_tool._load_config",
+    @patch("tools.delegate_tool_config._load_config",
            return_value={"max_concurrent_children": 15, "max_async_children": 3})
     def test_stale_max_async_children_ignored(self, mock_cfg):
         """A leftover max_async_children in config must not shrink the cap."""
-        from tools.delegate_tool import _get_max_async_children
+        from tools.delegate_tool_config import _get_max_async_children
         self.assertEqual(_get_max_async_children(), 15)
 
 # =========================================================================
@@ -1831,7 +1837,7 @@ class TestMaxSpawnDepth(unittest.TestCase):
     """Tests for _get_max_spawn_depth clamping and fallback behavior."""
 
 
-    @patch("tools.delegate_tool._load_config",
+    @patch("tools.delegate_tool_config._load_config",
            return_value={"max_spawn_depth": 0})
     def test_max_spawn_depth_clamped_below_one(self, mock_cfg):
         from tools.delegate_tool import _get_max_spawn_depth
@@ -1850,8 +1856,8 @@ class TestMaxSpawnDepth(unittest.TestCase):
 class TestOrchestratorRoleSchema(unittest.TestCase):
     """Tests that the role param reaches the child via dispatch."""
 
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
-    @patch("tools.delegate_tool._load_config",
+    @patch("tools.delegate_tool_routes._resolve_delegation_credentials")
+    @patch("tools.delegate_tool_config._load_config",
            return_value={"max_spawn_depth": 2})
     def _run_with_mock_child(self, role_arg, mock_cfg, mock_creds):
         mock_creds.return_value = {
@@ -1925,8 +1931,8 @@ def _make_role_mock_child():
 class TestOrchestratorRoleBehavior(unittest.TestCase):
     """Tests that role='orchestrator' actually changes toolset + prompt."""
 
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
-    @patch("tools.delegate_tool._load_config",
+    @patch("tools.delegate_tool_routes._resolve_delegation_credentials")
+    @patch("tools.delegate_tool_config._load_config",
            return_value={"max_spawn_depth": 2})
     def test_orchestrator_role_keeps_delegation_at_depth_1(
         self, mock_cfg, mock_creds
@@ -1949,8 +1955,8 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
             self.assertIn("delegation", kwargs["enabled_toolsets"])
             self.assertEqual(mock_child._delegate_role, "orchestrator")
 
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
-    @patch("tools.delegate_tool._load_config",
+    @patch("tools.delegate_tool_routes._resolve_delegation_credentials")
+    @patch("tools.delegate_tool_config._load_config",
            return_value={"max_spawn_depth": 2})
     def test_orchestrator_blocked_at_max_spawn_depth(
         self, mock_cfg, mock_creds
@@ -1992,8 +1998,8 @@ class TestOrchestratorEndToEnd(unittest.TestCase):
     the test in one patch context and avoids depth-indexed nesting.
     """
 
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
-    @patch("tools.delegate_tool._load_config",
+    @patch("tools.delegate_tool_routes._resolve_delegation_credentials")
+    @patch("tools.delegate_tool_config._load_config",
            return_value={"max_spawn_depth": 2})
     def test_end_to_end_nested_orchestration(self, mock_cfg, mock_creds):
         mock_creds.return_value = {
@@ -2095,20 +2101,20 @@ class TestSubagentApprovalCallback(unittest.TestCase):
             "deny",
         )
 
-    @patch("tools.delegate_tool._load_config", return_value={})
+    @patch("tools.delegate_tool_config._load_config", return_value={})
     def test_getter_defaults_to_deny(self, _mock_cfg):
-        from tools.delegate_tool import (
+        from tools.delegate_tool_config import (
             _get_subagent_approval_callback,
             _subagent_auto_deny,
         )
         self.assertIs(_get_subagent_approval_callback(), _subagent_auto_deny)
 
     @patch(
-        "tools.delegate_tool._load_config",
+        "tools.delegate_tool_config._load_config",
         return_value={"subagent_auto_approve": True},
     )
     def test_getter_true_is_approve(self, _mock_cfg):
-        from tools.delegate_tool import (
+        from tools.delegate_tool_config import (
             _get_subagent_approval_callback,
             _subagent_auto_approve,
         )
@@ -2157,7 +2163,7 @@ class TestFallbackModelInheritance(unittest.TestCase):
 
         with (
             patch("run_agent.AIAgent") as MockAgent,
-            patch("tools.delegate_tool._load_config", return_value={}),
+            patch("tools.delegate_tool_config._load_config", return_value={}),
         ):
             MockAgent.return_value = MagicMock()
             _build_child_agent(
@@ -2181,7 +2187,7 @@ class TestFallbackModelInheritance(unittest.TestCase):
 
         with (
             patch("run_agent.AIAgent") as MockAgent,
-            patch("tools.delegate_tool._load_config", return_value={}),
+            patch("tools.delegate_tool_config._load_config", return_value={}),
         ):
             MockAgent.return_value = MagicMock()
             _build_child_agent(

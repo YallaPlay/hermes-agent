@@ -28,6 +28,12 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+def _same_origin(a: str, b: str) -> bool:
+    from utils import base_url_origin
+    origin = base_url_origin(a)
+    return bool(origin[1]) and origin == base_url_origin(b)
+
+
 def _translate_acp_cwd(cwd: str) -> str:
     """Translate Windows ACP cwd values when Hermes itself is running in WSL.
 
@@ -124,15 +130,18 @@ def _build_session_title(title: Any, preview: Any, cwd: str | None) -> str:
 def _agent_provider_identity(agent: Any) -> str | None:
     """Best provider identity for persist/fork/model-state round-trips.
 
-    Prefers the requested (pre-canonicalization) identity — e.g.
-    ``custom:yallaplay-cpa`` — over the canonical ``provider`` attribute,
-    which for named custom endpoints is bare ``custom``. Re-resolving bare
-    ``custom`` yields the *generic* env/config custom provider (default
-    base_url: OpenRouter), silently rerouting the session away from the
-    named endpoint the user picked. Non-string / empty values (MagicMock
-    test agents, legacy agents) fall through to ``provider``.
+    Prefer upstream's resolved ``provider_route``. For bare ``custom``,
+    fall back to the fork's requested named identity before the generic kind;
+    re-resolving bare custom can silently select a different endpoint. Other
+    providers prefer their resolved kind over detection aliases such as auto.
+    Ignore non-string / empty values (test agents and legacy sessions).
     """
-    for attr in ("requested_provider", "provider"):
+    provider = getattr(agent, "provider", None)
+    # Upstream stamps the resolved route; only bare custom needs the fork's
+    # pre-canonicalized name. Do not persist detection aliases such as auto.
+    attrs = ("provider_route", "requested_provider", "provider") if provider == "custom" else (
+        "provider_route", "provider", "requested_provider")
+    for attr in attrs:
         value = getattr(agent, attr, None)
         if isinstance(value, str) and value.strip():
             return value.strip()
@@ -234,6 +243,21 @@ def _expand_acp_enabled_toolsets(toolsets: list[str] | None = None,
     names = [n for n in (["hermes-acp"] if toolsets is None else toolsets) if n]
     names += [f"mcp-{s}" for s in (mcp_server_names or []) if s]
     return list(dict.fromkeys(names))
+
+
+def _parse_model_config(mc: Any) -> dict:
+    """Decode a persisted model_config JSON blob for the read-only ACP catalog."""
+    try:
+        meta = json.loads(mc) if mc else None
+    except (json.JSONDecodeError, TypeError):
+        meta = None
+    return meta if isinstance(meta, dict) else {}
+
+
+def _session_info(sid: str, cwd: str, model: Any, history_len: int, title: Any, preview: Any,
+                  updated_at: Any) -> dict[str, Any]:
+    return {"session_id": sid, "cwd": cwd, "model": model, "history_len": history_len,
+            "title": _build_session_title(title, preview, cwd), "updated_at": _format_updated_at(updated_at)}
 
 
 def _apply_effort_to_agent(agent: Any, effort: str) -> None:
@@ -637,8 +661,11 @@ class SessionManager:
         """Return lightweight info dicts for all sessions (memory + database)."""
         normalized_cwd = _normalize_cwd_for_compare(cwd) if cwd else None
         owner_filter = (owner or "").strip() or None
-        db = self._get_db()
-        persisted_rows: dict[str, dict[str, Any]] = {}
+        # Catalog browsing must not initialize/migrate storage in an ACP client.
+        # An injected/already-open legacy manager can still enrich its rows.
+        db = self._db_instance
+        persisted_rows = {sid: row for sid, row in self._catalog_rows().items()
+                          if not owner_filter or (row.get("user_id") or "").strip() == owner_filter}
 
         if db is not None:
             try:
@@ -893,6 +920,28 @@ class SessionManager:
                     reverse=True,
                 )
         return results
+
+    def _catalog_rows(self) -> dict[str, dict[str, Any]]:
+        from acp_adapter.catalog import read_catalog_rows
+        from pathlib import Path
+
+        path = Path(self._db_instance.db_path) if self._db_instance is not None else get_hermes_home() / "state.db"
+        return read_catalog_rows(path)
+
+    def display_history(self, session_id: str) -> Optional[list[dict[str, Any]]]:
+        """The DURABLE DISPLAY projection for a session (``include_compacted``): what a reopened
+        editor should show, which is a SUPERSET of the active-only model history. In particular it
+        keeps a safety-refused turn's retained ``content_refused`` row, which the model context
+        dropped (``active = 0``). ``None`` when the DB is unavailable (e.g. a test agent factory),
+        so callers fall back to the in-memory model history."""
+        db = self._get_db()
+        if db is None:
+            return None
+        try:
+            return db.get_messages_as_conversation(session_id, include_compacted=True)
+        except Exception:
+            logger.debug("Failed to load ACP display history for %s", session_id, exc_info=True)
+            return None
 
     def update_cwd(
         self,
@@ -1569,9 +1618,27 @@ class SessionManager:
             kwargs["max_iterations"] = max_turns
 
         resolve_error: Exception | None = None
+        # A persisted row can carry a named custom endpoint downgraded to the bare kind
+        # (`custom`) plus its base_url (#142714): bare custom resolves credentialless, so
+        # map the recorded endpoint back to the configured identity it came from first —
+        # those rows then restore onto the endpoint they used instead of failing closed.
+        requested = requested_provider or config_provider
+        if requested == "custom" and base_url:
+            from hermes_cli.runtime_provider_custom import find_custom_provider_identity
+            try:
+                requested = find_custom_provider_identity(base_url) or requested
+            except Exception:
+                logger.debug("ACP session could not map its recorded base_url back to a "
+                             "named custom provider", exc_info=True)
         try:
             runtime = resolve_runtime_provider(
-                requested=requested_provider or config_provider, target_model=(model or default_model) or None)
+                requested=requested, target_model=(model or default_model) or None)
+            # The resolved key belongs to the resolved endpoint: a recorded base_url on another
+            # origin (a row stamped by an earlier fallback build, #142714) would send it there.
+            if base_url and runtime.get("base_url") and not _same_origin(base_url, runtime["base_url"]):
+                logger.warning("ACP session %s: recorded endpoint %s is not the resolved provider's "
+                               "endpoint %s; using the resolved one", session_id, base_url, runtime["base_url"])
+                base_url, api_mode = None, None
             kwargs.update({
                 "provider": runtime.get("provider"), "requested_provider": runtime.get("requested_provider"), "api_mode": api_mode or runtime.get("api_mode"),
                 "base_url": base_url or runtime.get("base_url"), "api_key": runtime.get("api_key"),
@@ -1620,7 +1687,21 @@ class SessionManager:
             if resolve_error is not None:
                 raise resolve_error from exc
             raise
+        if resolve_error is not None and requested_provider:
+            # Fail closed on an explicit request (#139908): the bare build "succeeded" only by
+            # dropping the failed resolution, landing the agent on the config-default endpoint —
+            # a different endpoint the session never used, later sent this provider's key.
+            # The bare-fallback contract (#91090) stands for the config-default request.
+            raise resolve_error
         # ACP stdio: stdout is protocol-only JSON-RPC; agent chatter goes to stderr.
         agent.session_cwd = cwd
         agent._print_fn = _acp_stderr_print
+        # The named route the agent actually resolved (``custom:<name>``), which AIAgent keeps
+        # only as the bare kind (``custom``): _persist stores it so a resume re-resolves the
+        # same named entry instead of a credentialless bare kind (#139908). A recovered
+        # identity (#142714) is the route too, so the next persist stores it back named.
+        # Only the bare kind is lossy: ``auto`` or an alias must persist what it resolved to.
+        route = str(requested or config_provider or "").strip()
+        if route and kwargs.get("provider") == "custom":
+            agent.provider_route = route
         return agent
