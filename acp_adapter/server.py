@@ -39,6 +39,7 @@ from acp_adapter.events import (
 from acp_adapter.model_catalog import build_model_state, encode_model_choice
 from acp_adapter.notifications import completion_output_seen_after_spawn
 from acp_adapter import modes as _modes
+from acp_adapter.execution_mode import acp_uses_gateway
 from acp_adapter.permissions import make_approval_callback
 from acp_adapter.provenance import session_provenance_meta
 from acp_adapter.session import (SessionManager, SessionState, QueuedPrompt,
@@ -511,7 +512,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
     _EDIT_APPROVAL_POLICY_TO_MODE = _modes.EDIT_APPROVAL_POLICY_TO_MODE
 
     def __new__(cls, session_manager=None):
-        if session_manager is None:
+        if session_manager is None and acp_uses_gateway():
             from acp_adapter.gateway_server import GatewayACPAgent
             return GatewayACPAgent()
         return super().__new__(cls)

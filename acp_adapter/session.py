@@ -663,7 +663,10 @@ class SessionManager:
         owner_filter = (owner or "").strip() or None
         # Catalog browsing must not initialize/migrate storage in an ACP client.
         # An injected/already-open legacy manager can still enrich its rows.
-        db = self._db_instance
+        # The fork's in-process adapter owns state.db, so it opens it for listing.
+        from acp_adapter.execution_mode import acp_uses_gateway
+
+        db = self._db_instance if acp_uses_gateway() else self._get_db()
         persisted_rows = {sid: row for sid, row in self._catalog_rows().items()
                           if not owner_filter or (row.get("user_id") or "").strip() == owner_filter}
 

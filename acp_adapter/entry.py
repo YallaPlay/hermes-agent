@@ -160,6 +160,31 @@ def _warm_memory_provider_import(logger: logging.Logger) -> None:
         logger.debug("memory provider not warmed (none configured or import failed; agent init reports that)")
 
 
+def _run_in_process(agent, logger: logging.Logger) -> None:
+    """Serve the fork's in-process adapter: this process owns MCP discovery and its sessions."""
+    import acp
+
+    # MCP discovery runs in a background thread so the server answers at once (blocking cost 2-5 s).
+    if os.environ.get("HERMES_ACP_SKIP_CONFIGURED_MCP", "").strip() != "1":
+        try:
+            from hermes_cli.mcp_startup import start_background_mcp_discovery
+
+            start_background_mcp_discovery(logger=logger, thread_name="acp-mcp-discovery")
+        except Exception:
+            logger.debug("MCP tool discovery failed at ACP startup", exc_info=True)
+
+    try:
+        asyncio.run(acp.run_agent(agent, use_unstable_protocol=True))
+    except KeyboardInterrupt:
+        logger.info("Shutting down (KeyboardInterrupt)")
+    except Exception:
+        logger.exception("ACP agent crashed")
+        sys.exit(1)
+    finally:
+        # The stdio client is gone; stamp ended_at so prune/archive can reach these rows (#118216).
+        agent.session_manager.end_all_sessions()
+
+
 def main(argv: list[str] | None = None) -> None:
     """Entry point: load env, configure logging, run the ACP agent."""
     if argv is None and "hermes_cli.main" not in sys.modules:
@@ -195,13 +220,17 @@ def main(argv: list[str] | None = None) -> None:
     install_truststore()
 
     import acp
-    from .server import HermesACPAgent
+    from .server import HermesACPAgent, acp_uses_gateway
 
     # Windows: import the configured memory provider (and numpy) on the main thread before
     # the ACP stdin-reader thread starts. A first-time native-extension import racing another
     # thread's import chain deadlocked in create_module and session/new never answered (#58083).
     if sys.platform == "win32":
         _warm_memory_provider_import(logger)
+
+    if not acp_uses_gateway():
+        _run_in_process(HermesACPAgent(), logger)
+        return
 
     # MCP discovery and execution belong to the gateway daemon; this process is a viewer.
     agent = HermesACPAgent()
