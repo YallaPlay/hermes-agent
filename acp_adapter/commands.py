@@ -228,15 +228,12 @@ class SlashCommandsMixin:
 
     @classmethod
     def _available_commands(cls) -> list[AvailableCommand]:
-        commands = [
+        # Built-ins only: hundreds of skills would crowd the editor's short match list. A typed
+        # /<skill> still runs (``_skill_invocation``), and /help says so.
+        return [
             AvailableCommand(name=name, description=desc, input=UnstructuredCommandInput(hint=hint) if hint else None)
             for name, (_help, desc, hint) in cls._COMMANDS.items()
         ]
-        for name, description in _skill_command_entries():
-            if name not in cls._COMMANDS:  # a built-in owns its name (agent.skill_commands guard parity)
-                commands.append(AvailableCommand(
-                    name=name, description=description, input=UnstructuredCommandInput(hint="instructions")))
-        return commands
 
     async def _send_available_commands_update(self, session_id: str) -> None:
         """Advertise supported slash commands to the connected ACP client."""

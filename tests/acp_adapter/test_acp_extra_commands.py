@@ -59,18 +59,18 @@ def test_menu_advertises_new_commands():
     assert {"goal", "subgoal", "usage", "status", "title", "undo", "retry", "plan", "learn", "init"} <= names
 
 
-def test_menu_lists_skills_without_shadowing_builtins(monkeypatch):
+def test_menu_leaves_out_skills_but_help_mentions_them(monkeypatch):
     import agent.skill_commands as sc
 
     monkeypatch.setattr(sc, "get_interactive_skill_commands", lambda: {
         "/my-skill": {"name": "my-skill", "description": "Does a thing"},
         "/plan": {"name": "plan", "description": "a skill that collides"},
     })
-    acp_agent, _state, _fake, _conn = make_agent_and_state()
-    commands = acp_agent._available_commands()
-    assert [c.name for c in commands].count("plan") == 1
-    skill = next(c for c in commands if c.name == "my-skill")
-    assert skill.description == "Does a thing"
+    acp_agent, state, _fake, _conn = make_agent_and_state()
+    names = [c.name for c in acp_agent._available_commands()]
+    assert "my-skill" not in names
+    assert names.count("plan") == 1
+    assert "/<skill-name>" in acp_agent._handle_slash_command("/help", state)
 
 
 def test_gateway_menu_advertises_goal():
