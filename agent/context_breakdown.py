@@ -204,9 +204,22 @@ def _categories(system_prompt: str, skills: str, tools: Sequence[dict], messages
         "memory": _chars_to_tokens(memory),
         "conversation": estimate_messages_tokens_rough(messages),
     }
+    # Fork: the same per-category drill-down rows as compute_session_context_breakdown, so the
+    # agentless (stored) breakdown renders like the live one in the desktop context panel.
+    detail_by_id = {
+        "system_prompt": [],
+        "tool_definitions": _tool_detail(builtin_tools),
+        "rules": _rules_detail(rules),
+        "skills": _skills_detail(skills),
+        "mcp": _tool_detail(mcp_tools),
+        "subagent_definitions": _tool_detail(subagent_tools),
+        "memory": _memory_detail(memory, ""),
+        "conversation": _conversation_detail(messages),
+    }
     return {
         "categories": [
-            {"color": color, "id": category_id, "label": _category_label(category_id), "tokens": tokens_by_id[category_id]}
+            {"color": color, "detail": detail_by_id[category_id], "id": category_id,
+             "label": _category_label(category_id), "tokens": tokens_by_id[category_id]}
             for category_id, (color, _glyph_) in _CATEGORIES.items()
             if tokens_by_id[category_id] > 0 or category_id in _ALWAYS_REPORTED
         ],
