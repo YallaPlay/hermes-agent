@@ -14,6 +14,7 @@ from hermes_cli.tools_config import (
     _apply_toolset_change,
     _checklist_toolset_keys,
     _get_platform_tools,
+    _get_plugin_toolset_keys,
     _run_post_setup,
     _save_platform_tools,
     _toolset_has_keys,
@@ -103,7 +104,8 @@ def test_explicit_empty_platform_toolsets_merge_no_mcp_servers():
     assert _get_platform_tools(config, "cli") == set()
 
     config["platform_toolsets"]["cli"] = ["no_mcp"]
-    assert _get_platform_tools(config, "cli") == set()
+    # Unlike [], no_mcp suppresses only MCP, not auto-enabled plugins (fork LSP).
+    assert _get_platform_tools(config, "cli") - _get_plugin_toolset_keys() == set()
 
 
 def test_explicit_empty_gateway_platform_toolsets_keep_mcp_controls():
@@ -115,10 +117,11 @@ def test_explicit_empty_gateway_platform_toolsets_keep_mcp_controls():
     assert {"alpha", "beta"} <= _get_platform_tools({"mcp_servers": servers}, "email")
     assert _get_platform_tools(
         {"mcp_servers": servers, "platform_toolsets": {"email": ["terminal", "alpha"]}}, "email",
-    ) == {"terminal", "alpha"}
+    ) - _get_plugin_toolset_keys() == {"terminal", "alpha"}
+    # Non-empty selections still auto-enable newly discovered plugins, including fork LSP.
     assert _get_platform_tools(
         {"mcp_servers": servers, "platform_toolsets": {"email": ["terminal"]}}, "email",
-    ) == {"terminal", "alpha", "beta"}
+    ) - _get_plugin_toolset_keys() == {"terminal", "alpha", "beta"}
 
 
 def test_scalar_platform_toolsets_fall_back_to_platform_default():

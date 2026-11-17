@@ -579,6 +579,9 @@ def _get_platform_tools(config: dict, platform: str, *, include_default_mcp_serv
     # Track whether the user explicitly saved a toolset list for this platform (vs. falling back to the
     # platform default). See #35527.
     explicitly_configured = isinstance(toolset_names, list)
+    # An explicit zero-tool selection also excludes newly discovered plugin toolsets.
+    if explicitly_configured and not toolset_names:
+        return set()
     if not explicitly_configured:
         toolset_names = [_platform_default_toolset(platform)]
     # YAML may parse bare numeric names (``12306:``) as int; normalise so sorted() never mixes types.
