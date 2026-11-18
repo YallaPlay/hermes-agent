@@ -161,6 +161,13 @@ created a dependency the data model denies, and because a handoff child would en
 its first turn asking the spawning session for approval — a question ACP cannot
 answer, since it cannot inject a reply into a finished turn.
 
+For a brief too large to pass inline, set `prompt_file` to a UTF-8 text file
+(up to 512 KiB). Its content becomes the child's first message, after `prompt`
+when both are given. The child gets the full text without reading the file, so
+large briefs do not depend on its tool output limits. Relative paths resolve
+against the spawning session's working directory, and the normal read denylist
+applies.
+
 This mechanism is process-local. Closing or reloading the ACP host can terminate
 an in-flight spawned turn; use a detached CLI session for walk-away durability.
 

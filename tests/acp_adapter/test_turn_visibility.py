@@ -243,6 +243,7 @@ class TestSpawnToolInjection:
         assert properties["provider"]["type"] == "string"
         assert properties["model"]["type"] == "string"
         assert properties["deliver_result_to_parent"]["type"] == "boolean"
+        assert properties["prompt_file"]["type"] == "string"
 
     def test_inject_is_idempotent(self):
         fake = MagicMock()
@@ -284,6 +285,79 @@ class TestSpawnDispatch:
             assert payload["error"] == "prompt is required"
         finally:
             reset_spawn_session_requester(token)
+
+    def test_prompt_file_content_becomes_first_message(self, tmp_path):
+        brief = tmp_path / "BRIEF.md"
+        brief.write_text("# Brief\n" + "x" * 200_000 + "\n", encoding="utf-8")
+        captured = {}
+
+        def _requester(prompt_text, cwd, title, provider=None, model=None):
+            captured["prompt"] = prompt_text
+            return "file-sid"
+
+        token = set_spawn_session_requester(_requester)
+        try:
+            payload = _loads(
+                maybe_dispatch_spawn_session(
+                    SPAWN_SESSION_TOOL_NAME,
+                    {"prompt": "Read the brief below.", "prompt_file": str(brief)},
+                )
+            )
+        finally:
+            reset_spawn_session_requester(token)
+
+        assert payload["session_id"] == "file-sid"
+        assert captured["prompt"] == "Read the brief below.\n\n# Brief\n" + "x" * 200_000
+
+    def test_relative_prompt_file_resolves_against_session_cwd(self, tmp_path, monkeypatch):
+        (tmp_path / "BRIEF.md").write_text("relative brief", encoding="utf-8")
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        captured = {}
+
+        def _requester(prompt_text, cwd, title, provider=None, model=None):
+            captured["prompt"] = prompt_text
+            return "rel-sid"
+
+        token = set_spawn_session_requester(_requester)
+        try:
+            maybe_dispatch_spawn_session(
+                SPAWN_SESSION_TOOL_NAME, {"prompt_file": "BRIEF.md"}
+            )
+        finally:
+            reset_spawn_session_requester(token)
+
+        assert captured["prompt"] == "relative brief"
+
+    @pytest.mark.parametrize(
+        ("name", "content", "error_fragment"),
+        [
+            ("missing.md", None, "prompt_file not found"),
+            ("huge.md", "x" * (512 * 1024 + 1), "the limit is"),
+            ("blank.md", "  \n", "prompt_file is empty"),
+            (".env", "SECRET=1", ".env"),
+        ],
+        ids=["missing", "oversized", "blank", "env-denied"],
+    )
+    def test_bad_prompt_file_rejected_without_spawning(
+        self, tmp_path, name, content, error_fragment
+    ):
+        target = tmp_path / name
+        if content is not None:
+            target.write_text(content, encoding="utf-8")
+        requester = MagicMock(return_value="never")
+
+        token = set_spawn_session_requester(requester)
+        try:
+            payload = _loads(
+                maybe_dispatch_spawn_session(
+                    SPAWN_SESSION_TOOL_NAME, {"prompt_file": str(target)}
+                )
+            )
+        finally:
+            reset_spawn_session_requester(token)
+
+        assert error_fragment in payload["error"]
+        requester.assert_not_called()
 
     def test_dispatch_returns_session_id(self):
         captured = {}

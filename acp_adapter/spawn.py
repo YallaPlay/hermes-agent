@@ -50,7 +50,17 @@ SPAWN_SESSION_TOOL_SCHEMA: dict[str, Any] = {
                     "description": (
                         "The first user message for the new session. Must be "
                         "self-contained — the new session shares none of this "
-                        "conversation's context."
+                        "conversation's context. Optional when prompt_file is set; "
+                        "then it precedes the file text."
+                    ),
+                },
+                "prompt_file": {
+                    "type": "string",
+                    "description": (
+                        "Path to a UTF-8 text file whose content becomes the first user message "
+                        "(after prompt, if given). Use for briefs too large to inline; the new "
+                        "session receives the full text without reading the file. Relative paths "
+                        "resolve against this session's cwd. Max 512 KiB."
                     ),
                 },
                 "cwd": {
@@ -89,10 +99,12 @@ SPAWN_SESSION_TOOL_SCHEMA: dict[str, Any] = {
                     ),
                 },
             },
-            "required": ["prompt"],
         },
     },
 }
+
+# shortcut: fixed cap (~130k tokens); derive it from the child model's context window if briefs outgrow it.
+MAX_PROMPT_FILE_BYTES = 512 * 1024
 
 SpawnSessionRequester = Callable[..., str]
 
@@ -154,6 +166,37 @@ def inject_spawn_session_tool(agent: Any) -> bool:
     return True
 
 
+def _read_prompt_file(path: str) -> tuple[str, str | None]:
+    """Return ``(text, error)`` for a ``prompt_file`` argument, applying the read denylist."""
+
+    from pathlib import Path
+
+    from agent.file_safety import get_read_block_error
+    from agent.runtime_cwd import resolve_agent_cwd
+
+    target = Path(path).expanduser()
+    if not target.is_absolute():
+        target = resolve_agent_cwd() / target
+    # The denylist anchors relative paths at the process cwd, so it needs the absolute path.
+    block_error = get_read_block_error(str(target))
+    if block_error:
+        return "", block_error
+    try:
+        size = target.stat().st_size
+        if not target.is_file():
+            return "", f"prompt_file is not a regular file: {target}"
+        if size > MAX_PROMPT_FILE_BYTES:
+            return "", (
+                f"prompt_file is {size} bytes; the limit is {MAX_PROMPT_FILE_BYTES}. "
+                "Split the brief or pass a shorter prompt that points to it."
+            )
+        return target.read_text(encoding="utf-8").strip(), None
+    except FileNotFoundError:
+        return "", f"prompt_file not found: {target}"
+    except (OSError, UnicodeDecodeError) as exc:
+        return "", f"Failed to read prompt_file {target}: {exc}"
+
+
 def maybe_dispatch_spawn_session(
     function_name: str, arguments: dict[str, Any]
 ) -> str | None:
@@ -181,8 +224,18 @@ def maybe_dispatch_spawn_session(
         )
 
     prompt_text = str(arguments.get("prompt") or "").strip()
+    prompt_file = arguments.get("prompt_file")
+    prompt_file = str(prompt_file).strip() if prompt_file else None
+    if prompt_file:
+        file_text, file_error = _read_prompt_file(prompt_file)
+        if file_error:
+            return json.dumps({"error": file_error}, ensure_ascii=False)
+        prompt_text = f"{prompt_text}\n\n{file_text}" if prompt_text else file_text
     if not prompt_text:
-        return json.dumps({"error": "prompt is required"}, ensure_ascii=False)
+        return json.dumps(
+            {"error": "prompt is required" if not prompt_file else "prompt_file is empty"},
+            ensure_ascii=False,
+        )
     cwd = arguments.get("cwd")
     cwd = str(cwd).strip() if cwd else None
     title = arguments.get("title")
