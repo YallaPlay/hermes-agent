@@ -22,6 +22,13 @@ from acp_adapter.session import _translate_acp_cwd, _normalize_cwd_for_compare
 logger = logging.getLogger(__name__)
 
 
+def _has_prompt_content(prompt):
+    """Main's ``_prompt_has_content`` on the converted prompt: blank text alone is no turn."""
+    from acp_adapter.content import _content_blocks_to_openai_user_content
+    content = _content_blocks_to_openai_user_content(prompt)
+    return bool(content.strip()) if isinstance(content, str) else bool(content)
+
+
 def _slash_command(text):
     """Canonical Hermes command name ``text`` invokes, or None for ordinary text.
 
@@ -386,13 +393,13 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         await self._adopt(session_id, snapshot)
         if 'editor' in resume_params:
             self._editor_mcp[session_id] = resume_params['editor']
-        from acp_adapter.server import _history_replay_updates
+        from acp_adapter.gateway_rewind import live_rows, replay_updates
         if self._conn:
             # The editor replays the live transcript in stored order, as main's ACP did; archived rows
-            # (summarized away by a compression) are display-only.
-            live = sorted((m for m in snapshot["messages"] if not m.get("archived")), key=lambda m: m.get("row_id") or 0)
-            for update in _history_replay_updates(live):
-                await self._conn.session_update(session_id=held_id, update=update)
+            # (summarized away by a compression) are display-only. Each user turn carries its
+            # ``historyIndex``, the coordinate an edit-and-resend sends back as ``keepHistory``.
+            for update, meta in replay_updates(live_rows(snapshot)):
+                await self._conn.session_update(session_id=held_id, update=update, **(meta or {}))
         for pending in snapshot.get("prompts", []):
             self._permission(session_id, pending)
         await self._notify_unknown(session_id)
@@ -662,6 +669,12 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         held_id, session_id = session_id, self._aliases.get(session_id, session_id)
         if session_id not in self._snapshots:
             raise GatewayClientError("not_found")
+        from acp_adapter.gateway_rewind import keep_history_meta, rewind_for_prompt
+        # Edit-and-resend (``_meta.hermes.keepHistory``): validated before anything is staged, so an
+        # invalid rewind never silently becomes a plain turn on the full history.
+        keep_history = keep_history_meta(kwargs)
+        if keep_history is not None and not _has_prompt_content(prompt):
+            raise acp.RequestError.invalid_params({"reason": "_meta.hermes.keepHistory requires a non-empty prompt"})
         if self._has_unknown(session_id) and await self._refresh_unknown_for_prompt(session_id):
             return PromptResponse(stop_reason='cancelled')
         if self._has_unknown(session_id):
@@ -676,6 +689,8 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             return PromptResponse(stop_reason='cancelled')
         retry_key, input_id, staged = prepared
         text, attachments = staged
+        if keep_history is not None:
+            await rewind_for_prompt(self, session_id, keep_history)
         answered, text = await self._run_slash(held_id, session_id, text) if not attachments else (False, text)
         if answered:
             return PromptResponse(stop_reason='end_turn')
