@@ -80,7 +80,8 @@ class PreparedMutations:
             del self.pending[key]
 
 
-_METADATA = frozenset({'rename'})
+# The owner's metadata controls (``gateway.session_mutations._METADATA``): no generation fence.
+_METADATA = frozenset({'rename', 'archive'})
 
 
 def _key(session_id, operation, payload):

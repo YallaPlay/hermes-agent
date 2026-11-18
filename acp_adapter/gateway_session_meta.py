@@ -131,15 +131,16 @@ async def session_config_options(client, session_id, models, info, mode_id):
     return options
 
 
-def model_state(info: dict) -> SessionModelState | None:
+def model_state(info: dict, *, force_refresh: bool = False) -> SessionModelState | None:
     """The picker for the session's model (``session.info``), from the shared inventory; a single
-    current-model row when nothing is listable, as main's ``_build_model_state``. Blocking."""
+    current-model row when nothing is listable, as main's ``_build_model_state``. Blocking.
+    ``force_refresh`` bypasses the inventory cache (``_x/refreshModels``)."""
     from acp_adapter.auth import detect_provider
     from acp_adapter.model_catalog import build_model_state, encode_model_choice
     model = str(info.get("model") or "").strip()
     provider = info.get("provider") or detect_provider() or "openrouter"
     try:
-        picker = build_model_state(model, provider, "")
+        picker = build_model_state(model, provider, "", force_refresh=force_refresh)
         if picker is not None:
             return picker
     except Exception:

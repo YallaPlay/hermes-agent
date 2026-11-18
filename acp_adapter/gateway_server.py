@@ -152,6 +152,11 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         from acp_adapter.server import HermesACPAgent
         return await HermesACPAgent.authenticate(self, method_id, **kwargs)
 
+    async def ext_method(self, method, params):
+        """Hermes ``_x`` extensions (``acp_adapter/gateway_ext.py``); an unknown one is ``method_not_found``."""
+        from acp_adapter.gateway_ext import ext_method
+        return await ext_method(self, method, params)
+
     async def _client(self):
         async with self._connect_lock:
             if self._failure is not None or self._transport_closed():
