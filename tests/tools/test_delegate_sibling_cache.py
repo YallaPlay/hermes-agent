@@ -37,8 +37,7 @@ def test_siblings_send_one_system_prompt_and_get_their_context_in_the_user_turn(
 
 
 def test_a_briefed_child_is_titled_after_its_goal_not_its_context_header():
-    from persistence.conversation.sessions import SessionQuery
-    from persistence_assembly import open_persistence, profile_scope
+    from hermes_state import SessionDB
     from run_agent import AIAgent
     from tests.e2e.core.history._helpers import NO_BACKGROUND_REVIEW, OFFLINE_CONFIG
     from tests.fakes.fake_llm_provider import FakeLLMServer, Text, write_hermes_home
@@ -48,15 +47,15 @@ def test_a_briefed_child_is_titled_after_its_goal_not_its_context_header():
     with FakeLLMServer([]) as srv:
         write_hermes_home(home, srv.base_url, extra_config=OFFLINE_CONFIG + NO_BACKGROUND_REVIEW)
         srv.push(Text("done"))
-        db = open_persistence(profile_scope(home=home))
+        db = SessionDB(db_path=home / "state.db")
         parent = AIAgent(provider="custom", base_url=srv.base_url, api_key="sk-fake-e2e", model="fake-model",
-                         session_db=db, persistence=db, session_id="parent", quiet_mode=True, platform="cli")
+                         session_db=db, session_id="parent", quiet_mode=True, platform="cli")
         parent._ensure_db_session()
         delegate_task(goal="count the files", context="The parent is auditing numbers.", parent_agent=parent)
         parent.close()
-        rows = db.sessions.list_sessions(SessionQuery(include_children=True, include_subagents=True))
+        rows = db.list_sessions_rich(limit=100, include_children=True, include_subagents=True, include_hidden=True)
 
-    assert [t for r in rows if (t := r.session.title or "").startswith("Subagent: ")] == ["Subagent: count the files"]
+    assert [t for r in rows if (t := r.get("title") or "").startswith("Subagent: ")] == ["Subagent: count the files"]
 
 
 def test_schema_correction_turn_carries_the_contract_even_after_a_compaction():
