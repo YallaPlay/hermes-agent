@@ -1109,6 +1109,9 @@ class SessionAuthority:
                 from gateway.session_setting_commands import apply_pending_reasoning
                 await apply_pending_reasoning(self, ref, live)
                 await apply_deferred_pick(self, ref, live)
+                if first is not None:
+                    from gateway.session_orphaned_route import replace_orphaned_route
+                    await replace_orphaned_route(self, ref, live)
             if first is not None and live.source.platform == Platform.LOCAL:
                 from gateway.session_local_recovery import restore_local_session
                 restore_local_session(self, ref.session_id)

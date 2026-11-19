@@ -250,6 +250,14 @@ def refused_pick_text(update):
             f"({update.get('reason') or 'refused'}); still using {current}.")
 
 
+def route_replaced_text(update):
+    """The owner's ``session.updated`` for a session moved off a provider this profile does not declare."""
+    old = ' / '.join(filter(None, (update.get('from_provider'), update.get('from_model'))))
+    new = ' / '.join(filter(None, (update.get('provider'), update.get('model'))))
+    return (f"This session used {old}, which this profile does not have; "
+            f"continuing on {new}. Use /model to pick another.")
+
+
 def _summary_text(result):
     summary = result.get('summary') or {}
     return '\n'.join(filter(None, (summary.get('headline'), summary.get('token_line'), summary.get('note'))))

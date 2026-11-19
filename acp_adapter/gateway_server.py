@@ -1086,6 +1086,12 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
                 await self._conn.session_update(session_id=editor_id, update=acp.update_agent_message_text(
                     refused_pick_text(payload) + "\n"))
             return
+        if kind == "session.updated" and payload.get("operation") == "model" and payload.get("status") == "route_replaced":
+            if self._conn:
+                from acp_adapter.gateway_commands import route_replaced_text
+                await self._conn.session_update(session_id=editor_id, update=acp.update_agent_message_text(
+                    route_replaced_text(payload) + "\n"))
+            return
         if (kind == "session.updated" and payload.get("operation") == "model"
                 and payload.get("status") == "confirmation_required" and isinstance(payload.get("confirm"), str)):
             # A deferred pick whose target needs consent at the turn boundary: asked like an idle
