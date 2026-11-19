@@ -657,13 +657,19 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
     async def list_sessions(self, cursor=None, cwd=None, **kwargs):
         from acp.schema import ListSessionsResponse, SessionInfo
         from acp_adapter.catalog import catalog_sessions
+        from acp_adapter.server import _group_session_families, _session_list_meta
         rows = await asyncio.to_thread(catalog_sessions, self._home / "state.db", cwd)
+        # Pages hold whole fork/subagent families, as main's adapter does, so nested children
+        # never land on a different page than their parent.
+        families = _group_session_families(rows)
         if cursor:
-            index = next((i for i, row in enumerate(rows) if row["session_id"] == cursor), None)
-            rows = [] if index is None else rows[index + 1:]
+            index = next((i for i, fam in enumerate(families) if any(r["session_id"] == cursor for r in fam)), None)
+            families = [] if index is None else families[index + 1:]
         page = [SessionInfo(session_id=row["session_id"], cwd=row["cwd"], title=row.get("title"),
-                            updated_at=row.get("updated_at")) for row in rows[:50]]
-        return ListSessionsResponse(sessions=page, next_cursor=page[-1].session_id if len(rows) > 50 else None)
+                            updated_at=row.get("updated_at"),
+                            field_meta={"hermes": meta} if (meta := _session_list_meta(row)) else None)
+                for fam in families[:50] for row in fam]
+        return ListSessionsResponse(sessions=page, next_cursor=page[-1].session_id if len(families) > 50 else None)
 
     async def prompt(self, prompt, session_id, **kwargs):
         held_id, session_id = session_id, self._aliases.get(session_id, session_id)

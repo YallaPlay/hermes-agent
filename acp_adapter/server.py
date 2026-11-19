@@ -458,6 +458,39 @@ def _group_session_families(
     return [families[root] for root in order]
 
 
+def _session_list_meta(s: dict[str, Any]) -> dict[str, Any]:
+    """``session/list`` row ``_meta.hermes`` for one listed session (both ACP adapters)."""
+    hermes_meta: dict[str, Any] = {}
+    if s.get("archived"):
+        hermes_meta["archived"] = True
+    # Fork lineage: id of the session this one was forked from, so
+    # clients can nest forks under their parent in session lists.
+    if s.get("parent_id"):
+        hermes_meta["forkedFrom"] = s["parent_id"]
+    # Delegate children: read-only observation sessions nested under
+    # their parent (forkedFrom above carries the linkage).
+    if s.get("subagent"):
+        hermes_meta["isSubagent"] = True
+    # Slack-bot sessions (first user message carries the Slack runtime
+    # envelope) so clients can badge them, e.g. a Slack icon prefix.
+    if s.get("slack"):
+        hermes_meta["slack"] = True
+    # Session owner (sessions.user_id — the Cloudflare Access email
+    # stamped on session/new) so clients can badge rows per user, e.g.
+    # owner initials in an "All sessions" list. Soft display key only.
+    owner_id = str(s.get("user_id") or "").strip()
+    if owner_id:
+        hermes_meta["owner"] = owner_id
+    # Progress markers for sessions that advance in another process
+    # (Slack bot, gateway): clients re-replay an open tab when
+    # messageCount moves and show the activity heartbeat meanwhile.
+    if s.get("message_count") is not None:
+        hermes_meta["messageCount"] = s["message_count"]
+    if s.get("activity"):
+        hermes_meta["activity"] = s["activity"]
+    return hermes_meta
+
+
 def _apply_session_effort(agent: Any, level: str) -> None:
     """Apply a reasoning-effort level to the LIVE agent.
 
@@ -1287,34 +1320,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             updated_at = s.get("updated_at")
             if updated_at is not None and not isinstance(updated_at, str):
                 updated_at = str(updated_at)
-            hermes_meta: dict[str, Any] = {}
-            if s.get("archived"):
-                hermes_meta["archived"] = True
-            # Fork lineage: id of the session this one was forked from, so
-            # clients can nest forks under their parent in session lists.
-            if s.get("parent_id"):
-                hermes_meta["forkedFrom"] = s["parent_id"]
-            # Delegate children: read-only observation sessions nested under
-            # their parent (forkedFrom above carries the linkage).
-            if s.get("subagent"):
-                hermes_meta["isSubagent"] = True
-            # Slack-bot sessions (first user message carries the Slack runtime
-            # envelope) so clients can badge them, e.g. a Slack icon prefix.
-            if s.get("slack"):
-                hermes_meta["slack"] = True
-            # Session owner (sessions.user_id — the Cloudflare Access email
-            # stamped on session/new) so clients can badge rows per user, e.g.
-            # owner initials in an "All sessions" list. Soft display key only.
-            owner_id = str(s.get("user_id") or "").strip()
-            if owner_id:
-                hermes_meta["owner"] = owner_id
-            # Progress markers for sessions that advance in another process
-            # (Slack bot, gateway): clients re-replay an open tab when
-            # messageCount moves and show the activity heartbeat meanwhile.
-            if s.get("message_count") is not None:
-                hermes_meta["messageCount"] = s["message_count"]
-            if s.get("activity"):
-                hermes_meta["activity"] = s["activity"]
+            hermes_meta = _session_list_meta(s)
             field_meta = {"hermes": hermes_meta} if hermes_meta else None
             sessions.append(
                 SessionInfo(
