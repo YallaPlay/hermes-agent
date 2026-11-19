@@ -69,7 +69,8 @@ async def _editor(tmp_path, monkeypatch, wire_class=SlashWire):
     updates = []
 
     async def session_update(session_id, update):
-        updates.append(update.content.text)
+        if update.session_update != 'session_info_update':  # turn status carriers have no text
+            updates.append(update.content.text)
     agent._conn = SimpleNamespace(session_update=session_update)
     agent._snapshots[sid] = await wire.rpc('session.resume', session_id=sid)
     agent._event_task = asyncio.create_task(agent._events())

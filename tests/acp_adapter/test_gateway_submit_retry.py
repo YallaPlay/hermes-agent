@@ -61,7 +61,8 @@ async def test_retry_after_lost_submit_ack_is_one_admission(tmp_path, monkeypatc
     agent._conn = SimpleNamespace(updates=[])
 
     async def session_update(session_id, update):
-        agent._conn.updates.append(update.content.text)
+        if update.session_update != 'session_info_update':  # turn status carriers have no text
+            agent._conn.updates.append(update.content.text)
     agent._conn.session_update = session_update
     agent._snapshots['s'] = await wire.rpc('session.resume', session_id='s')
     agent._event_task = asyncio.create_task(agent._events())

@@ -71,6 +71,15 @@ def _tools_changed_notice(payload):
     return f"Editor MCP tools changed (servers: {servers}); the new tool list applies from the next turn.\n"
 
 
+def _turn_meta(running, pending):
+    """Main's ``_turn_status_meta``: ``isRunning`` and the text of the input the running turn executes
+    (its ``started`` pending row), so an editor attaching mid-turn echoes the prompt it did not send."""
+    if not running:
+        return {"isRunning": False}
+    text = next((row.get("text") for row in pending or () if row.get("status") == "started"), None)
+    return {"isRunning": True, **({"currentPromptText": text} if text else {})}
+
+
 class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
     def __init__(self):
         self._conn = None
@@ -124,6 +133,8 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         self._titles = {}
         # Session -> the mode (edit approval policy) the editor was last shown (``current_mode_update``).
         self._modes = {}
+        # Session -> whether the editor was last shown a running turn (``_meta.hermes.isRunning``).
+        self._running = {}
         # Session -> the settings the editor's ``configOptions`` last showed (``config_option_update``).
         self._configs = {}
         # Session -> the owner's latest usage dict (``session.usage`` / ``session.stats``).
@@ -226,6 +237,7 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
                 self._adopted[session_id] = resumes
             self._changed.notify_all()
         await self._project_mode(session_id, self._editor_id(session_id), snapshot.get("info") or {}, client=client)
+        await self._project_running(session_id, self._editor_id(session_id), snapshot)
 
     async def _request_live_reasoning(self, client, session_id):
         """Ask the owner to stream this session's reasoning (``show_reasoning``), as the CLI does.
@@ -404,7 +416,14 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
             self._permission(session_id, pending)
         await self._notify_unknown(session_id)
         await self._request_live_reasoning(client, session_id)
-        return await self._session_fields(session_id, {**info, **(snapshot.get("info") or {})}, held_id)
+        fields = await self._session_fields(session_id, {**info, **(snapshot.get("info") or {})}, held_id)
+        if self._running.get(session_id):
+            # Main's load reply carried the live turn (``_turn_status_meta``); read now, not from the
+            # snapshot, so a turn that ended while the reply was built is not shown running.
+            meta = fields["field_meta"] or {}
+            fields["field_meta"] = {**meta, "hermes": {**(meta.get("hermes") or {}), **_turn_meta(
+                True, self._snapshots[session_id].get("pending"))}}
+        return fields
 
     @staticmethod
     def _moved(info, cwd):
@@ -1114,6 +1133,24 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
                     self._changed.notify_all()
         await self._project_title(sid, editor_id, payload.get("title"))
         await self._project_mode(sid, editor_id, payload)
+        await self._project_running(sid, editor_id, payload)
+
+    async def _project_running(self, sid, editor_id, payload):
+        """The owner's turn state (``running`` on a snapshot or ``session.info``) as main's title-less
+        ``session_info_update`` with ``_meta.hermes.isRunning``: an editor that attached mid-turn (a window
+        reload) learns the turn it did not start, and when it ends. A session's first observation seeds
+        silently: the load reply carries it (``_resume``)."""
+        running = payload.get("running")
+        if not isinstance(running, bool):
+            return
+        shown = self._running.get(sid)
+        self._running[sid] = running
+        if shown is None or shown == running or not self._conn:
+            return
+        from acp.schema import SessionInfoUpdate
+        await self._conn.session_update(session_id=editor_id, update=SessionInfoUpdate(
+            session_update="session_info_update",
+            field_meta={"hermes": _turn_meta(running, self._snapshots.get(sid, {}).get("pending"))}))
 
     async def _project_mode(self, sid, editor_id, payload, client=None):
         """Another surface's ``edit_policy`` change (its ``session.info``) as ``current_mode_update``."""
