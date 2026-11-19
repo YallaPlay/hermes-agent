@@ -21,7 +21,29 @@ def multiplexer_root_for(home: Path) -> Path | None:
     if named_profile_home(home) is None:
         return None
     root = home.parent.parent
-    return root if root != home else None
+    if root == home:
+        return None
+    return _symlinked_default_root(home) or root
+
+
+def _symlinked_default_root(home: Path) -> Path | None:
+    """The platform default root when its ``profiles`` dir is a link to *home*'s parent.
+
+    Discovery canonicalizes homes with ``resolve()``, so a profile under a symlinked
+    ``~/.hermes/profiles`` resolves outside ``~/.hermes``. Its ``parent.parent`` then names a
+    directory with no multiplexer, and a served profile looks unowned forever.
+    """
+    from hermes_constants import _get_platform_default_hermes_home
+    default = _get_platform_default_hermes_home()
+    profiles = default / "profiles"
+    try:
+        if not profiles.is_symlink() or home.parent.parent == default:
+            return None
+        if profiles.resolve() == home.parent.resolve():
+            return default
+    except OSError:
+        return None
+    return None
 
 
 def implied_host_root(home: Path) -> Path | None:
