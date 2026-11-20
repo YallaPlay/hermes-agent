@@ -40,3 +40,18 @@ def test_classic_layout_unchanged(tmp_path, monkeypatch):
     (default / "profiles" / "lab" / "config.yaml").write_text("{}\n")
     monkeypatch.setattr(hermes_constants, "_get_platform_default_hermes_home", lambda: default)
     assert multiplexer_root_for(default / "profiles" / "lab") == default
+
+
+def test_symlinked_profiles_found_when_process_home_is_repointed(tmp_path, monkeypatch):
+    """A service that runs with HOME=<scratch> (the Slack bot) must still find the account's root.
+
+    The bot spawns `hermes -p <profile> acp` with HOME pointing at its own scratch home. The
+    platform default then names <scratch>/.hermes, which has no `profiles` link, and discovery
+    looked for the multiplexer in the link target's parent forever ("Gateway starting").
+    """
+    default, resolved_home = _layout(tmp_path, monkeypatch, link=True)
+    scratch = tmp_path / "scratch-home" / ".hermes"
+    scratch.mkdir(parents=True)
+    monkeypatch.setattr(hermes_constants, "_get_platform_default_hermes_home", lambda: scratch)
+    monkeypatch.setattr(hermes_constants, "account_default_hermes_home", lambda: default)
+    assert multiplexer_root_for(resolved_home) == default

@@ -27,22 +27,34 @@ def multiplexer_root_for(home: Path) -> Path | None:
 
 
 def _symlinked_default_root(home: Path) -> Path | None:
-    """The platform default root when its ``profiles`` dir is a link to *home*'s parent.
+    """The default root whose ``profiles`` dir is a link to *home*'s parent.
 
     Discovery canonicalizes homes with ``resolve()``, so a profile under a symlinked
     ``~/.hermes/profiles`` resolves outside ``~/.hermes``. Its ``parent.parent`` then names a
     directory with no multiplexer, and a served profile looks unowned forever.
+
+    Both the ``$HOME`` default and the OS account default are checked: a service that runs with
+    ``HOME`` pointed at a scratch dir (the Slack bot) still belongs to the account's multiplexer.
     """
-    from hermes_constants import _get_platform_default_hermes_home
-    default = _get_platform_default_hermes_home()
-    profiles = default / "profiles"
-    try:
-        if not profiles.is_symlink() or home.parent.parent == default:
-            return None
-        if profiles.resolve() == home.parent.resolve():
-            return default
-    except OSError:
-        return None
+    import hermes_constants
+    candidates = []
+    for resolve_default in (hermes_constants._get_platform_default_hermes_home,
+                            hermes_constants.account_default_hermes_home):
+        try:
+            default = resolve_default()
+        except Exception:  # noqa: BLE001 - a missing account entry must not break discovery
+            continue
+        if default not in candidates:
+            candidates.append(default)
+    for default in candidates:
+        profiles = default / "profiles"
+        try:
+            if home.parent.parent == default:
+                return None
+            if profiles.is_symlink() and profiles.resolve() == home.parent.resolve():
+                return default
+        except OSError:
+            continue
     return None
 
 
