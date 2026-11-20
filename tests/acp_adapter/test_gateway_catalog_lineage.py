@@ -44,6 +44,33 @@ def test_gateway_list_sessions_stamps_lineage_meta(tmp_path):
     assert 'isRunning' not in meta['child'] and 'isRunning' not in meta['parent']
 
 
+class _Editor:
+    def __init__(self):
+        self.updates = []
+
+    async def session_update(self, session_id, update, **kwargs):
+        self.updates.append((session_id, update))
+
+
+async def _no_gateway():
+    raise AssertionError('a delegate child must not reach the owner')
+
+
+def test_gateway_load_session_replays_delegate_child_read_only(tmp_path):
+    """A listed child opens observation-only from its stored transcript. The owner's
+    ``session.resume`` refuses children, which surfaced as ``Internal error`` in the editor."""
+    _seed(tmp_path / 'state.db', str(tmp_path))
+    with SessionDB(tmp_path / 'state.db') as db:
+        db.append_message('child', 'assistant', 'child progress')
+    agent = GatewayACPAgent.__new__(GatewayACPAgent)
+    agent._home, agent._conn, agent._client = tmp_path, _Editor(), _no_gateway
+    resp = asyncio.run(agent.load_session(cwd=str(tmp_path), session_id='child', mcp_servers=[]))
+    assert resp.field_meta == {'hermes': {'isSubagent': True, 'messageCount': 2}}
+    assert {sid for sid, _ in agent._conn.updates} == {'child'}
+    kinds = [getattr(u, 'session_update', None) for _, u in agent._conn.updates]
+    assert 'user_message_chunk' in kinds and 'agent_message_chunk' in kinds
+
+
 def test_gateway_list_sessions_marks_live_delegate_children_running(tmp_path):
     import time
     _seed(tmp_path / 'state.db', str(tmp_path))
@@ -62,3 +89,6 @@ def test_gateway_list_sessions_marks_live_delegate_children_running(tmp_path):
     meta = {s.session_id: (s.field_meta or {}).get('hermes', {}) for s in resp.sessions}
     assert meta['live'].get('isRunning') is True
     assert 'isRunning' not in meta['ended'] and 'isRunning' not in meta['stale']
+    agent._conn, agent._client = _Editor(), _no_gateway
+    loaded = asyncio.run(agent.load_session(cwd=str(tmp_path), session_id='live', mcp_servers=[]))
+    assert loaded.field_meta['hermes']['isRunning'] is True

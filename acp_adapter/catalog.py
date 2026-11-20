@@ -78,6 +78,24 @@ def _subagent_rows(path):
         return db.list_sessions_rich(source="subagent", limit=-1, include_children=True, min_message_count=1)
 
 
+def read_subagent_transcript(path, session_id):
+    """``(messages, message_count, running)`` of a delegate child (``source='subagent'``), else ``None``.
+
+    The owner's ``session.resume`` refuses a child (its parent's ``delegate_task`` runs it), so
+    an editor opening one from the listing reads its stored transcript, observation-only.
+    """
+    path = Path(path)
+    if not path.exists():
+        return None
+    with SessionDB(db_path=path, read_only=True) as db:
+        row = db.get_session(session_id)
+        if not row or row.get("source") != "subagent":
+            return None
+        row = dict(row)
+        return (db.get_messages_as_conversation(session_id), int(row.get("message_count") or 0),
+                _subagent_running(row))
+
+
 def catalog_sessions(path, cwd=None):
     normalized = _normalize_cwd_for_compare(cwd) if cwd else None
     owners = read_local_owners(path)

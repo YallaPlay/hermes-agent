@@ -369,7 +369,29 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         await client.rpc("session.detach", session_id=session_id, subscription_id=adopted["subscription_id"])
         return await client.rpc("session.info", session_id=session_id)
 
+    async def _load_subagent(self, session_id):
+        """Main's read-only load of a delegate child the listing offers: replay its stored
+        transcript and mark it ``isSubagent`` (plus ``isRunning`` while its heartbeat is fresh).
+        ``None`` when *session_id* is not a child. The child is never adopted, so a prompt to it
+        stays ``not_found``."""
+        from acp_adapter.catalog import read_subagent_transcript
+        child = await asyncio.to_thread(read_subagent_transcript, self._home / "state.db", session_id)
+        if child is None:
+            return None
+        messages, count, running = child
+        if self._conn:
+            from acp_adapter.server import _history_replay_updates
+            for update in _history_replay_updates(messages):
+                await self._conn.session_update(session_id=session_id, update=update)
+        # The listing's count: the client re-replays an open tab when the two differ.
+        meta = {"isSubagent": True, "messageCount": count}
+        if running:
+            meta["isRunning"] = True
+        return {"field_meta": {"hermes": meta}}
+
     async def _resume(self, cwd, held_id, mcp_servers):
+        if (child := await self._load_subagent(held_id)) is not None:
+            return child
         client = await self._client()
         from acp_adapter.catalog import logical_session_id
         from hermes_cli.gateway_client import GatewayRPCError
