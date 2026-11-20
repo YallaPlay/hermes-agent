@@ -1761,6 +1761,24 @@ class TestListAndFork:
         child_meta = (child.field_meta or {}).get("hermes", {})
         assert child_meta.get("isSubagent") is True
         assert child_meta.get("forkedFrom") == "parent1"
+        assert "isRunning" not in child_meta
+        assert parent.field_meta is None
+
+    @pytest.mark.asyncio
+    async def test_list_sessions_stamps_running_subagent(self, agent):
+        """A live delegate child has no ACP turn, so the list row carries isRunning."""
+        with patch.object(
+            agent.session_manager, "list_sessions",
+            return_value=[
+                {"session_id": "child1", "cwd": "/tmp", "title": "Child goal", "updated_at": 2.0,
+                 "parent_id": "parent1", "subagent": True, "running": True},
+                {"session_id": "parent1", "cwd": "/tmp", "title": "Parent", "updated_at": 1.0,
+                 "parent_id": None, "running": True},
+            ],
+        ):
+            resp = await agent.list_sessions(cwd="/tmp")
+        child, parent = resp.sessions
+        assert (child.field_meta or {}).get("hermes", {}).get("isRunning") is True
         assert parent.field_meta is None
 
     @pytest.mark.asyncio

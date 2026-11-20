@@ -41,3 +41,24 @@ def test_gateway_list_sessions_stamps_lineage_meta(tmp_path):
     assert meta['child']['isSubagent'] is True and meta['child']['forkedFrom'] == 'parent'
     assert meta['fork']['forkedFrom'] == 'parent'
     assert meta['parent']['owner'] == 'a@x.com'
+    assert 'isRunning' not in meta['child'] and 'isRunning' not in meta['parent']
+
+
+def test_gateway_list_sessions_marks_live_delegate_children_running(tmp_path):
+    import time
+    _seed(tmp_path / 'state.db', str(tmp_path))
+    with SessionDB(tmp_path / 'state.db') as db:
+        for sid in ('live', 'ended', 'stale'):
+            db.create_session(session_id=sid, source='subagent', cwd='/elsewhere', parent_session_id='parent',
+                              model_config={'_delegate_from': 'parent'})
+            db.append_message(sid, 'user', f'{sid} goal')
+        db.touch_session_activity('live', time.time(), description='tool running: terminal')
+        db.touch_session_activity('ended', time.time(), description='receiving stream response')
+        db.end_session('ended', 'agent_close')
+        db.touch_session_activity('stale', time.time() - 3600, description='receiving stream response')
+    agent = GatewayACPAgent.__new__(GatewayACPAgent)
+    agent._home = tmp_path
+    resp = asyncio.run(agent.list_sessions(cwd=str(tmp_path)))
+    meta = {s.session_id: (s.field_meta or {}).get('hermes', {}) for s in resp.sessions}
+    assert meta['live'].get('isRunning') is True
+    assert 'isRunning' not in meta['ended'] and 'isRunning' not in meta['stale']

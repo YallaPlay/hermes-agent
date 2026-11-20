@@ -471,6 +471,9 @@ def _session_list_meta(s: dict[str, Any]) -> dict[str, Any]:
     # their parent (forkedFrom above carries the linkage).
     if s.get("subagent"):
         hermes_meta["isSubagent"] = True
+        # No ACP turn exists for a child, so clients take its activity dot from here.
+        if s.get("running"):
+            hermes_meta["isRunning"] = True
     # Slack-bot sessions (first user message carries the Slack runtime
     # envelope) so clients can badge them, e.g. a Slack icon prefix.
     if s.get("slack"):

@@ -4,7 +4,8 @@ from pathlib import Path
 
 from hermes_state import SessionDB
 from acp_adapter.session import (
-    _is_slack_preview, _normalize_cwd_for_compare, _parse_model_config, _session_info, _updated_at_sort_key,
+    _is_slack_preview, _normalize_cwd_for_compare, _parse_model_config, _session_info, _subagent_running,
+    _updated_at_sort_key,
 )
 
 
@@ -114,7 +115,8 @@ def catalog_sessions(path, cwd=None):
         info = _session_info(str(row["id"]), row.get("cwd") or ".", row.get("model") or "",
                              int(row.get("message_count") or 0), row.get("title"), row.get("preview"),
                              row.get("last_active") or row.get("started_at"))
-        info.update(user_id=row.get("user_id") or "", parent_id=parent_id, subagent=True, slack=False)
+        info.update(user_id=row.get("user_id") or "", parent_id=parent_id, subagent=True,
+                    running=_subagent_running(row), slack=False)
         children.append(info)
     return sorted([*results.values(), *children],
                   key=lambda row: _updated_at_sort_key(row.get("updated_at")), reverse=True)

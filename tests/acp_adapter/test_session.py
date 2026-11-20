@@ -1266,6 +1266,27 @@ class TestPersistence:
         assert "orphan-sub" not in by_id
         assert "cli-parent" not in by_id
 
+    def test_list_sessions_marks_only_live_subagent_children_running(self, manager):
+        """A child with an open row and a fresh heartbeat lists as running;
+        ended and heartbeat-stale children do not."""
+        parent = manager.create_session(cwd="/work")
+        parent.history.append({"role": "user", "content": "delegate"})
+        manager.save_session(parent.session_id)
+
+        db = manager._get_db()
+        for sid in ("live-sub", "ended-sub", "stale-sub"):
+            db.create_session(sid, source="subagent", parent_session_id=parent.session_id)
+            db.append_message(sid, role="user", content=f"{sid} goal")
+        db.touch_session_activity("live-sub", time.time(), description="tool running: terminal")
+        db.touch_session_activity("ended-sub", time.time(), description="receiving stream response")
+        db.end_session("ended-sub", "agent_close")
+        db.touch_session_activity("stale-sub", time.time() - 3600, description="receiving stream response")
+
+        by_id = {s["session_id"]: s for s in manager.list_sessions()}
+        assert by_id["live-sub"]["running"] is True
+        assert by_id["ended-sub"]["running"] is False
+        assert by_id["stale-sub"]["running"] is False
+
     def test_list_sessions_subagent_children_respect_archived_only(self, manager):
         """archived_only listings don't surface live subagent children."""
         parent = manager.create_session(cwd="/work")

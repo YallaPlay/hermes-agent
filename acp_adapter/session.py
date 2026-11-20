@@ -195,6 +195,28 @@ def _progress_fields(row: Dict[str, Any]) -> Dict[str, Any]:
     return fields
 
 
+# A delegate child persists a mid-turn heartbeat at most once per minute
+# (SESSION_ACTIVITY_HEARTBEAT_MIN_INTERVAL_SECONDS); a few missed beats mean its
+# worker died without stamping ended_at.
+_SUBAGENT_LIVE_WINDOW_SECONDS = 300.0
+
+
+def _subagent_running(row: Dict[str, Any], now: Optional[float] = None) -> bool:
+    """Whether a delegate child's DB row shows a turn in flight right now.
+
+    The child runs inside its parent's ``delegate_task`` (often in another
+    process), so no ACP turn state exists for it; its open row plus a fresh
+    activity heartbeat is the only cross-process liveness signal.
+    """
+    at = row.get("last_activity_at")
+    if row.get("ended_at") is not None or at is None:
+        return False
+    try:
+        return (now if now is not None else time.time()) - float(at) < _SUBAGENT_LIVE_WINDOW_SECONDS
+    except (TypeError, ValueError):
+        return False
+
+
 def _updated_at_sort_key(value: Any) -> float:
     if isinstance(value, (int, float)):
         return float(value)
@@ -913,6 +935,7 @@ class SessionManager:
                     "archived": bool(row.get("archived")),
                     "parent_id": parent_sid,
                     "subagent": True,
+                    "running": _subagent_running(row),
                     "slack": False,
                     **_progress_fields(row),
                 })
