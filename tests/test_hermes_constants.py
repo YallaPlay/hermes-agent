@@ -48,6 +48,28 @@ class TestGetDefaultHermesRoot:
         monkeypatch.setenv("HERMES_HOME", str(profile))
         assert get_default_hermes_root() == docker_root
 
+    @pytest.mark.platforms("linux")
+    def test_profile_under_symlinked_native_profiles_dir_returns_native_root(self, tmp_path, monkeypatch):
+        """A resolved profile home behind a symlinked ~/.hermes/profiles keeps the native root.
+
+        Otherwise the host multiplexer counts as another tenant and a standalone profile's gateway
+        refuses to start forever (exit 75, "has not published its served set yet").
+        """
+        native = tmp_path / ".hermes"
+        native.mkdir()
+        real_profiles = tmp_path / "repo" / ".hermes" / "profiles"
+        (real_profiles / "jobs").mkdir(parents=True)
+        (native / "profiles").symlink_to(real_profiles)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        monkeypatch.setenv("HERMES_HOME", str(real_profiles / "jobs"))
+        assert get_default_hermes_root() == native
+        # A different, unlinked custom root keeps the Docker/custom rule.
+        other = tmp_path / "other" / "profiles" / "jobs"
+        other.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(other))
+        assert get_default_hermes_root() == tmp_path / "other"
+
     def test_expanded_custom_profile_returns_custom_root(self, tmp_path, monkeypatch):
         custom_root = tmp_path / "deployment"
         home_token = "$" + "HOME"

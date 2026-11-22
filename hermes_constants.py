@@ -115,8 +115,26 @@ def _hermes_root_of(native_home: Path, env_path: Path | None) -> Path:
     try:
         env_path.resolve().relative_to(native_home.resolve())  # under ~/.hermes (normal or profile mode)
     except ValueError:  # Docker/custom root: <root>/profiles/<name> -> <root>, else HERMES_HOME itself
-        return env_path.parent.parent if env_path.parent.name == "profiles" else env_path
+        if env_path.parent.name != "profiles":
+            return env_path
+        if _is_native_profiles_link_target(native_home, env_path.parent):
+            return native_home
+        return env_path.parent.parent
     return native_home
+
+
+def _is_native_profiles_link_target(native_home: Path, profiles_dir: Path) -> bool:
+    """True when ``<native_home>/profiles`` is a symlink that resolves to *profiles_dir*.
+
+    A profile reached through a symlinked ``~/.hermes/profiles`` canonicalizes outside
+    ``~/.hermes``. It still belongs to the native root; reading ``parent.parent`` instead names a
+    second tenant, so the host multiplexer looks foreign and a standalone profile never starts.
+    """
+    link = native_home / "profiles"
+    try:
+        return link.is_symlink() and link.resolve() == profiles_dir.resolve()
+    except OSError:
+        return False
 
 
 _ENV_REFERENCE = re.compile(r"%([^%]+)%|\$\{([^}]+)\}|\$([A-Za-z0-9_-]+)")
