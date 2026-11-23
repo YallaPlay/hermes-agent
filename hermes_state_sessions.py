@@ -349,7 +349,9 @@ class SessionSessionsMixin:
             parent = Path(self.db_path).resolve().parent
             if parent == root:
                 return "default"
-            is_profile_dir = parent.parent == root / "profiles"
+            # Resolve the profiles dir too: a symlinked ``~/.hermes/profiles`` canonicalizes the store
+            # outside the root, and the bare ``root / "profiles"`` would then never match.
+            is_profile_dir = parent.parent == (root / "profiles").resolve()
             if is_profile_dir and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", parent.name):
                 return parent.name
         except Exception:
