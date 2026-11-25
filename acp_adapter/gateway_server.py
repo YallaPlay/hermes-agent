@@ -161,8 +161,9 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         return InitializeResponse(protocol_version=acp.PROTOCOL_VERSION,
             agent_info=Implementation(name="hermes-agent", version=__version__),
             agent_capabilities=AgentCapabilities(load_session=True,
-                prompt_capabilities=PromptCapabilities(image=True),
-                session_capabilities=SessionCapabilities(fork=SessionForkCapabilities(), list=SessionListCapabilities(),
+                prompt_capabilities=PromptCapabilities(image=True, field_meta={"hermes": {"keepHistory": True}}),
+                session_capabilities=SessionCapabilities(fork=SessionForkCapabilities(field_meta={"hermes": {"keepHistory": True}}),
+                                                         list=SessionListCapabilities(),
                                                          resume=SessionResumeCapabilities())),
             auth_methods=build_auth_methods())
 
@@ -518,14 +519,18 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         # copy of the parent's.
         payload = {'mcp_servers': [s.model_dump(by_alias=True) for s in mcp_servers]} if mcp_servers else {}
         self._unacked.pop(session_id, None)
-        result = await self._mutations.apply(client, session_id, 'branch', payload)
+        from acp_adapter.gateway_rewind import branch_payload, keep_history_meta
+        # Fork-from-here (``_meta.hermes.keepHistory``): the branch ends at that replay coordinate.
+        keep = keep_history_meta(kwargs)
+        branch = payload if keep is None else branch_payload(payload, keep)
+        result = await self._mutations.apply(client, session_id, 'branch', branch)
         child = result['branched_session_id']
         if self._moved(info, cwd):
             await self._move_workspace(client, child, cwd)
         await self._adopt(child, await client.rpc('session.resume', session_id=child))
         if payload or session_id in self._editor_mcp:
             self._editor_mcp[child] = payload or self._editor_mcp[session_id]
-        self._mutations.acknowledge(session_id, 'branch', payload)
+        self._mutations.acknowledge(session_id, 'branch', branch)
         info = self._snapshots[child].get('info') or await client.rpc('session.info', session_id=child)
         await self._request_live_reasoning(client, child)
         return ForkSessionResponse(session_id=child, **await self._session_fields(child, info, child))
@@ -801,9 +806,25 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
         if outcome == "failed":
             raise GatewayClientError("admitted_turn_failed")
         from acp_adapter.gateway_session_meta import turn_usage
+        index = await self._user_history_index(session_id, (terminal.get("persisted_turn") or {}).get("user_row_id"))
         # The turn's last ``session.usage`` precedes its ``message.complete`` on the stream.
         return PromptResponse(stop_reason="cancelled" if outcome == "cancelled" else "end_turn",
-                              usage=turn_usage(self._usage.get(session_id)))
+                              usage=turn_usage(self._usage.get(session_id)),
+                              field_meta={"hermes": {"userHistoryIndex": index}} if index is not None else None)
+
+    async def _user_history_index(self, session_id, user_row_id):
+        """Main's ``userHistoryIndex``: the sent turn's replay coordinate, read from the owner's transcript
+        after the turn so the editor can fork or rewind from it without a reload. None (the editor keeps
+        its pre-coordinate behaviour) when the owner named no committed user row or the read failed."""
+        if type(user_row_id) is not int:
+            return None
+        from acp_adapter.gateway_rewind import history_index
+        try:
+            client = await self._client()
+            return history_index(await client.rpc("session.resume", session_id=session_id), user_row_id)
+        except GatewayClientError as exc:
+            logger.info("No history coordinate for %s's turn: %s", session_id, exc)
+            return None
 
     async def _admission_from_receipt(self, client, held_id, session_id, receipt):
         """The admission a ``prompt.submit`` receipt names, or None when the owner admitted nothing."""
@@ -929,7 +950,7 @@ class GatewayACPAgent(GatewayReplyMixin, acp.Agent):
                 "text": result.get("final_response") or "", "outcome": outcome,
                 "response_reused": result.get("response_reused"), "receipt": True})
             async with self._changed:
-                self._terminals[admission_id] = {"outcome": outcome}
+                self._terminals[admission_id] = {"outcome": outcome, "persisted_turn": result.get("persisted_turn")}
                 self._changed.notify_all()
         finally:
             self._settling.discard(admission_id)

@@ -57,6 +57,26 @@ def replay_updates(live):
         yield update, None
 
 
+def history_index(snapshot, row_id):
+    """The replay coordinate of stored row *row_id* (``prompt``'s ``userHistoryIndex``), or None."""
+    if type(row_id) is not int:
+        return None
+    return next((i for i, row in enumerate(live_rows(snapshot)) if row.get("row_id") == row_id), None)
+
+
+def branch_payload(base, keep):
+    """``session.mutate branch`` payload keeping the first ``keep`` live rows (main's ``history[:keep]``):
+    the owner's ``through_message_id`` is the last kept row. At or past the end it is the whole copy."""
+    def payload(snapshot):
+        live = live_rows(snapshot)
+        if keep >= len(live):
+            return dict(base)
+        if keep == 0:
+            raise _invalid("_meta.hermes.keepHistory must keep at least one row")
+        return {**base, "through_message_id": live[keep - 1]["row_id"]}
+    return payload
+
+
 def _invalid(reason):
     return acp.RequestError.invalid_params({"reason": reason})
 

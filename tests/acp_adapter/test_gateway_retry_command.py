@@ -39,7 +39,7 @@ class LossyResume(SlashWire):
 
 
 @contextlib.asynccontextmanager
-async def _editor(tmp_path, monkeypatch, wire_class=SlashWire):
+async def _editor(tmp_path, monkeypatch, wire_class=SlashWire, turn=None):
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
     executed = []
@@ -47,7 +47,8 @@ async def _editor(tmp_path, monkeypatch, wire_class=SlashWire):
     async def answer(event):
         from gateway.session_results import execution_result
         executed.append(event.text)
-        execution_result.get()['result'] = {'final_response': 'ACK_' + event.text, 'completed': True, 'messages': []}
+        execution_result.get()['result'] = {'final_response': 'ACK_' + event.text, 'completed': True, 'messages': [],
+                                            **(turn(event) if turn else {})}
         return 'ACK_' + event.text
 
     from gateway import run
